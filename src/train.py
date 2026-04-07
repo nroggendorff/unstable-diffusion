@@ -104,7 +104,7 @@ def train():
     samples = get_samples(100)
     transform = get_transform()
 
-    for step in tqdm(range(STEPS)):
+    for step in (pbar := tqdm(range(STEPS))):
         sample = random.choice(samples)
         image, prompt = prepare_sample(sample, transform, DEVICE)
 
@@ -167,7 +167,7 @@ def train():
 
         if step % 10 == 0:
             diff = (pred - base_pred).abs().mean().item()
-            print(f"step {step} loss {loss.item():.4f} diff {diff:.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", diff=f"{diff:.4f}")
 
         if step % 50 == 0:
             torch.cuda.empty_cache()
