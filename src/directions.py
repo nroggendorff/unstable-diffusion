@@ -9,45 +9,6 @@ LAYER_PATTERNS = [
 ]
 
 
-def _matches_any(name, patterns):
-    for p in patterns:
-        if name.endswith(p):
-            return True
-    return False
-
-
-def collect_activations(unet, batch_inputs, layer_patterns):
-    activations = {p: [] for p in layer_patterns}
-    hooks = []
-
-    def make_hook(pattern):
-        def hook(module, input, output):
-            out = output[0] if isinstance(output, tuple) else output
-            flat = (
-                out.detach().float().mean(dim=(0, 2, 3))
-                if out.ndim == 4
-                else out.detach().float().mean(dim=(0, 1))
-            )
-            activations[pattern].append(flat)
-
-        return hook
-
-    try:
-        for name, module in unet.named_modules():
-            for p in layer_patterns:
-                if name.endswith(p):
-                    hooks.append(module.register_forward_hook(make_hook(p)))
-
-        with torch.no_grad():
-            for inp in batch_inputs:
-                unet(**inp)
-    finally:
-        for hook in hooks:
-            hook.remove()
-
-    return activations
-
-
 def compute_diversity_loss(
     unet,
     noisy_latents_a,
@@ -71,7 +32,7 @@ def compute_diversity_loss(
     hooks = []
 
     def make_hook(store, pattern):
-        def hook(module, input, output):
+        def hook(output):
             out = output[0] if isinstance(output, tuple) else output
             flat = (
                 out.float().mean(dim=(0, 2, 3))

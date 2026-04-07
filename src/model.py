@@ -16,6 +16,7 @@ LORA_TARGET_MODULES = ["to_k", "to_q", "to_v", "to_out.0"]
 
 
 def load_model():
+    # pyrefly: ignore [missing-attribute]
     pipe = StableDiffusionXLPipeline.from_pretrained(
         MODEL_ID, torch_dtype=torch.float16
     ).to(DEVICE)
@@ -37,7 +38,9 @@ def load_model():
     optimizer = torch.optim.AdamW(unet_creative.parameters(), lr=LR)
 
     scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
+    # pyrefly: ignore [missing-attribute]
     scheduler.set_timesteps(NUM_INFERENCE_STEPS)
+    # pyrefly: ignore [missing-attribute]
     early_timesteps = scheduler.timesteps[:EARLY_STEPS].to(DEVICE)
 
     return {

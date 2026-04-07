@@ -2,6 +2,7 @@ diffusers
 peft
 bitsandbytes
 tqdm
+types-tqdm
 torchvision
 pillow
 datasets

@@ -70,7 +70,9 @@ def train():
         noise_b = torch.randn_like(latents)
         t = early_timesteps[torch.randint(0, len(early_timesteps), (1,))]
 
+        # pyrefly: ignore [missing-attribute]
         noisy_a = scheduler.add_noise(latents, noise_a, t)
+        # pyrefly: ignore [missing-attribute]
         noisy_b = scheduler.add_noise(latents, noise_b, t)
 
         inputs_1 = tokenizer(
