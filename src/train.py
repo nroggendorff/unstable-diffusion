@@ -4,8 +4,8 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from .model import load_model, DEVICE
-from .dataset import get_samples, get_transform, prepare_sample
+from model import load_model, DEVICE
+from dataset import get_samples, get_transform, prepare_sample
 
 
 STEPS = 200
