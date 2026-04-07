@@ -3,5 +3,6 @@ peft
 bitsandbytes
 tqdm
 torchvision
-Pillow
+pillow
 datasets
+triton
