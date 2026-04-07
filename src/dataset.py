@@ -14,7 +14,7 @@ def get_samples(n=100):
     out = []
     for i, x in enumerate(dataset):
         out.append(x)
-        if i >= n:
+        if i >= n - 1:
             break
     return out
 

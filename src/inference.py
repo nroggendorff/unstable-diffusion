@@ -16,7 +16,7 @@ def load_pipe():
     ).to("cuda")
 
     pipe.unet = PeftModel.from_pretrained(pipe.unet, ADAPTER_PATH)
-    pipe.unet.merge_and_unload()
+    pipe.unet = pipe.unet.merge_and_unload()
 
     return pipe
 

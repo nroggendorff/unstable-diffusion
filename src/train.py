@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from .model import load_model, DEVICE
-from .dataset import get_samples, get_transform, prepare_sample
+from .dataset import get_samples, get_transform, prepare_sample, IMAGE_SIZE
 
 
 STEPS = 200
@@ -80,7 +80,7 @@ def compute_loss(
     step_loss = F.mse_loss(x_prev_pred, x_prev_target)
     divergence = (pred_noise - base_noise).abs().mean()
 
-    loss = noise_loss + 0.5 * step_loss + 0.05 * divergence
+    loss = noise_loss + 0.5 * step_loss - 0.05 * divergence
 
     return loss, pred_noise, base_noise
 
@@ -146,7 +146,7 @@ def train():
             )
             pooled_emb = text_emb_2.text_embeds
             time_ids = torch.tensor(
-                [[image.shape[2], image.shape[3], 0, 0, 0, 0]], device=DEVICE
+                [[IMAGE_SIZE, IMAGE_SIZE, 0, 0, IMAGE_SIZE, IMAGE_SIZE]], device=DEVICE
             )
 
         loss, pred, base_pred = compute_loss(
