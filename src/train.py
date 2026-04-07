@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 from .model import load_model, DEVICE
 from .dataset import get_samples, get_transform, prepare_sample, IMAGE_SIZE
-from .directions import compute_diversity_loss, LAYER_NAMES
+from .directions import compute_diversity_loss, LAYER_PATTERNS
 from .snapshot import SnapshotBuffer
 
 
@@ -119,7 +119,7 @@ def train():
             text_emb,
             pooled_emb,
             time_ids,
-            LAYER_NAMES,
+            LAYER_PATTERNS,
         )
         snapshot_loss = snapshot_buffer.compute_distance_loss(unet_creative)
 
