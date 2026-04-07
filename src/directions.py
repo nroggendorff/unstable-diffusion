@@ -32,17 +32,18 @@ def collect_activations(unet, batch_inputs, layer_patterns):
 
         return hook
 
-    for name, module in unet.named_modules():
-        for p in layer_patterns:
-            if name.endswith(p):
-                hooks.append(module.register_forward_hook(make_hook(p)))
+    try:
+        for name, module in unet.named_modules():
+            for p in layer_patterns:
+                if name.endswith(p):
+                    hooks.append(module.register_forward_hook(make_hook(p)))
 
-    with torch.no_grad():
-        for inp in batch_inputs:
-            unet(**inp)
-
-    for hook in hooks:
-        hook.remove()
+        with torch.no_grad():
+            for inp in batch_inputs:
+                unet(**inp)
+    finally:
+        for hook in hooks:
+            hook.remove()
 
     return activations
 
@@ -57,6 +58,13 @@ def compute_diversity_loss(
     time_ids,
     layer_patterns,
 ):
+    noisy_latents_a = noisy_latents_a.detach().contiguous()
+    noisy_latents_b = noisy_latents_b.detach().contiguous()
+    t = t.detach()
+    text_emb = text_emb.detach().contiguous()
+    pooled_emb = pooled_emb.detach()
+    time_ids = time_ids.detach()
+
     added_cond_kwargs = {"text_embeds": pooled_emb, "time_ids": time_ids}
     store_a = {}
     store_b = {}
@@ -74,40 +82,44 @@ def compute_diversity_loss(
 
         return hook
 
-    for name, module in unet.named_modules():
-        for p in layer_patterns:
-            if name.endswith(p):
-                hooks.append(module.register_forward_hook(make_hook(store_a, p)))
+    try:
+        for name, module in unet.named_modules():
+            for p in layer_patterns:
+                if name.endswith(p):
+                    hooks.append(module.register_forward_hook(make_hook(store_a, p)))
 
-    unet(
-        noisy_latents_a,
-        t,
-        encoder_hidden_states=text_emb,
-        added_cond_kwargs=added_cond_kwargs,
-    )
-
-    for hook in hooks:
-        hook.remove()
+        with torch.no_grad():
+            unet(
+                noisy_latents_a,
+                t,
+                encoder_hidden_states=text_emb,
+                added_cond_kwargs=added_cond_kwargs,
+            )
+    finally:
+        for hook in hooks:
+            hook.remove()
     hooks = []
 
-    for name, module in unet.named_modules():
-        for p in layer_patterns:
-            if name.endswith(p):
-                hooks.append(module.register_forward_hook(make_hook(store_b, p)))
+    try:
+        for name, module in unet.named_modules():
+            for p in layer_patterns:
+                if name.endswith(p):
+                    hooks.append(module.register_forward_hook(make_hook(store_b, p)))
 
-    unet(
-        noisy_latents_b,
-        t,
-        encoder_hidden_states=text_emb,
-        added_cond_kwargs=added_cond_kwargs,
-    )
-
-    for hook in hooks:
-        hook.remove()
+        with torch.no_grad():
+            unet(
+                noisy_latents_b,
+                t,
+                encoder_hidden_states=text_emb,
+                added_cond_kwargs=added_cond_kwargs,
+            )
+    finally:
+        for hook in hooks:
+            hook.remove()
 
     shared = [p for p in layer_patterns if p in store_a and p in store_b]
     if not shared:
-        return torch.tensor(0.0)
+        return torch.tensor(0.0, device=noisy_latents_a.device)
     similarity = torch.stack(
         [
             F.cosine_similarity(store_a[p].unsqueeze(0), store_b[p].unsqueeze(0))
