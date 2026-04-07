@@ -49,7 +49,6 @@ def train():
     optimizer = models["optimizer"]
     scheduler = models["scheduler"]
     early_timesteps = models["early_timesteps"]
-    pipe = models["pipe"]
 
     snapshot_buffer = SnapshotBuffer(unet_creative)
 
@@ -148,8 +147,7 @@ def train():
         if step % 50 == 0:
             torch.cuda.empty_cache()
 
-    pipe.save_pretrained("./creative-early-step")
-    unet_creative.save_pretrained("./creative-early-step/lora")
+    unet_creative.save_pretrained("./creative-lora")
 
 
 if __name__ == "__main__":

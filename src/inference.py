@@ -2,11 +2,10 @@ import argparse
 import torch
 
 from diffusers import StableDiffusionXLPipeline
-from peft import PeftModel
 
 
 MODEL_ID = "glides/illustriousxl"
-ADAPTER_PATH = "./creative-early-step/lora"
+ADAPTER_PATH = "./creative-lora"
 OUTPUT_DIR = "./outputs"
 
 
@@ -16,9 +15,7 @@ def load_pipe():
         MODEL_ID, torch_dtype=torch.float16
     ).to("cuda")
 
-    pipe.unet = PeftModel.from_pretrained(pipe.unet, ADAPTER_PATH)
-    # pyrefly: ignore [not-callable]
-    pipe.unet = pipe.unet.merge_and_unload()
+    pipe.load_lora_weights(ADAPTER_PATH)
 
     return pipe
 
