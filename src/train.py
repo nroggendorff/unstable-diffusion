@@ -10,7 +10,7 @@ from .directions import compute_diversity_loss, LAYER_PATTERNS
 from .snapshot import SnapshotBuffer
 
 
-STEPS = 20
+STEPS = 200
 
 NOISE_LOSS_WEIGHT = 1.0
 DIVERSITY_LOSS_WEIGHT = 0.3
