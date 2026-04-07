@@ -1,4 +1,3 @@
-import copy
 import torch
 
 from diffusers import StableDiffusionXLPipeline, DDPMScheduler
@@ -27,19 +26,13 @@ def load_model():
     tokenizer = pipe.tokenizer
     tokenizer_2 = pipe.tokenizer_2
 
-    unet_base = pipe.unet.eval().to(dtype=torch.float16)
-    for param in unet_base.parameters():
-        param.requires_grad = False
-
-    unet_for_creative = copy.deepcopy(unet_base)
-
     lora_config = LoraConfig(
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
         target_modules=LORA_TARGET_MODULES,
         inference_mode=False,
     )
-    unet_creative = get_peft_model(unet_for_creative, lora_config).train()
+    unet_creative = get_peft_model(pipe.unet, lora_config).train()
 
     optimizer = torch.optim.AdamW(unet_creative.parameters(), lr=LR)
 
@@ -50,7 +43,6 @@ def load_model():
     return {
         "pipe": pipe,
         "vae": vae,
-        "unet_base": unet_base,
         "unet_creative": unet_creative,
         "text_encoder": text_encoder,
         "text_encoder_2": text_encoder_2,
