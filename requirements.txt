@@ -1,2 +1,7 @@
-bitsandbytes
+diffusers
 peft
+bitsandbytes
+tqdm
+torchvision
+Pillow
+datasets

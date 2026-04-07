@@ -20,10 +20,12 @@ def load_model():
         MODEL_ID, torch_dtype=torch.float16
     ).to(DEVICE)
 
-    vae = pipe.vae
-    unet_base = pipe.unet.eval()
-    text_encoder = pipe.text_encoder
+    vae = pipe.vae.to(dtype=torch.float16)
+    unet_base = pipe.unet.eval().to(dtype=torch.float16)
+    text_encoder = pipe.text_encoder.to(dtype=torch.float16)
+    text_encoder_2 = pipe.text_encoder_2.to(dtype=torch.float16)
     tokenizer = pipe.tokenizer
+    tokenizer_2 = pipe.tokenizer_2
 
     lora_config = LoraConfig(
         r=LORA_RANK,
@@ -45,7 +47,9 @@ def load_model():
         "unet_base": unet_base,
         "unet_creative": unet_creative,
         "text_encoder": text_encoder,
+        "text_encoder_2": text_encoder_2,
         "tokenizer": tokenizer,
+        "tokenizer_2": tokenizer_2,
         "optimizer": optimizer,
         "scheduler": scheduler,
         "early_timesteps": early_timesteps,

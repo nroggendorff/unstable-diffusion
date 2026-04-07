@@ -4,8 +4,8 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from model import load_model, DEVICE
-from dataset import get_samples, get_transform, prepare_sample
+from .model import load_model, DEVICE
+from .dataset import get_samples, get_transform, prepare_sample
 
 
 STEPS = 200
@@ -40,14 +40,41 @@ def apply_structured_noise(noisy_latents, latents, t, t_max):
 
 
 def compute_loss(
-    unet_creative, unet_base, scheduler, noisy_latents, noise, t, text_emb
+    unet_creative,
+    unet_base,
+    scheduler,
+    noisy_latents,
+    noise,
+    t,
+    text_emb,
+    pooled_emb,
+    time_ids,
 ):
-    pred_noise = unet_creative(noisy_latents, t, encoder_hidden_states=text_emb).sample
-    x_prev_pred = scheduler.step(pred_noise, t.item(), noisy_latents).prev_sample
+    noisy_latents = noisy_latents.to(dtype=torch.float16)
+    t = t.to(dtype=torch.float16)
+    added_cond_kwargs = {
+        "text_embeds": pooled_emb,
+        "time_ids": time_ids,
+    }
+    pred_noise = unet_creative(
+        noisy_latents,
+        t,
+        encoder_hidden_states=text_emb,
+        added_cond_kwargs=added_cond_kwargs,
+    ).sample
+    t_int = t.long()
+    x_prev_pred = scheduler.step(pred_noise, t_int.item(), noisy_latents).prev_sample
 
     with torch.no_grad():
-        base_noise = unet_base(noisy_latents, t, encoder_hidden_states=text_emb).sample
-        x_prev_target = scheduler.step(base_noise, t.item(), noisy_latents).prev_sample
+        base_noise = unet_base(
+            noisy_latents,
+            t,
+            encoder_hidden_states=text_emb,
+            added_cond_kwargs=added_cond_kwargs,
+        ).sample
+        x_prev_target = scheduler.step(
+            base_noise, t_int.item(), noisy_latents
+        ).prev_sample
 
     noise_loss = F.mse_loss(pred_noise, noise)
     step_loss = F.mse_loss(x_prev_pred, x_prev_target)
@@ -64,7 +91,9 @@ def train():
     unet_base = models["unet_base"]
     unet_creative = models["unet_creative"]
     text_encoder = models["text_encoder"]
+    text_encoder_2 = models["text_encoder_2"]
     tokenizer = models["tokenizer"]
+    tokenizer_2 = models["tokenizer_2"]
     optimizer = models["optimizer"]
     scheduler = models["scheduler"]
     early_timesteps = models["early_timesteps"]
@@ -95,14 +124,41 @@ def train():
         with torch.no_grad():
             noisy_latents = apply_structured_noise(noisy_latents, latents, t, t_max)
 
-        inputs = tokenizer(
-            prompt, return_tensors="pt", padding=True, truncation=True
+        inputs_1 = tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        ).to(DEVICE)
+        inputs_2 = tokenizer_2(
+            prompt,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=tokenizer_2.model_max_length,
+            truncation=True,
         ).to(DEVICE)
         with torch.no_grad():
-            text_emb = text_encoder(**inputs).last_hidden_state
+            text_emb_1 = text_encoder(**inputs_1, output_hidden_states=True)
+            text_emb_2 = text_encoder_2(**inputs_2, output_hidden_states=True)
+            text_emb = torch.cat(
+                [text_emb_1.hidden_states[-2], text_emb_2.hidden_states[-2]], dim=-1
+            )
+            pooled_emb = text_emb_2.text_embeds
+            time_ids = torch.tensor(
+                [[image.shape[2], image.shape[3], 0, 0, 0, 0]], device=DEVICE
+            )
 
         loss, pred, base_pred = compute_loss(
-            unet_creative, unet_base, scheduler, noisy_latents, noise, t, text_emb
+            unet_creative,
+            unet_base,
+            scheduler,
+            noisy_latents,
+            noise,
+            t.float(),
+            text_emb,
+            pooled_emb,
+            time_ids,
         )
 
         optimizer.zero_grad()
@@ -117,7 +173,7 @@ def train():
             torch.cuda.empty_cache()
 
     pipe.save_pretrained("./creative-early-step")
-    unet_creative.save_adapter("./creative-early-step", "default")
+    unet_creative.save_pretrained("./creative-early-step/lora")
 
 
 if __name__ == "__main__":
