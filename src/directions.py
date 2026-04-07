@@ -32,7 +32,7 @@ def compute_diversity_loss(
     hooks = []
 
     def make_hook(store, pattern):
-        def hook(module, input, output):
+        def hook(module, input, output):  # noqa: ARG001
             out = output[0] if isinstance(output, tuple) else output
             flat = (
                 out.float().mean(dim=(0, 2, 3))
