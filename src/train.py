@@ -71,8 +71,8 @@ def train():
         if step % 50 == 0:
             torch.cuda.empty_cache()
 
-    pipe.unet = unet_creative
     pipe.save_pretrained("./creative-early-step")
+    unet_creative.save_adapter("./creative-early-step", "default")
 
 
 if __name__ == "__main__":
