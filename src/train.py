@@ -11,6 +11,53 @@ from .dataset import get_samples, get_transform, prepare_sample
 STEPS = 200
 
 
+def compute_subject_mask(latents):
+    down = F.interpolate(
+        latents, scale_factor=0.25, mode="bilinear", align_corners=False
+    )
+    up = F.interpolate(
+        down, size=latents.shape[-2:], mode="bilinear", align_corners=False
+    )
+    importance = (latents - up).abs()
+    importance = importance / (importance.amax(dim=(1, 2, 3), keepdim=True) + 1e-6)
+    return importance
+
+
+def apply_structured_noise(noisy_latents, latents, t, t_max):
+    importance = latents.abs().mean(dim=1, keepdim=True)
+    background_mask = 1.0 - importance / (
+        importance.amax(dim=(1, 2, 3), keepdim=True) + 1e-6
+    )
+
+    subject_mask = compute_subject_mask(latents)
+    combined_mask = (background_mask + (1.0 - subject_mask)) * 0.5
+
+    strength = t.float() / t_max
+    noisy_latents = noisy_latents + strength * 0.1 * combined_mask * torch.randn_like(
+        noisy_latents
+    )
+    return noisy_latents
+
+
+def compute_loss(
+    unet_creative, unet_base, scheduler, noisy_latents, noise, t, text_emb
+):
+    pred_noise = unet_creative(noisy_latents, t, encoder_hidden_states=text_emb).sample
+    x_prev_pred = scheduler.step(pred_noise, t.item(), noisy_latents).prev_sample
+
+    with torch.no_grad():
+        base_noise = unet_base(noisy_latents, t, encoder_hidden_states=text_emb).sample
+        x_prev_target = scheduler.step(base_noise, t.item(), noisy_latents).prev_sample
+
+    noise_loss = F.mse_loss(pred_noise, noise)
+    step_loss = F.mse_loss(x_prev_pred, x_prev_target)
+    divergence = (pred_noise - base_noise).abs().mean()
+
+    loss = noise_loss + 0.5 * step_loss + 0.05 * divergence
+
+    return loss, pred_noise, base_noise
+
+
 def train():
     models = load_model()
     vae = models["vae"]
@@ -22,6 +69,8 @@ def train():
     scheduler = models["scheduler"]
     early_timesteps = models["early_timesteps"]
     pipe = models["pipe"]
+
+    t_max = scheduler.timesteps[0].float()
 
     samples = get_samples(100)
     transform = get_transform()
@@ -43,7 +92,8 @@ def train():
 
         noisy_latents = scheduler.add_noise(latents, noise, t)
 
-        noisy_latents = noisy_latents + 0.1 * torch.randn_like(noisy_latents)
+        with torch.no_grad():
+            noisy_latents = apply_structured_noise(noisy_latents, latents, t, t_max)
 
         inputs = tokenizer(
             prompt, return_tensors="pt", padding=True, truncation=True
@@ -51,14 +101,9 @@ def train():
         with torch.no_grad():
             text_emb = text_encoder(**inputs).last_hidden_state
 
-        pred = unet_creative(noisy_latents, t, encoder_hidden_states=text_emb).sample
-
-        with torch.no_grad():
-            base_pred = unet_base(
-                noisy_latents, t, encoder_hidden_states=text_emb
-            ).sample
-
-        loss = F.mse_loss(pred, noise) + 0.1 * F.mse_loss(pred, base_pred)
+        loss, pred, base_pred = compute_loss(
+            unet_creative, unet_base, scheduler, noisy_latents, noise, t, text_emb
+        )
 
         optimizer.zero_grad()
         loss.backward()
