@@ -19,13 +19,6 @@ def compute_diversity_loss(
     time_ids,
     layer_patterns,
 ):
-    noisy_latents_a = noisy_latents_a.detach().contiguous()
-    noisy_latents_b = noisy_latents_b.detach().contiguous()
-    t = t.detach()
-    text_emb = text_emb.detach().contiguous()
-    pooled_emb = pooled_emb.detach()
-    time_ids = time_ids.detach()
-
     added_cond_kwargs = {"text_embeds": pooled_emb, "time_ids": time_ids}
     store_a = {}
     store_b = {}
@@ -40,7 +33,6 @@ def compute_diversity_loss(
                 else out.float().mean(dim=(0, 1))
             )
             store[pattern] = flat
-
         return hook
 
     try:
@@ -49,13 +41,12 @@ def compute_diversity_loss(
                 if name.endswith(p):
                     hooks.append(module.register_forward_hook(make_hook(store_a, p)))
 
-        with torch.no_grad():
-            unet(
-                noisy_latents_a,
-                t,
-                encoder_hidden_states=text_emb,
-                added_cond_kwargs=added_cond_kwargs,
-            )
+        unet(
+            noisy_latents_a.to(dtype=torch.float16),
+            t.to(dtype=torch.float16),
+            encoder_hidden_states=text_emb,
+            added_cond_kwargs=added_cond_kwargs,
+        )
     finally:
         for hook in hooks:
             hook.remove()
@@ -69,8 +60,8 @@ def compute_diversity_loss(
 
         with torch.no_grad():
             unet(
-                noisy_latents_b,
-                t,
+                noisy_latents_b.to(dtype=torch.float16),
+                t.to(dtype=torch.float16),
                 encoder_hidden_states=text_emb,
                 added_cond_kwargs=added_cond_kwargs,
             )
@@ -81,11 +72,8 @@ def compute_diversity_loss(
     shared = [p for p in layer_patterns if p in store_a and p in store_b]
     if not shared:
         return torch.tensor(0.0, device=noisy_latents_a.device)
-    similarity = torch.stack(
-        [
-            F.cosine_similarity(store_a[p].unsqueeze(0), store_b[p].unsqueeze(0))
-            for p in shared
-        ]
-    ).mean()
 
-    return similarity
+    return torch.stack([
+        F.cosine_similarity(store_a[p].unsqueeze(0), store_b[p].detach().unsqueeze(0))
+        for p in shared
+    ]).mean()
