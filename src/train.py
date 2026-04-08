@@ -1,8 +1,12 @@
 import random
+import os
 
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+
+from peft.utils import get_peft_model_state_dict
+from safetensors.torch import save_file
 
 from .model import load_model, DEVICE
 from .dataset import get_samples, get_transform, prepare_sample, IMAGE_SIZE
@@ -191,7 +195,14 @@ def train():
         if step % 50 == 0:
             torch.cuda.empty_cache()
 
-    unet_creative.save_pretrained("./creative-lora")
+    state_dict = get_peft_model_state_dict(unet_creative)
+
+    converted = {
+        k.replace("base_model.model.", "unet."): v for k, v in state_dict.items()
+    }
+
+    os.makedirs("creative-lora", exist_ok=True)
+    save_file(converted, "creative-lora/adapter_model.safetensors")
 
 
 if __name__ == "__main__":
