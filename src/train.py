@@ -19,7 +19,7 @@ from .model import (
     MID_SEG,
     LR,
 )
-from .dataset import get_samples, get_transform, prepare_sample, IMAGE_SIZE
+from .dataset import get_samples, get_transform, prepare_sample
 from .encoder import CLIPVisionEncoder, SubjectMaskBuilder
 from .encoder.feature_diff import compute_perceptual_discrepancy
 from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scale
@@ -48,19 +48,15 @@ def compute_loss(
     noise,
     t,
     text_emb,
-    pooled_emb,
-    time_ids,
     subject_mask,
 ):
     noisy_latents = noisy_latents.to(dtype=torch.float16)
     t = t.to(dtype=torch.float16)
-    added_cond_kwargs = {"text_embeds": pooled_emb, "time_ids": time_ids}
 
     pred_noise = unet_creative(
         noisy_latents,
         t,
         encoder_hidden_states=text_emb,
-        added_cond_kwargs=added_cond_kwargs,
     ).sample
 
     pred_noise_f = pred_noise.float()
@@ -93,9 +89,7 @@ def train_segment(
     timesteps,
     vae,
     text_encoder,
-    text_encoder_2,
     tokenizer,
-    tokenizer_2,
     scheduler,
     vision_encoder,
     mask_builder,
@@ -137,37 +131,20 @@ def train_segment(
             target_features = vision_encoder.extract_features(target_normalized)
 
         with torch.no_grad():
-            inputs_1 = tokenizer(
+            inputs = tokenizer(
                 prompt,
                 return_tensors="pt",
                 padding="max_length",
                 max_length=tokenizer.model_max_length,
                 truncation=True,
             ).to(DEVICE)
-            inputs_2 = tokenizer_2(
-                prompt,
-                return_tensors="pt",
-                padding="max_length",
-                max_length=tokenizer_2.model_max_length,
-                truncation=True,
-            ).to(DEVICE)
-            text_emb_1 = text_encoder(**inputs_1, output_hidden_states=True)
-            text_emb_2 = text_encoder_2(**inputs_2, output_hidden_states=True)
-            text_emb = torch.cat(
-                [text_emb_1.hidden_states[-2], text_emb_2.hidden_states[-2]], dim=-1
-            )
-            pooled_emb = text_emb_2.text_embeds
-            time_ids = torch.tensor(
-                [[IMAGE_SIZE, IMAGE_SIZE, 0, 0, IMAGE_SIZE, IMAGE_SIZE]], device=DEVICE
-            )
-            added_cond_kwargs = {"text_embeds": pooled_emb, "time_ids": time_ids}
+            text_emb = text_encoder(**inputs).last_hidden_state
 
             uniform_noisy = scheduler.add_noise(latents, noise, t)
             init_pred = unet(
                 uniform_noisy.to(dtype=torch.float16),
                 t.to(dtype=torch.float16),
                 encoder_hidden_states=text_emb,
-                added_cond_kwargs=added_cond_kwargs,
             ).sample.float()
 
             alphas_cumprod = scheduler.alphas_cumprod.to(DEVICE)
@@ -210,8 +187,6 @@ def train_segment(
             noise,
             t.float(),
             text_emb,
-            pooled_emb,
-            time_ids,
             subject_mask,
         )
 
@@ -239,9 +214,7 @@ def train():
     models = load_model()
     vae = models["vae"]
     text_encoder = models["text_encoder"]
-    text_encoder_2 = models["text_encoder_2"]
     tokenizer = models["tokenizer"]
-    tokenizer_2 = models["tokenizer_2"]
 
     scheduler = SpatiallyVaryingDDPMScheduler.from_config(
         # pyrefly: ignore [missing-attribute]
@@ -277,9 +250,7 @@ def train():
             timesteps=timesteps,
             vae=vae,
             text_encoder=text_encoder,
-            text_encoder_2=text_encoder_2,
             tokenizer=tokenizer,
-            tokenizer_2=tokenizer_2,
             scheduler=scheduler,
             vision_encoder=vision_encoder,
             mask_builder=mask_builder,

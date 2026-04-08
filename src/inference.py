@@ -1,18 +1,18 @@
 import argparse
 import torch
 
-from diffusers import StableDiffusionXLPipeline
+from diffusers import StableDiffusionPipeline
 from PIL import Image
 
 
-MODEL_ID = "glides/illustriousxl"
+MODEL_ID = "glides/counterfeit"
 ADAPTER_PATH = "./creative-lora"
 ADAPTER_NAME = "creative"
 
 
 def load_pipe():
     # pyrefly: ignore [missing-attribute]
-    pipe = StableDiffusionXLPipeline.from_pretrained(
+    pipe = StableDiffusionPipeline.from_pretrained(
         MODEL_ID, torch_dtype=torch.float16
     ).to("cuda")
 

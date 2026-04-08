@@ -6,7 +6,7 @@ from datasets import load_dataset
 
 
 DATASET_ID = "none-yet/anime-captions"
-IMAGE_SIZE = 1024
+IMAGE_SIZE = 512
 
 
 def get_samples(n=100):
