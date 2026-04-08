@@ -2,38 +2,48 @@ import argparse
 import torch
 
 from diffusers import StableDiffusionXLPipeline
+from PIL import Image
 
 
 MODEL_ID = "glides/illustriousxl"
 ADAPTER_PATH = "./creative-lora"
-OUTPUT_DIR = "./outputs"
 
 
-def load_pipe():
+def load_pipe(with_lora=True):
     # pyrefly: ignore [missing-attribute]
     pipe = StableDiffusionXLPipeline.from_pretrained(
         MODEL_ID, torch_dtype=torch.float16
     ).to("cuda")
 
-    pipe.load_lora_weights(ADAPTER_PATH)
+    if with_lora:
+        pipe.load_lora_weights(ADAPTER_PATH)
 
     return pipe
 
 
-def infer(pipe, prompt, num_inference_steps=30, guidance_scale=7.0, seed=None):
-    if seed is not None:
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-    else:
-        generator = None
+def infer_batch(pipe, prompt, num_inference_steps=30, guidance_scale=7.0, seed=None, batch_size=3):
+    # pyrefly: ignore [unsupported-operation]
+    seeds = [seed + i for i in range(batch_size)]
+    generators = [torch.Generator(device="cuda").manual_seed(s) for s in seeds]
 
-    image = pipe(
-        prompt=prompt,
+    images = pipe(
+        prompt=[prompt] * batch_size,
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
-        generator=generator,
-    ).images[0]
+        generator=generators,
+    ).images
 
-    return image
+    return images
+
+
+def make_grid(images, rows=2, cols=3):
+    w, h = images[0].size
+    grid = Image.new("RGB", size=(cols * w, rows * h))
+    for i, img in enumerate(images):
+        row = i // cols
+        col = i % cols
+        grid.paste(img, (col * w, row * h))
+    return grid
 
 
 def main():
@@ -46,17 +56,18 @@ def main():
     args = parser.parse_args()
 
     output_path = args.output
-    if output_path is None:
-        safe_prompt = args.prompt.replace(" ", "_").replace("/", "_")[:50]
-        output_path = f"{OUTPUT_DIR}/{safe_prompt}.png"
 
-    print(f"Loading model from {ADAPTER_PATH}...")
-    pipe = load_pipe()
+    print("Loading models...")
+    pipe_with_lora = load_pipe(with_lora=True)
+    pipe_without_lora = load_pipe(with_lora=False)
 
     print(f"Generating: {args.prompt}")
-    image = infer(pipe, args.prompt, args.steps, args.guidance, args.seed)
+    images = []
+    images.extend(infer_batch(pipe_with_lora, args.prompt, args.steps, args.guidance, args.seed))
+    images.extend(infer_batch(pipe_without_lora, args.prompt, args.steps, args.guidance, args.seed))
 
-    image.save(output_path)
+    grid = make_grid(images, rows=2, cols=3)
+    grid.save(output_path)
     print(f"Saved to {output_path}")
 
 

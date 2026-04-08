@@ -52,6 +52,7 @@ def compute_losses(
                 else out.float().mean(dim=(0, 1))
             )
             store_a[pattern] = flat
+
         return hook
 
     try:
@@ -84,6 +85,7 @@ def compute_losses(
                 else out.float().mean(dim=(0, 1))
             )
             store_b[pattern] = flat.detach()
+
         return hook
 
     try:
@@ -105,10 +107,12 @@ def compute_losses(
 
     shared = [p for p in layer_patterns if p in store_a and p in store_b]
     if shared:
-        diversity_loss = torch.stack([
-            F.cosine_similarity(store_a[p].unsqueeze(0), store_b[p].unsqueeze(0))
-            for p in shared
-        ]).mean()
+        diversity_loss = torch.stack(
+            [
+                F.cosine_similarity(store_a[p].unsqueeze(0), store_b[p].unsqueeze(0))
+                for p in shared
+            ]
+        ).mean()
     else:
         diversity_loss = torch.tensor(0.0, device=noisy_latents_a.device)
 
