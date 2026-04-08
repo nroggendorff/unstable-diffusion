@@ -8,10 +8,10 @@ MODEL_ID = "glides/illustriousxl"
 DEVICE = "cuda"
 NUM_INFERENCE_STEPS = 30
 EARLY_STEPS = 4
-LR = 1e-5
+LR = 5e-6
 
-LORA_RANK = 4
-LORA_ALPHA = 4
+LORA_RANK = 32
+LORA_ALPHA = 32
 LORA_TARGET_MODULES = ["to_k", "to_q", "to_v", "to_out.0"]
 
 

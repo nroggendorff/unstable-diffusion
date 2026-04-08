@@ -6,117 +6,107 @@ from tqdm import tqdm
 
 from .model import load_model, DEVICE
 from .dataset import get_samples, get_transform, prepare_sample, IMAGE_SIZE
-from .directions import LAYER_PATTERNS
-from .snapshot import SnapshotBuffer
 
 
 STEPS = 200
-
 NOISE_LOSS_WEIGHT = 1.0
-SNAPSHOT_LOSS_WEIGHT = 0.1
-SNAPSHOT_INTERVAL = 50
-DIVERSITY_SCHEDULE_START = 0.1
-DIVERSITY_SCHEDULE_END = 0.5
+UNSPECIFIED_WEIGHT = 0.4
+LR = 5e-6
 
 
-def _check_gradients(unet_creative, loss):
-    loss.backward(retain_graph=True)
-    grads = [p.grad for p in unet_creative.parameters() if p.grad is not None]
-    assert len(grads) > 0, "No gradients — check loss computation"
-    print(f"Gradient check passed. Norm: {sum(g.norm().item() for g in grads):.4f}")
-    for p in unet_creative.parameters():
-        p.grad = None
+def get_attention_mask(unet, noisy_latents, t, text_emb, pooled_emb, time_ids):
+    attention_maps = []
+    hooks = []
+
+    def make_attn_hook():
+        def hook(module, input, output):  # noqa: ARG001
+            if hasattr(module, "heads"):
+                out = (
+                    output[1] if isinstance(output, tuple) and len(output) > 1 else None
+                )
+                if out is not None and out.ndim == 4:
+                    attention_maps.append(out.detach().float().mean(dim=1))
+
+        return hook
+
+    for name, module in unet.named_modules():
+        if "attn2" in name and name.endswith("attn2"):
+            hooks.append(module.register_forward_hook(make_attn_hook()))
+
+    added_cond_kwargs = {"text_embeds": pooled_emb, "time_ids": time_ids}
+    with torch.no_grad():
+        unet(
+            noisy_latents.to(dtype=torch.float16),
+            t.to(dtype=torch.float16),
+            encoder_hidden_states=text_emb,
+            added_cond_kwargs=added_cond_kwargs,
+        )
+
+    for hook in hooks:
+        hook.remove()
+
+    if not attention_maps:
+        h = noisy_latents.shape[2]
+        w = noisy_latents.shape[3]
+        return torch.ones(1, 1, h, w, device=noisy_latents.device)
+
+    maps = []
+    target_h = noisy_latents.shape[2]
+    target_w = noisy_latents.shape[3]
+    for m in attention_maps:
+        spatial = m.mean(dim=-1)
+        side = int(spatial.shape[-1] ** 0.5)
+        if side * side == spatial.shape[-1]:
+            spatial = spatial.reshape(spatial.shape[0], side, side).unsqueeze(1)
+            spatial = F.interpolate(
+                spatial.float(),
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+            maps.append(spatial)
+
+    if not maps:
+        return torch.ones(1, 1, target_h, target_w, device=noisy_latents.device)
+
+    mask = torch.stack(maps).mean(dim=0)
+    mask = (mask - mask.min()) / (mask.max() - mask.min() + 1e-6)
+    return mask
 
 
-def compute_losses(
+def compute_loss(
     unet_creative,
-    noisy_latents_a,
-    noisy_latents_b,
-    noise_a,
+    noisy_latents,
+    noise,
     t,
     text_emb,
     pooled_emb,
     time_ids,
-    layer_patterns,
+    attention_mask,
 ):
+    noisy_latents = noisy_latents.to(dtype=torch.float16)
+    t = t.to(dtype=torch.float16)
     added_cond_kwargs = {"text_embeds": pooled_emb, "time_ids": time_ids}
-    store_a = {}
-    hooks = []
 
-    def make_hook(pattern):
-        def hook(module, input, output):  # noqa: ARG001
-            out = output[0] if isinstance(output, tuple) else output
-            flat = (
-                out.float().mean(dim=(0, 2, 3))
-                if out.ndim == 4
-                else out.float().mean(dim=(0, 1))
-            )
-            store_a[pattern] = flat
+    pred_noise = unet_creative(
+        noisy_latents,
+        t,
+        encoder_hidden_states=text_emb,
+        added_cond_kwargs=added_cond_kwargs,
+    ).sample
 
-        return hook
+    pred_noise_f = pred_noise.float()
+    noise_f = noise.float()
+    mask = attention_mask.to(pred_noise_f.device)
 
-    try:
-        for name, module in unet_creative.named_modules():
-            for p in layer_patterns:
-                if name.endswith(p):
-                    hooks.append(module.register_forward_hook(make_hook(p)))
+    per_pixel_loss = (pred_noise_f - noise_f).pow(2)
 
-        pred_noise = unet_creative(
-            noisy_latents_a.to(dtype=torch.float16),
-            t.to(dtype=torch.float16),
-            encoder_hidden_states=text_emb,
-            added_cond_kwargs=added_cond_kwargs,
-        ).sample
-    finally:
-        for hook in hooks:
-            hook.remove()
+    specified_loss = (per_pixel_loss * mask).mean()
+    unspecified_loss = (per_pixel_loss * (1.0 - mask)).mean()
 
-    noise_loss = F.mse_loss(pred_noise, noise_a)
+    loss = NOISE_LOSS_WEIGHT * specified_loss - UNSPECIFIED_WEIGHT * unspecified_loss
 
-    store_b = {}
-    hooks = []
-
-    def make_ref_hook(pattern):
-        def hook(module, input, output):  # noqa: ARG001
-            out = output[0] if isinstance(output, tuple) else output
-            flat = (
-                out.float().mean(dim=(0, 2, 3))
-                if out.ndim == 4
-                else out.float().mean(dim=(0, 1))
-            )
-            store_b[pattern] = flat.detach()
-
-        return hook
-
-    try:
-        for name, module in unet_creative.named_modules():
-            for p in layer_patterns:
-                if name.endswith(p):
-                    hooks.append(module.register_forward_hook(make_ref_hook(p)))
-
-        with torch.no_grad():
-            unet_creative(
-                noisy_latents_b.to(dtype=torch.float16),
-                t.to(dtype=torch.float16),
-                encoder_hidden_states=text_emb,
-                added_cond_kwargs=added_cond_kwargs,
-            )
-    finally:
-        for hook in hooks:
-            hook.remove()
-
-    shared = [p for p in layer_patterns if p in store_a and p in store_b]
-    if shared:
-        diversity_loss = torch.stack(
-            [
-                F.cosine_similarity(store_a[p].unsqueeze(0), store_b[p].unsqueeze(0))
-                for p in shared
-            ]
-        ).mean()
-    else:
-        diversity_loss = torch.tensor(0.0, device=noisy_latents_a.device)
-
-    return noise_loss, diversity_loss
+    return loss, specified_loss.detach(), unspecified_loss.detach()
 
 
 def train():
@@ -131,45 +121,38 @@ def train():
     scheduler = models["scheduler"]
     early_timesteps = models["early_timesteps"]
 
-    snapshot_buffer = SnapshotBuffer(unet_creative)
-
     samples = get_samples(100)
     transform = get_transform()
 
     for step in (pbar := tqdm(range(STEPS))):
         sample = random.choice(samples)
         image, prompt = prepare_sample(sample, transform, DEVICE)
-
         if image is None:
             continue
 
         with torch.no_grad():
             latents = vae.encode(image).latent_dist.sample() * vae.config.scaling_factor
 
-        noise_a = torch.randn_like(latents)
-        noise_b = torch.randn_like(latents)
+        noise = torch.randn_like(latents)
         t = early_timesteps[torch.randint(0, len(early_timesteps), (1,))]
-
         # pyrefly: ignore [missing-attribute]
-        noisy_a = scheduler.add_noise(latents, noise_a, t)
-        # pyrefly: ignore [missing-attribute]
-        noisy_b = scheduler.add_noise(latents, noise_b, t)
+        noisy_latents = scheduler.add_noise(latents, noise, t)
 
-        inputs_1 = tokenizer(
-            prompt,
-            return_tensors="pt",
-            padding="max_length",
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-        ).to(DEVICE)
-        inputs_2 = tokenizer_2(
-            prompt,
-            return_tensors="pt",
-            padding="max_length",
-            max_length=tokenizer_2.model_max_length,
-            truncation=True,
-        ).to(DEVICE)
         with torch.no_grad():
+            inputs_1 = tokenizer(
+                prompt,
+                return_tensors="pt",
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                truncation=True,
+            ).to(DEVICE)
+            inputs_2 = tokenizer_2(
+                prompt,
+                return_tensors="pt",
+                padding="max_length",
+                max_length=tokenizer_2.model_max_length,
+                truncation=True,
+            ).to(DEVICE)
             text_emb_1 = text_encoder(**inputs_1, output_hidden_states=True)
             text_emb_2 = text_encoder_2(**inputs_2, output_hidden_states=True)
             text_emb = torch.cat(
@@ -180,31 +163,20 @@ def train():
                 [[IMAGE_SIZE, IMAGE_SIZE, 0, 0, IMAGE_SIZE, IMAGE_SIZE]], device=DEVICE
             )
 
-        diversity_weight = DIVERSITY_SCHEDULE_START + (
-            DIVERSITY_SCHEDULE_END - DIVERSITY_SCHEDULE_START
-        ) * (step / STEPS)
+        attention_mask = get_attention_mask(
+            unet_creative, noisy_latents, t.float(), text_emb, pooled_emb, time_ids
+        )
 
-        noise_loss, diversity_loss = compute_losses(
+        loss, spec, unspec = compute_loss(
             unet_creative,
-            noisy_a,
-            noisy_b,
-            noise_a,
+            noisy_latents,
+            noise,
             t.float(),
             text_emb,
             pooled_emb,
             time_ids,
-            LAYER_PATTERNS,
+            attention_mask,
         )
-        snapshot_loss = snapshot_buffer.compute_distance_loss(unet_creative)
-
-        loss = (
-            NOISE_LOSS_WEIGHT * noise_loss
-            + diversity_weight * diversity_loss
-            + SNAPSHOT_LOSS_WEIGHT * snapshot_loss
-        )
-
-        if step == 0:
-            _check_gradients(unet_creative, loss)
 
         optimizer.zero_grad()
         loss.backward()
@@ -212,13 +184,9 @@ def train():
 
         pbar.set_postfix(
             loss=f"{loss.item():.4f}",
-            noise=f"{noise_loss.item():.4f}",
-            div=f"{diversity_loss.item():.4f}",
-            snap=f"{snapshot_loss.item():.4f}",
+            spec=f"{spec.item():.4f}",
+            unspec=f"{unspec.item():.4f}",
         )
-
-        if step % SNAPSHOT_INTERVAL == 0 and step > 0:
-            snapshot_buffer.push(unet_creative)
 
         if step % 50 == 0:
             torch.cuda.empty_cache()

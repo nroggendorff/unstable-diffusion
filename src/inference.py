@@ -21,7 +21,9 @@ def load_pipe(with_lora=True):
     return pipe
 
 
-def infer_batch(pipe, prompt, num_inference_steps=30, guidance_scale=7.0, seed=None, batch_size=3):
+def infer_batch(
+    pipe, prompt, num_inference_steps=30, guidance_scale=7.0, seed=None, batch_size=3
+):
     # pyrefly: ignore [unsupported-operation]
     seeds = [seed + i for i in range(batch_size)]
     generators = [torch.Generator(device="cuda").manual_seed(s) for s in seeds]
@@ -63,8 +65,14 @@ def main():
 
     print(f"Generating: {args.prompt}")
     images = []
-    images.extend(infer_batch(pipe_with_lora, args.prompt, args.steps, args.guidance, args.seed))
-    images.extend(infer_batch(pipe_without_lora, args.prompt, args.steps, args.guidance, args.seed))
+    images.extend(
+        infer_batch(pipe_with_lora, args.prompt, args.steps, args.guidance, args.seed)
+    )
+    images.extend(
+        infer_batch(
+            pipe_without_lora, args.prompt, args.steps, args.guidance, args.seed
+        )
+    )
 
     grid = make_grid(images, rows=2, cols=3)
     grid.save(output_path)
