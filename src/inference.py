@@ -33,12 +33,15 @@ def make_segment_callback(use_lora):
         if not use_lora:
             return callback_kwargs
         if step_index < EARLY_SEG:
-            segment = "early"
+            active = "early"
         elif step_index < EARLY_SEG + MID_SEG:
-            segment = "mid"
+            active = "mid"
         else:
-            segment = "late"
-        pipe.set_adapters([segment])
+            active = "late"
+        pipe.set_adapters(
+            SEGMENTS,
+            adapter_weights=[1.0 if s == active else 0.0 for s in SEGMENTS],
+        )
         return callback_kwargs
 
     return callback

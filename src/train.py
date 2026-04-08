@@ -79,7 +79,7 @@ def save_lora(model, path):
         k.replace("base_model.model.", "unet."): v for k, v in state_dict.items()
     }
     os.makedirs(path, exist_ok=True)
-    save_file(converted, os.path.join(path, "adapter_model.safetensors"))
+    save_file(converted, os.path.join(path, "pytorch_lora_weights.safetensors"))
 
 
 def train_segment(
