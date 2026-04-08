@@ -86,7 +86,13 @@ def make_grid(images, rows=2, cols=3):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("prompt", type=str)
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="A woman with long, wavy pink hair is shown in profile, "
+        "wearing a dark, strapless dress with lace trim around the neckline and armholes. "
+        "She has a prominent gold chain around her neck.",
+    )
     parser.add_argument("--output", "-o", type=str, default="output.png")
     parser.add_argument("--steps", "-s", type=int, default=30)
     parser.add_argument("--guidance", "-g", type=float, default=7.0)
