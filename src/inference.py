@@ -4,7 +4,7 @@ import torch
 from diffusers import StableDiffusionPipeline
 from PIL import Image
 
-from model import EARLY_SEG, MID_SEG
+from .model import EARLY_SEG, MID_SEG
 
 
 MODEL_ID = "glides/counterfeit"
