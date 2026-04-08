@@ -4,10 +4,12 @@ import torch
 from diffusers import StableDiffusionPipeline
 from PIL import Image
 
+from model import EARLY_SEG, MID_SEG
+
 
 MODEL_ID = "glides/counterfeit"
-ADAPTER_PATH = "./creative-lora"
-ADAPTER_NAME = "creative"
+ADAPTER_BASE_PATH = "./creative-lora"
+SEGMENTS = ["early", "mid", "late"]
 
 
 def load_pipe():
@@ -16,9 +18,30 @@ def load_pipe():
         MODEL_ID, torch_dtype=torch.float16
     ).to("cuda")
 
-    pipe.load_lora_weights(ADAPTER_PATH, adapter_name=ADAPTER_NAME)
+    for segment in SEGMENTS:
+        pipe.load_lora_weights(
+            f"{ADAPTER_BASE_PATH}/{segment}",
+            weight_name="pytorch_lora_weights.safetensors",
+            adapter_name=segment,
+        )
 
     return pipe
+
+
+def make_segment_callback(use_lora):
+    def callback(pipe, step_index, timestep, callback_kwargs):  # noqa: ARG001
+        if not use_lora:
+            return callback_kwargs
+        if step_index < EARLY_SEG:
+            segment = "early"
+        elif step_index < EARLY_SEG + MID_SEG:
+            segment = "mid"
+        else:
+            segment = "late"
+        pipe.set_adapters([segment])
+        return callback_kwargs
+
+    return callback
 
 
 def infer_batch(
@@ -31,8 +54,8 @@ def infer_batch(
     batch_size=3,
 ):
     if use_lora:
-        pipe.set_adapters([ADAPTER_NAME])
         pipe.enable_lora()
+        pipe.set_adapters(["early"])
     else:
         pipe.disable_lora()
 
@@ -45,6 +68,7 @@ def infer_batch(
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         generator=generators,
+        callback_on_step_end=make_segment_callback(use_lora),
     ).images
 
     return images
