@@ -8,14 +8,24 @@ from tqdm import tqdm
 from peft.utils import get_peft_model_state_dict
 from safetensors.torch import save_file
 
-from .model import load_model, DEVICE
+from .model import load_model, DEVICE, NUM_INFERENCE_STEPS, EARLY_STEPS
 from .dataset import get_samples, get_transform, prepare_sample, IMAGE_SIZE
+from .encoder import CLIPVisionEncoder, SubjectMaskBuilder
+from .encoder.feature_diff import compute_perceptual_discrepancy
+from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scale
 
 
 STEPS = 200
 NOISE_LOSS_WEIGHT = 1.0
 UNSPECIFIED_WEIGHT = 0.4
 LR = 5e-6
+VISION_ENCODER_MODEL = "openai/clip-vit-base-patch32"
+FEATURE_LAYERS = [2, 4, 6, 8]
+MASK_BLUR_SIGMA_START = 5.0
+MASK_BLUR_SIGMA_END = 1.0
+MASK_MIN_VALUE = 0.1
+SCHEDULER_GAMMA = 2.25
+SCHEDULER_K = 5.0
 
 
 def get_attention_mask(unet, noisy_latents, t, text_emb, pooled_emb, time_ids):
@@ -122,8 +132,25 @@ def train():
     tokenizer = models["tokenizer"]
     tokenizer_2 = models["tokenizer_2"]
     optimizer = models["optimizer"]
-    scheduler = models["scheduler"]
-    early_timesteps = models["early_timesteps"]
+
+    scheduler = SpatiallyVaryingDDPMScheduler.from_config(
+        models["pipe"].scheduler.config
+    )
+    scheduler.set_timesteps(NUM_INFERENCE_STEPS)
+    early_timesteps = scheduler.timesteps[:EARLY_STEPS].to(DEVICE)
+
+    vision_encoder = CLIPVisionEncoder(
+        model_name=VISION_ENCODER_MODEL,
+        feature_layers=FEATURE_LAYERS,
+    ).to(DEVICE)
+    mask_builder = SubjectMaskBuilder(
+        blur_sigma_start=MASK_BLUR_SIGMA_START,
+        blur_sigma_end=MASK_BLUR_SIGMA_END,
+        min_mask_value=MASK_MIN_VALUE,
+    )
+
+    clip_mean = torch.tensor([0.481, 0.457, 0.408]).view(1, 3, 1, 1).to(DEVICE)
+    clip_std = torch.tensor([0.269, 0.261, 0.276]).view(1, 3, 1, 1).to(DEVICE)
 
     samples = get_samples(100)
     transform = get_transform()
@@ -139,8 +166,19 @@ def train():
 
         noise = torch.randn_like(latents)
         t = early_timesteps[torch.randint(0, len(early_timesteps), (1,))]
-        # pyrefly: ignore [missing-attribute]
-        noisy_latents = scheduler.add_noise(latents, noise, t)
+
+        with torch.no_grad():
+            target_image_raw = vae.decode(
+                (latents / vae.config.scaling_factor).to(dtype=torch.float16)
+            ).sample
+            target_image_for_encoder = F.interpolate(
+                target_image_raw.to(torch.float32),
+                size=(224, 224),
+                mode="bilinear",
+                align_corners=False,
+            )
+            target_normalized = (target_image_for_encoder - clip_mean) / clip_std
+            target_features = vision_encoder.extract_features(target_normalized)
 
         with torch.no_grad():
             inputs_1 = tokenizer(
@@ -166,6 +204,50 @@ def train():
             time_ids = torch.tensor(
                 [[IMAGE_SIZE, IMAGE_SIZE, 0, 0, IMAGE_SIZE, IMAGE_SIZE]], device=DEVICE
             )
+            added_cond_kwargs = {"text_embeds": pooled_emb, "time_ids": time_ids}
+
+            uniform_noisy = scheduler.add_noise(latents, noise, t)
+            init_pred = unet_creative(
+                uniform_noisy.to(dtype=torch.float16),
+                t.to(dtype=torch.float16),
+                encoder_hidden_states=text_emb,
+                added_cond_kwargs=added_cond_kwargs,
+            ).sample.float()
+            alphas_cumprod = scheduler.alphas_cumprod.to(DEVICE)
+            sqrt_alpha_prod = alphas_cumprod[t.item()] ** 0.5
+            sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[t.item()]) ** 0.5
+            denoised_latents = (
+                uniform_noisy - sqrt_one_minus_alpha_prod * init_pred
+            ) / sqrt_alpha_prod
+            denoised_image_raw = vae.decode(
+                (denoised_latents / vae.config.scaling_factor).to(dtype=torch.float16)
+            ).sample
+            denoised_image_for_encoder = F.interpolate(
+                denoised_image_raw.to(torch.float32),
+                size=(224, 224),
+                mode="bilinear",
+                align_corners=False,
+            )
+            denoised_normalized = (denoised_image_for_encoder - clip_mean) / clip_std
+            pred_features = vision_encoder.extract_features(denoised_normalized)
+
+        blur_sigma = mask_builder.blur_sigma_for_step(step, STEPS)
+
+        with torch.no_grad():
+            raw_discrepancy = compute_perceptual_discrepancy(
+                pred_features, target_features
+            )
+
+        subject_mask = mask_builder.build_mask(raw_discrepancy, blur_sigma)
+        subject_mask = F.interpolate(
+            subject_mask, size=latents.shape[2:], mode="bilinear", align_corners=False
+        )
+
+        t_norm = t.float() / 1000.0
+        noise_scale = compute_spatial_noise_scale(
+            subject_mask, t_norm, gamma=SCHEDULER_GAMMA, k=SCHEDULER_K
+        )
+        noisy_latents = scheduler.add_noise(latents, noise, t, noise_scale=noise_scale)
 
         attention_mask = get_attention_mask(
             unet_creative, noisy_latents, t.float(), text_emb, pooled_emb, time_ids
