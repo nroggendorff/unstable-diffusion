@@ -25,6 +25,7 @@ from .encoder.feature_diff import compute_perceptual_discrepancy
 from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scale
 
 STEPS = 200
+BATCH_SIZE = 4
 NOISE_LOSS_WEIGHT = 1.0
 UNSPECIFIED_WEIGHT = 0.4
 VISION_ENCODER_MODEL = "openai/clip-vit-base-patch32"
@@ -42,32 +43,19 @@ SEGMENTS = [
 ]
 
 
-def compute_loss(
-    unet_creative,
-    noisy_latents,
-    noise,
-    t,
-    text_emb,
-    subject_mask,
-):
-    noisy_latents = noisy_latents.to(dtype=torch.float16)
-    t = t.to(dtype=torch.float16)
+def compute_loss(unet, noisy_latents, noise, t, text_emb, mask):
+    with torch.cuda.amp.autocast(dtype=torch.float16):
+        pred = unet(
+            noisy_latents,
+            t,
+            encoder_hidden_states=text_emb,
+        ).sample
 
-    pred_noise = unet_creative(
-        noisy_latents,
-        t,
-        encoder_hidden_states=text_emb,
-    ).sample
+    per_pixel = (pred.float() - noise.float()).pow(2)
+    mask_f = mask.float().to(per_pixel.device)
 
-    pred_noise_f = pred_noise.float()
-    noise_f = noise.float()
-    mask = subject_mask.to(pred_noise_f.device)
-
-    per_pixel_loss = (pred_noise_f - noise_f).pow(2)
-
-    specified_loss = (per_pixel_loss * mask).mean()
-    unspecified_loss = (per_pixel_loss * (1.0 - mask)).mean()
-
+    specified_loss = (per_pixel * mask_f).mean()
+    unspecified_loss = (per_pixel * (1.0 - mask_f)).mean()
     loss = NOISE_LOSS_WEIGHT * specified_loss - UNSPECIFIED_WEIGHT * unspecified_loss
 
     return loss, specified_loss.detach(), unspecified_loss.detach()
@@ -88,30 +76,18 @@ def save_lora(model, path):
     save_file(converted, os.path.join(path, "pytorch_lora_weights.safetensors"))
 
 
-def train_segment(
-    segment_name,
-    t_indices,
-    base_unet,
-    timesteps,
+def build_cache(
+    samples,
+    transform,
     vae,
     text_encoder,
     tokenizer,
-    scheduler,
     vision_encoder,
-    mask_builder,
     clip_mean,
     clip_std,
-    samples,
-    transform,
 ):
-    print(f"\nTraining segment: {segment_name}")
-
-    unet = get_peft_model(copy.deepcopy(base_unet), get_lora_config()).train()
-    optimizer = torch.optim.AdamW(unet.parameters(), lr=LR)
-    t_indices_list = list(t_indices)
-
-    for step in (pbar := tqdm(range(STEPS))):
-        sample = random.choice(samples)
+    cached = []
+    for sample in tqdm(samples, desc="Caching"):
         image, prompt = prepare_sample(sample, transform, DEVICE)
         if image is None:
             continue
@@ -119,24 +95,6 @@ def train_segment(
         with torch.no_grad():
             latents = vae.encode(image).latent_dist.sample() * vae.config.scaling_factor
 
-        noise = torch.randn_like(latents)
-        t_idx = random.choice(t_indices_list)
-        t = timesteps[t_idx].unsqueeze(0)
-
-        with torch.no_grad():
-            target_image_raw = vae.decode(
-                (latents / vae.config.scaling_factor).to(dtype=torch.float16)
-            ).sample
-            target_image_for_encoder = F.interpolate(
-                target_image_raw.to(torch.float32),
-                size=(224, 224),
-                mode="bilinear",
-                align_corners=False,
-            )
-            target_normalized = (target_image_for_encoder - clip_mean) / clip_std
-            target_features = vision_encoder.extract_features(target_normalized)
-
-        with torch.no_grad():
             inputs = tokenizer(
                 prompt,
                 return_tensors="pt",
@@ -146,55 +104,99 @@ def train_segment(
             ).to(DEVICE)
             text_emb = text_encoder(**inputs).last_hidden_state
 
-            uniform_noisy = scheduler.add_noise(latents, noise, t)
-            init_pred = unet(
-                uniform_noisy.to(dtype=torch.float16),
-                t.to(dtype=torch.float16),
-                encoder_hidden_states=text_emb,
-            ).sample.float()
+            decoded = vae.decode(
+                (latents / vae.config.scaling_factor).to(dtype=torch.float16)
+            ).sample
+            img_for_clip = F.interpolate(
+                decoded.float(), size=(224, 224), mode="bilinear", align_corners=False
+            )
+            target_features = vision_encoder.extract_features(
+                (img_for_clip - clip_mean) / clip_std
+            )
 
-            alphas_cumprod = scheduler.alphas_cumprod.to(DEVICE)
-            sqrt_alpha_prod = alphas_cumprod[t.item()] ** 0.5
-            sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[t.item()]) ** 0.5
-            denoised_latents = (
-                uniform_noisy.float() - sqrt_one_minus_alpha_prod * init_pred
-            ) / sqrt_alpha_prod
-            denoised_image_raw = vae.decode(
+        cached.append(
+            {
+                "latents": latents.cpu().float(),
+                "text_emb": text_emb.cpu(),
+                "target_features": [f.cpu() for f in target_features],
+            }
+        )
+
+    return cached
+
+
+def train_segment(
+    segment_name,
+    t_indices,
+    base_unet,
+    timesteps,
+    vae,
+    scheduler,
+    vision_encoder,
+    mask_builder,
+    clip_mean,
+    clip_std,
+    cached,
+):
+    print(f"\nTraining segment: {segment_name}")
+
+    unet = get_peft_model(copy.deepcopy(base_unet), get_lora_config()).train()
+    optimizer = torch.optim.AdamW(unet.parameters(), lr=LR)
+    t_indices_list = list(t_indices)
+    alphas = scheduler.alphas_cumprod.to(DEVICE)
+
+    for step in (pbar := tqdm(range(STEPS))):
+        items = random.choices(cached, k=BATCH_SIZE)
+        latents = torch.cat([x["latents"] for x in items]).to(DEVICE)
+        text_emb = torch.cat([x["text_emb"] for x in items]).to(DEVICE)
+        target_features = [
+            torch.cat([x["target_features"][i] for x in items]).to(DEVICE)
+            for i in range(len(items[0]["target_features"]))
+        ]
+
+        noise = torch.randn_like(latents)
+        t_idx = random.choice(t_indices_list)
+        t = timesteps[t_idx].unsqueeze(0).expand(BATCH_SIZE).clone()
+
+        with torch.no_grad():
+            uniform_noisy = scheduler.add_noise(latents, noise, t)
+
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                init_pred = unet(
+                    uniform_noisy.to(dtype=torch.float16),
+                    t,
+                    encoder_hidden_states=text_emb.to(dtype=torch.float16),
+                ).sample.float()
+
+            a = alphas[t.long()].view(-1, 1, 1, 1) ** 0.5
+            b = (1 - alphas[t.long()]).view(-1, 1, 1, 1) ** 0.5
+            denoised_latents = (uniform_noisy.float() - b * init_pred) / a
+
+            decoded = vae.decode(
                 (denoised_latents / vae.config.scaling_factor).to(dtype=torch.float16)
             ).sample
-            denoised_image_for_encoder = F.interpolate(
-                denoised_image_raw.to(torch.float32),
-                size=(224, 224),
-                mode="bilinear",
-                align_corners=False,
+            img_for_clip = F.interpolate(
+                decoded.float(), size=(224, 224), mode="bilinear", align_corners=False
             )
-            denoised_normalized = (denoised_image_for_encoder - clip_mean) / clip_std
-            pred_features = vision_encoder.extract_features(denoised_normalized)
+            pred_features = vision_encoder.extract_features(
+                (img_for_clip - clip_mean) / clip_std
+            )
 
-            raw_discrepancy = compute_perceptual_discrepancy(
-                pred_features, target_features
-            )
+            raw_diff = compute_perceptual_discrepancy(pred_features, target_features)
 
         blur_sigma = mask_builder.blur_sigma_for_step(step, STEPS)
-        subject_mask = mask_builder.build_mask(raw_discrepancy, blur_sigma)
-        subject_mask = F.interpolate(
-            subject_mask, size=latents.shape[2:], mode="bilinear", align_corners=False
+        mask = mask_builder.build_mask(raw_diff, blur_sigma)
+        mask = F.interpolate(
+            mask, size=latents.shape[2:], mode="bilinear", align_corners=False
         )
 
         t_norm = t.float() / 1000.0
         noise_scale = compute_spatial_noise_scale(
-            subject_mask, t_norm, gamma=SCHEDULER_GAMMA, k=SCHEDULER_K
+            mask, t_norm, gamma=SCHEDULER_GAMMA, k=SCHEDULER_K
         )
         noisy_latents = scheduler.add_noise(latents, noise, t, noise_scale=noise_scale)
 
-        loss, spec, unspec = compute_loss(
-            unet,
-            noisy_latents,
-            noise,
-            t.float(),
-            text_emb,
-            subject_mask,
-        )
+        loss, spec, unspec = compute_loss(unet, noisy_latents, noise, t, text_emb, mask)
 
         optimizer.zero_grad()
         loss.backward()
@@ -204,7 +206,7 @@ def train_segment(
             loss=f"{loss.item():.4f}",
             spec=f"{spec.item():.4f}",
             unspec=f"{unspec.item():.4f}",
-            t=t.item(),
+            t=t[0].item(),
         )
 
         if step % 50 == 0:
@@ -245,6 +247,18 @@ def train():
     samples = get_samples(100)
     transform = get_transform()
 
+    print("Building latent cache...")
+    cached = build_cache(
+        samples,
+        transform,
+        vae,
+        text_encoder,
+        tokenizer,
+        vision_encoder,
+        clip_mean,
+        clip_std,
+    )
+
     # pyrefly: ignore [missing-attribute]
     base_unet = models["pipe"].unet
 
@@ -255,15 +269,12 @@ def train():
             base_unet=base_unet,
             timesteps=timesteps,
             vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
             scheduler=scheduler,
             vision_encoder=vision_encoder,
             mask_builder=mask_builder,
             clip_mean=clip_mean,
             clip_std=clip_std,
-            samples=samples,
-            transform=transform,
+            cached=cached,
         )
 
 
