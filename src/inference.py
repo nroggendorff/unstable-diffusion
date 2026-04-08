@@ -7,23 +7,35 @@ from PIL import Image
 
 MODEL_ID = "glides/illustriousxl"
 ADAPTER_PATH = "./creative-lora"
+ADAPTER_NAME = "creative"
 
 
-def load_pipe(with_lora=True):
+def load_pipe():
     # pyrefly: ignore [missing-attribute]
     pipe = StableDiffusionXLPipeline.from_pretrained(
         MODEL_ID, torch_dtype=torch.float16
     ).to("cuda")
 
-    if with_lora:
-        pipe.load_lora_weights(ADAPTER_PATH)
+    pipe.load_lora_weights(ADAPTER_PATH, adapter_name=ADAPTER_NAME)
 
     return pipe
 
 
 def infer_batch(
-    pipe, prompt, num_inference_steps=30, guidance_scale=7.0, seed=None, batch_size=3
+    pipe,
+    prompt,
+    use_lora=True,
+    num_inference_steps=30,
+    guidance_scale=7.0,
+    seed=None,
+    batch_size=3,
 ):
+    if use_lora:
+        pipe.set_adapters([ADAPTER_NAME])
+        pipe.enable_lora()
+    else:
+        pipe.disable_lora()
+
     # pyrefly: ignore [unsupported-operation]
     seeds = [seed + i for i in range(batch_size)]
     generators = [torch.Generator(device="cuda").manual_seed(s) for s in seeds]
@@ -57,26 +69,35 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    output_path = args.output
-
-    print("Loading models...")
-    pipe_with_lora = load_pipe(with_lora=True)
-    pipe_without_lora = load_pipe(with_lora=False)
+    print("Loading model...")
+    pipe = load_pipe()
 
     print(f"Generating: {args.prompt}")
     images = []
     images.extend(
-        infer_batch(pipe_with_lora, args.prompt, args.steps, args.guidance, args.seed)
+        infer_batch(
+            pipe,
+            args.prompt,
+            use_lora=True,
+            num_inference_steps=args.steps,
+            guidance_scale=args.guidance,
+            seed=args.seed,
+        )
     )
     images.extend(
         infer_batch(
-            pipe_without_lora, args.prompt, args.steps, args.guidance, args.seed
+            pipe,
+            args.prompt,
+            use_lora=False,
+            num_inference_steps=args.steps,
+            guidance_scale=args.guidance,
+            seed=args.seed,
         )
     )
 
     grid = make_grid(images, rows=2, cols=3)
-    grid.save(output_path)
-    print(f"Saved to {output_path}")
+    grid.save(args.output)
+    print(f"Saved to {args.output}")
 
 
 if __name__ == "__main__":
