@@ -32,6 +32,7 @@ STEPS = 2000
 BATCH_SIZE = 8
 NOISE_LOSS_WEIGHT = 1.0
 DIVERSITY_WEIGHT = 0.4
+RECON_LOSS_WEIGHT = 0.2
 
 STEPS //= BATCH_SIZE
 
@@ -85,7 +86,7 @@ def _blend_masks(
     return (1.0 - alpha) * attn_mask + alpha * clip_mask
 
 
-def compute_loss(unet, noisy_latents, noise, t, text_emb, mask):
+def compute_loss(unet, noisy_latents, noise, t, text_emb, mask, scheduler, noise_scale):
     with torch.amp.autocast("cuda", dtype=torch.float16):
         pred = unet(
             noisy_latents,
@@ -103,8 +104,18 @@ def compute_loss(unet, noisy_latents, noise, t, text_emb, mask):
     bg = pred_f * (1.0 - mask_f)
     diversity_loss = -bg.var(dim=0).mean()
 
-    loss = NOISE_LOSS_WEIGHT * specified_loss + DIVERSITY_WEIGHT * diversity_loss
-    return loss, specified_loss.detach(), diversity_loss.detach()
+    x0_pred = scheduler.predict_x0(noisy_latents, pred_f, t, noise_scale)
+    x0_target = scheduler.get_x0_target(noisy_latents, noise_f, t, noise_scale)
+
+    recon_weight = mask_f
+    recon_loss = ((x0_pred - x0_target).pow(2) * recon_weight).mean()
+
+    loss = (
+        NOISE_LOSS_WEIGHT * specified_loss
+        + DIVERSITY_WEIGHT * diversity_loss
+        + RECON_LOSS_WEIGHT * recon_loss
+    )
+    return loss, specified_loss.detach(), diversity_loss.detach(), recon_loss.detach()
 
 
 def save_lora(model, path):
@@ -242,7 +253,9 @@ def train_segment(
         )
         noisy_latents = scheduler.add_noise(latents, noise, t, noise_scale=noise_scale)
 
-        loss, spec, div = compute_loss(unet, noisy_latents, noise, t, text_emb, mask)
+        loss, spec, div, recon = compute_loss(
+            unet, noisy_latents, noise, t, text_emb, mask, scheduler, noise_scale
+        )
 
         optimizer.zero_grad()
         loss.backward()
@@ -252,6 +265,7 @@ def train_segment(
             loss=f"{loss.item():.4f}",
             spec=f"{spec.item():.4f}",
             div=f"{div.item():.4f}",
+            recon=f"{recon.item():.4f}",
             blend=f"{alpha:.2f}",
             t=t[0].item(),
         )
