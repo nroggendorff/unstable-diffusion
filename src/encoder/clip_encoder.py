@@ -5,7 +5,10 @@ from transformers import CLIPModel
 
 class CLIPVisionEncoder(nn.Module):
     def __init__(
-        self, model_name="openai/clip-vit-b32", feature_layers=None, freeze=True
+        self,
+        model_name="openai/clip-vit-base-patch32",
+        feature_layers=None,
+        freeze=True,
     ):
         super().__init__()
         if feature_layers is None:
@@ -28,7 +31,7 @@ class CLIPVisionEncoder(nn.Module):
 
     def _make_hook(self, layer_idx):
         def hook(module, input, output):  # noqa: ARG001
-            self._activations[layer_idx] = output.detach()
+            self._activations[layer_idx] = output[0].detach()
 
         return hook
 

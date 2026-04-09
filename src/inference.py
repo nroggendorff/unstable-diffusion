@@ -53,7 +53,7 @@ def infer_batch(
     use_lora=True,
     num_inference_steps=30,
     guidance_scale=7.0,
-    seed=None,
+    seed=42,
     batch_size=3,
 ):
     if use_lora:
@@ -62,7 +62,6 @@ def infer_batch(
     else:
         pipe.disable_lora()
 
-    # pyrefly: ignore [unsupported-operation]
     seeds = [seed + i for i in range(batch_size)]
     generators = [torch.Generator(device="cuda").manual_seed(s) for s in seeds]
 

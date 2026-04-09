@@ -45,6 +45,17 @@ SEGMENTS = [
 ]
 
 
+def decode_for_clip(vae, latents, clip_mean, clip_std):
+    decoded = vae.decode(
+        (latents / vae.config.scaling_factor).to(dtype=torch.float16)
+    ).sample
+    img = F.interpolate(
+        decoded.float(), size=(224, 224), mode="bilinear", align_corners=False
+    )
+    img = img * 0.5 + 0.5
+    return (img - clip_mean) / clip_std
+
+
 def compute_loss(unet, noisy_latents, noise, t, text_emb, mask):
     with torch.amp.autocast("cuda", dtype=torch.float16):
         pred = unet(
@@ -106,14 +117,8 @@ def build_cache(
             ).to(DEVICE)
             text_emb = text_encoder(**inputs).last_hidden_state
 
-            decoded = vae.decode(
-                (latents / vae.config.scaling_factor).to(dtype=torch.float16)
-            ).sample
-            img_for_clip = F.interpolate(
-                decoded.float(), size=(224, 224), mode="bilinear", align_corners=False
-            )
             target_features = vision_encoder.extract_features(
-                (img_for_clip - clip_mean) / clip_std
+                decode_for_clip(vae, latents, clip_mean, clip_std)
             )
 
         cached.append(
@@ -174,14 +179,8 @@ def train_segment(
             b = (1 - alphas[t.long()]).view(-1, 1, 1, 1) ** 0.5
             denoised_latents = (uniform_noisy.float() - b * init_pred) / a
 
-            decoded = vae.decode(
-                (denoised_latents / vae.config.scaling_factor).to(dtype=torch.float16)
-            ).sample
-            img_for_clip = F.interpolate(
-                decoded.float(), size=(224, 224), mode="bilinear", align_corners=False
-            )
             pred_features = vision_encoder.extract_features(
-                (img_for_clip - clip_mean) / clip_std
+                decode_for_clip(vae, denoised_latents, clip_mean, clip_std)
             )
 
             raw_diff = compute_perceptual_discrepancy(pred_features, target_features)
