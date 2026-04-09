@@ -30,9 +30,8 @@ from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scal
 
 STEPS = 2000
 BATCH_SIZE = 8
-NOISE_LOSS_WEIGHT = 1.0
-DIVERSITY_WEIGHT = 0.4
-RECON_LOSS_WEIGHT = 0.2
+NOISE_LOSS_WEIGHT = 0.6
+DIVERSITY_WEIGHT = 1.2
 
 STEPS //= BATCH_SIZE
 
@@ -86,13 +85,9 @@ def _blend_masks(
     return (1.0 - alpha) * attn_mask + alpha * clip_mask
 
 
-def compute_loss(unet, noisy_latents, noise, t, text_emb, mask, scheduler, noise_scale):
+def compute_loss(unet, noisy_latents, noise, t, text_emb, mask, noise_scale):
     with torch.amp.autocast("cuda", dtype=torch.float16):
-        pred = unet(
-            noisy_latents,
-            t,
-            encoder_hidden_states=text_emb,
-        ).sample
+        pred = unet(noisy_latents, t, encoder_hidden_states=text_emb).sample
 
     pred_f = pred.float()
     noise_f = noise.float()
@@ -107,30 +102,17 @@ def compute_loss(unet, noisy_latents, noise, t, text_emb, mask, scheduler, noise
 
     specified_loss = (per_pixel * mask_f).mean()
 
-    bg = pred_f * (1.0 - mask_f)
+    mean_pred = pred_f.mean(dim=0, keepdim=True).detach()
+    deviation = pred_f - mean_pred
 
-    if noise_scale is not None:
-        bg = bg / (noise_scale.clamp(min=1e-2) + 1e-6)
-    diversity_loss = -bg.var(dim=0).mean()
+    deviation_norm = deviation / (deviation.norm(dim=1, keepdim=True) + 1e-6)
+    mean_norm = mean_pred / (mean_pred.norm(dim=1, keepdim=True) + 1e-6)
 
-    alphas = scheduler.alphas_cumprod.to(pred_f.device)
-    a = alphas[t.long()].view(-1, 1, 1, 1).sqrt().clamp(min=1e-2)
-    b = (1 - alphas[t.long()]).view(-1, 1, 1, 1).sqrt().clamp(min=1e-2)
+    cos_to_mean = (deviation_norm * mean_norm).sum(dim=1, keepdim=True)
+    anti_average_loss = (cos_to_mean * mask_f).mean()
 
-    x0_pred = (noisy_latents.float() - b * pred_f) / a
-    x0_pred = x0_pred.clamp(-4.0, 4.0)
-
-    noise_from_x0_pred = (noisy_latents.float() - a * x0_pred) / b
-
-    recon_weight = mask_f.detach()
-    recon_loss = ((noise_from_x0_pred - noise_f).pow(2) * recon_weight).mean()
-
-    loss = (
-        NOISE_LOSS_WEIGHT * specified_loss
-        + DIVERSITY_WEIGHT * diversity_loss
-        + RECON_LOSS_WEIGHT * recon_loss
-    )
-    return loss, specified_loss.detach(), diversity_loss.detach(), recon_loss.detach()
+    loss = NOISE_LOSS_WEIGHT * specified_loss + DIVERSITY_WEIGHT * anti_average_loss
+    return loss, specified_loss.detach(), anti_average_loss.detach()
 
 
 def save_lora(model, path):
@@ -218,7 +200,10 @@ def train_segment(
     capture = CrossAttentionCapture(unet)
 
     for step in (pbar := tqdm(range(STEPS))):
-        items = random.choices(cached, k=BATCH_SIZE)
+        indices = list(range(len(cached)))
+        random.shuffle(indices)
+        items = [cached[i] for i in indices[:BATCH_SIZE]]
+
         latents = torch.cat([x["latents"] for x in items]).to(DEVICE)
         text_emb = torch.cat([x["text_emb"] for x in items]).to(DEVICE)
         token_mask = torch.cat([x["token_attention_mask"] for x in items]).to(DEVICE)
@@ -268,8 +253,8 @@ def train_segment(
         )
         noisy_latents = scheduler.add_noise(latents, noise, t, noise_scale=noise_scale)
 
-        loss, spec, div, recon = compute_loss(
-            unet, noisy_latents, noise, t, text_emb, mask, scheduler, noise_scale
+        loss, spec, div = compute_loss(
+            unet, noisy_latents, noise, t, text_emb, mask, noise_scale
         )
 
         optimizer.zero_grad()
@@ -280,7 +265,6 @@ def train_segment(
             loss=f"{loss.item():.4f}",
             spec=f"{spec.item():.4f}",
             div=f"{div.item():.4f}",
-            recon=f"{recon.item():.4f}",
             blend=f"{alpha:.2f}",
             t=t[0].item(),
         )
