@@ -4,12 +4,28 @@ import torch
 from diffusers import StableDiffusionPipeline
 from PIL import Image
 
-from .model import EARLY_SEG, MID_SEG
+from .model import EARLY_SEG, MID_SEG, LATE_SEG
 
 
 MODEL_ID = "glides/counterfeit"
 ADAPTER_BASE_PATH = "./creative-lora"
 SEGMENTS = ["early", "mid", "late"]
+
+_SEGMENT_CENTERS = [
+    EARLY_SEG / 2,
+    EARLY_SEG + MID_SEG / 2,
+    EARLY_SEG + MID_SEG + LATE_SEG / 2,
+]
+_BLEND_WINDOW = 8
+
+
+def _adapter_weights(step_index: int) -> list[float]:
+    raw = [
+        max(0.0, 1.0 - abs(step_index - center) / _BLEND_WINDOW)
+        for center in _SEGMENT_CENTERS
+    ]
+    total = sum(raw) + 1e-8
+    return [w / total for w in raw]
 
 
 def load_pipe():
@@ -32,16 +48,8 @@ def make_segment_callback(use_lora):
     def callback(pipe, step_index, timestep, callback_kwargs):  # noqa: ARG001
         if not use_lora:
             return callback_kwargs
-        if step_index < EARLY_SEG:
-            active = "early"
-        elif step_index < EARLY_SEG + MID_SEG:
-            active = "mid"
-        else:
-            active = "late"
-        pipe.set_adapters(
-            SEGMENTS,
-            adapter_weights=[1.0 if s == active else 0.0 for s in SEGMENTS],
-        )
+        weights = _adapter_weights(step_index)
+        pipe.set_adapters(SEGMENTS, adapter_weights=weights)
         return callback_kwargs
 
     return callback
@@ -53,15 +61,16 @@ def infer_batch(
     use_lora=True,
     num_inference_steps=30,
     guidance_scale=7.0,
-    seed=42,
+    seed=None,
     batch_size=3,
 ):
     if use_lora:
         pipe.enable_lora()
-        pipe.set_adapters(["early"])
+        pipe.set_adapters(SEGMENTS, adapter_weights=_adapter_weights(0))
     else:
         pipe.disable_lora()
 
+    # pyrefly: ignore [unsupported-operation]
     seeds = [seed + i for i in range(batch_size)]
     generators = [torch.Generator(device="cuda").manual_seed(s) for s in seeds]
 

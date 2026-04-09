@@ -36,7 +36,8 @@ class SubjectMaskBuilder:
     def build_mask(
         self, raw_discrepancy: torch.Tensor, blur_sigma: float
     ) -> torch.Tensor:
-        kernel_size = int(2 * 2 * blur_sigma + 1)
+        kernel_size = int(4 * blur_sigma + 1)
+        kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
         blurred = _gaussian_blur(raw_discrepancy, kernel_size, blur_sigma)
         bmin = blurred.amin(dim=(2, 3), keepdim=True)
         bmax = blurred.amax(dim=(2, 3), keepdim=True)
