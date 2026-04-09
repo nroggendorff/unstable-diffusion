@@ -48,6 +48,17 @@ class SpatiallyVaryingDDPMScheduler(DDPMScheduler):
 
         return (x_t - b * noise) / a
 
+    def predict_noise_from_x0(self, x_t, x0, t, noise_scale=None):
+        alphas = self.alphas_cumprod.to(x_t.device)
+
+        a = alphas[t.long()].view(-1, 1, 1, 1).sqrt()
+        b = (1 - alphas[t.long()]).view(-1, 1, 1, 1).sqrt()
+
+        if noise_scale is not None:
+            b = b * noise_scale
+
+        return (x_t - a * x0) / (b + 1e-6)
+
 
 def compute_spatial_noise_scale(
     mask: torch.Tensor,
