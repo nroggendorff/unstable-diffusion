@@ -305,7 +305,7 @@ def train():
     clip_mean = torch.tensor([0.481, 0.457, 0.408]).view(1, 3, 1, 1).to(DEVICE)
     clip_std = torch.tensor([0.269, 0.261, 0.276]).view(1, 3, 1, 1).to(DEVICE)
 
-    samples = get_samples(100)
+    samples = get_samples(STEPS)
     transform = get_transform()
 
     print("Building latent cache...")
