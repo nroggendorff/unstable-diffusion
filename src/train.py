@@ -24,8 +24,8 @@ from .encoder import CLIPVisionEncoder, SubjectMaskBuilder
 from .encoder.feature_diff import compute_perceptual_discrepancy
 from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scale
 
-STEPS = 200
-BATCH_SIZE = 4
+STEPS = 20000
+BATCH_SIZE = 6
 NOISE_LOSS_WEIGHT = 1.0
 UNSPECIFIED_WEIGHT = 0.4
 VISION_ENCODER_MODEL = "openai/clip-vit-base-patch32"
@@ -36,6 +36,8 @@ MASK_MIN_VALUE = 0.1
 SCHEDULER_GAMMA = 2.25
 SCHEDULER_K = 5.0
 
+STEPS = STEPS // BATCH_SIZE
+
 SEGMENTS = [
     ("early", range(0, EARLY_SEG)),
     ("mid", range(EARLY_SEG, EARLY_SEG + MID_SEG)),
@@ -44,7 +46,7 @@ SEGMENTS = [
 
 
 def compute_loss(unet, noisy_latents, noise, t, text_emb, mask):
-    with torch.cuda.amp.autocast(dtype=torch.float16):
+    with torch.amp.autocast("cuda", dtype=torch.float16):
         pred = unet(
             noisy_latents,
             t,
@@ -161,7 +163,7 @@ def train_segment(
         with torch.no_grad():
             uniform_noisy = scheduler.add_noise(latents, noise, t)
 
-            with torch.cuda.amp.autocast(dtype=torch.float16):
+            with torch.amp.autocast("cuda", dtype=torch.float16):
                 init_pred = unet(
                     uniform_noisy.to(dtype=torch.float16),
                     t,
