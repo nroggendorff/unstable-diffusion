@@ -76,6 +76,8 @@ def infer_batch(
 
     images = pipe(
         prompt=[prompt] * batch_size,
+        width=1024,
+        height=1024,
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         generator=generators,
