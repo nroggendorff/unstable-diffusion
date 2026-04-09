@@ -110,23 +110,20 @@ def compute_loss(unet, noisy_latents, noise, t, text_emb, mask, scheduler, noise
     bg = pred_f * (1.0 - mask_f)
 
     if noise_scale is not None:
-        bg = bg / (noise_scale + 1e-6)
-
+        bg = bg / (noise_scale.clamp(min=1e-2) + 1e-6)
     diversity_loss = -bg.var(dim=0).mean()
 
     alphas = scheduler.alphas_cumprod.to(pred_f.device)
-    a = alphas[t.long()].view(-1, 1, 1, 1).sqrt()
-    a = a.clamp(1e-2, 1.0)
+    a = alphas[t.long()].view(-1, 1, 1, 1).sqrt().clamp(min=1e-2)
+    b = (1 - alphas[t.long()]).view(-1, 1, 1, 1).sqrt().clamp(min=1e-2)
 
-    b = (1 - alphas[t.long()]).view(-1, 1, 1, 1).sqrt()
-    x0_pred = (noisy_latents.float() - b * pred_f) / (a + 1e-6)
+    x0_pred = (noisy_latents.float() - b * pred_f) / a
+    x0_pred = x0_pred.clamp(-4.0, 4.0)
 
-    noise_from_x0_pred = scheduler.predict_noise_from_x0(
-        noisy_latents, x0_pred, t, noise_scale
-    )
+    noise_from_x0_pred = (noisy_latents.float() - a * x0_pred) / b
 
     recon_weight = mask_f.detach()
-    recon_loss = ((noise_from_x0_pred - noise_target).pow(2) * recon_weight).mean()
+    recon_loss = ((noise_from_x0_pred - noise_f).pow(2) * recon_weight).mean()
 
     loss = (
         NOISE_LOSS_WEIGHT * specified_loss
