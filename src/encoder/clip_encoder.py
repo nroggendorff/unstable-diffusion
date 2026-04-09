@@ -31,7 +31,7 @@ class CLIPVisionEncoder(nn.Module):
 
     def _make_hook(self, layer_idx):
         def hook(module, input, output):  # noqa: ARG001
-            self._activations[layer_idx] = output[0].detach()
+            self._activations[layer_idx] = output.detach()
 
         return hook
 

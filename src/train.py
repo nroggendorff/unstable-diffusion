@@ -3,6 +3,7 @@ import copy
 import os
 
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from peft import get_peft_model
@@ -19,7 +20,12 @@ from .model import (
     LR,
 )
 from .dataset import get_samples, get_transform, prepare_sample
-from .encoder import SubjectMaskBuilder, CrossAttentionCapture
+from .encoder import (
+    CLIPVisionEncoder,
+    compute_perceptual_discrepancy,
+    SubjectMaskBuilder,
+    CrossAttentionCapture,
+)
 from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scale
 
 STEPS = 200
@@ -35,11 +41,43 @@ MASK_MIN_VALUE = 0.1
 SCHEDULER_SUBJECT_POWER = 1.5
 SCHEDULER_BG_SCALE = 0.4
 
+VISION_ENCODER_MODEL = "openai/clip-vit-base-patch32"
+FEATURE_LAYERS = [2, 4, 6, 8]
+MASK_BLEND_ALPHA = 0.5
+
 SEGMENTS = [
     ("early", range(0, EARLY_SEG)),
     ("mid", range(EARLY_SEG, EARLY_SEG + MID_SEG)),
     ("late", range(EARLY_SEG + MID_SEG, NUM_INFERENCE_STEPS)),
 ]
+
+
+def decode_for_clip(
+    vae, latents: torch.Tensor, clip_mean: torch.Tensor, clip_std: torch.Tensor
+) -> torch.Tensor:
+    latents = latents.to(dtype=vae.dtype)
+
+    decoded = vae.decode(latents / vae.config.scaling_factor).sample
+
+    decoded = (decoded.float().clamp(-1, 1) + 1) / 2
+    decoded = F.interpolate(
+        decoded, size=(224, 224), mode="bilinear", align_corners=False
+    )
+    return (decoded - clip_mean) / clip_std
+
+
+def _blend_masks(
+    attn_mask: torch.Tensor,
+    clip_raw: torch.Tensor,
+    spatial_size: tuple,
+) -> torch.Tensor:
+    clip_mask = F.interpolate(
+        clip_raw, size=spatial_size, mode="bilinear", align_corners=False
+    )
+    mn = clip_mask.flatten(1).min(1).values.view(-1, 1, 1, 1)
+    mx = clip_mask.flatten(1).max(1).values.view(-1, 1, 1, 1)
+    clip_mask = (clip_mask - mn) / (mx - mn + 1e-8)
+    return (1.0 - MASK_BLEND_ALPHA) * attn_mask + MASK_BLEND_ALPHA * clip_mask
 
 
 def compute_loss(unet, noisy_latents, noise, t, text_emb, mask):
@@ -79,7 +117,16 @@ def save_lora(model, path):
     save_file(converted, os.path.join(path, "pytorch_lora_weights.safetensors"))
 
 
-def build_cache(samples, transform, vae, text_encoder, tokenizer):
+def build_cache(
+    samples,
+    transform,
+    vae,
+    text_encoder,
+    tokenizer,
+    vision_encoder,
+    clip_mean,
+    clip_std,
+):
     cached = []
     for sample in tqdm(samples, desc="Caching"):
         image, prompt = prepare_sample(sample, transform, DEVICE)
@@ -98,11 +145,19 @@ def build_cache(samples, transform, vae, text_encoder, tokenizer):
             ).to(DEVICE)
             text_emb = text_encoder(**inputs).last_hidden_state
 
+            target_features = [
+                f.cpu()
+                for f in vision_encoder.extract_features(
+                    decode_for_clip(vae, latents, clip_mean, clip_std)
+                )
+            ]
+
         cached.append(
             {
                 "latents": latents.cpu().float(),
                 "text_emb": text_emb.cpu(),
                 "token_attention_mask": inputs.attention_mask.cpu(),
+                "target_features": target_features,
             }
         )
 
@@ -114,22 +169,32 @@ def train_segment(
     t_indices,
     base_unet,
     timesteps,
+    vae,
     scheduler,
+    vision_encoder,
     mask_builder,
+    clip_mean,
+    clip_std,
+    cached,
 ):
     print(f"\nTraining segment: {segment_name}")
 
     unet = get_peft_model(copy.deepcopy(base_unet), get_lora_config()).train()
     optimizer = torch.optim.AdamW(unet.parameters(), lr=LR)
     t_indices_list = list(t_indices)
+    alphas = scheduler.alphas_cumprod.to(DEVICE)
 
     capture = CrossAttentionCapture(unet)
 
     for step in (pbar := tqdm(range(STEPS))):
-        items = random.choices(cached_global, k=BATCH_SIZE)
+        items = random.choices(cached, k=BATCH_SIZE)
         latents = torch.cat([x["latents"] for x in items]).to(DEVICE)
         text_emb = torch.cat([x["text_emb"] for x in items]).to(DEVICE)
         token_mask = torch.cat([x["token_attention_mask"] for x in items]).to(DEVICE)
+        target_features = [
+            torch.cat([x["target_features"][i] for x in items]).to(DEVICE)
+            for i in range(len(items[0]["target_features"]))
+        ]
 
         noise = torch.randn_like(latents)
         t_idx = random.choice(t_indices_list)
@@ -140,13 +205,24 @@ def train_segment(
 
             with capture:
                 with torch.amp.autocast("cuda", dtype=torch.float16):
-                    unet(
+                    init_pred = unet(
                         uniform_noisy.to(dtype=torch.float16),
                         t,
                         encoder_hidden_states=text_emb.to(dtype=torch.float16),
-                    )
+                    ).sample.float()
 
-            mask = capture.build_mask(token_mask, latents.shape[2:])
+            attn_mask = capture.build_mask(token_mask, latents.shape[2:])
+
+            a = alphas[t.long()].view(-1, 1, 1, 1) ** 0.5
+            b = (1 - alphas[t.long()]).view(-1, 1, 1, 1) ** 0.5
+            denoised_latents = (uniform_noisy.float() - b * init_pred) / a
+
+            pred_features = vision_encoder.extract_features(
+                decode_for_clip(vae, denoised_latents, clip_mean, clip_std)
+            )
+            raw_diff = compute_perceptual_discrepancy(pred_features, target_features)
+
+            mask = _blend_masks(attn_mask, raw_diff, latents.shape[2:])
 
         blur_sigma = mask_builder.blur_sigma_for_step(step, STEPS)
         mask = mask_builder.build_mask(mask, blur_sigma)
@@ -182,12 +258,7 @@ def train_segment(
     torch.cuda.empty_cache()
 
 
-cached_global = []
-
-
 def train():
-    global cached_global
-
     models = load_model()
     vae = models["vae"]
     text_encoder = models["text_encoder"]
@@ -200,17 +271,34 @@ def train():
     scheduler.set_timesteps(NUM_INFERENCE_STEPS)
     timesteps = scheduler.timesteps.to(DEVICE)
 
+    vision_encoder = CLIPVisionEncoder(
+        model_name=VISION_ENCODER_MODEL,
+        feature_layers=FEATURE_LAYERS,
+    ).to(DEVICE)
+
     mask_builder = SubjectMaskBuilder(
         blur_sigma_start=MASK_BLUR_SIGMA_START,
         blur_sigma_end=MASK_BLUR_SIGMA_END,
         min_mask_value=MASK_MIN_VALUE,
     )
 
+    clip_mean = torch.tensor([0.481, 0.457, 0.408]).view(1, 3, 1, 1).to(DEVICE)
+    clip_std = torch.tensor([0.269, 0.261, 0.276]).view(1, 3, 1, 1).to(DEVICE)
+
     samples = get_samples(100)
     transform = get_transform()
 
     print("Building latent cache...")
-    cached_global = build_cache(samples, transform, vae, text_encoder, tokenizer)
+    cached = build_cache(
+        samples,
+        transform,
+        vae,
+        text_encoder,
+        tokenizer,
+        vision_encoder,
+        clip_mean,
+        clip_std,
+    )
 
     # pyrefly: ignore [missing-attribute]
     base_unet = models["pipe"].unet
@@ -221,8 +309,13 @@ def train():
             t_indices=t_indices,
             base_unet=base_unet,
             timesteps=timesteps,
+            vae=vae,
             scheduler=scheduler,
+            vision_encoder=vision_encoder,
             mask_builder=mask_builder,
+            clip_mean=clip_mean,
+            clip_std=clip_std,
+            cached=cached,
         )
 
 
