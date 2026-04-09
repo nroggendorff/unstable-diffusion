@@ -28,22 +28,22 @@ from .encoder import (
 )
 from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scale
 
-STEPS = 200
-BATCH_SIZE = 4
+STEPS = 2000
+BATCH_SIZE = 8
 NOISE_LOSS_WEIGHT = 1.0
-DIVERSITY_WEIGHT = 0.2
+DIVERSITY_WEIGHT = 0.4
 
 STEPS //= BATCH_SIZE
 
 MASK_BLUR_SIGMA_START = 5.0
 MASK_BLUR_SIGMA_END = 1.0
-MASK_MIN_VALUE = 0.1
+MASK_MIN_VALUE = 0.05
 SCHEDULER_SUBJECT_POWER = 1.5
 SCHEDULER_BG_SCALE = 0.4
 
 VISION_ENCODER_MODEL = "openai/clip-vit-base-patch32"
 FEATURE_LAYERS = [2, 4, 6, 8]
-MASK_BLEND_ALPHA = 0.5
+MASK_BLEND_ALPHA_MAX = 0.2
 
 SEGMENTS = [
     ("early", range(0, EARLY_SEG)),
@@ -66,10 +66,15 @@ def decode_for_clip(
     return (decoded - clip_mean) / clip_std
 
 
+def _blend_alpha(step: int, total_steps: int) -> float:
+    return MASK_BLEND_ALPHA_MAX * (step / max(total_steps - 1, 1))
+
+
 def _blend_masks(
     attn_mask: torch.Tensor,
     clip_raw: torch.Tensor,
     spatial_size: tuple,
+    alpha: float,
 ) -> torch.Tensor:
     clip_mask = F.interpolate(
         clip_raw, size=spatial_size, mode="bilinear", align_corners=False
@@ -77,7 +82,7 @@ def _blend_masks(
     mn = clip_mask.flatten(1).min(1).values.view(-1, 1, 1, 1)
     mx = clip_mask.flatten(1).max(1).values.view(-1, 1, 1, 1)
     clip_mask = (clip_mask - mn) / (mx - mn + 1e-8)
-    return (1.0 - MASK_BLEND_ALPHA) * attn_mask + MASK_BLEND_ALPHA * clip_mask
+    return (1.0 - alpha) * attn_mask + alpha * clip_mask
 
 
 def compute_loss(unet, noisy_latents, noise, t, text_emb, mask):
@@ -222,7 +227,8 @@ def train_segment(
             )
             raw_diff = compute_perceptual_discrepancy(pred_features, target_features)
 
-            mask = _blend_masks(attn_mask, raw_diff, latents.shape[2:])
+            alpha = _blend_alpha(step, STEPS)
+            mask = _blend_masks(attn_mask, raw_diff, latents.shape[2:], alpha=alpha)
 
         blur_sigma = mask_builder.blur_sigma_for_step(step, STEPS)
         mask = mask_builder.build_mask(mask, blur_sigma)
@@ -246,6 +252,7 @@ def train_segment(
             loss=f"{loss.item():.4f}",
             spec=f"{spec.item():.4f}",
             div=f"{div.item():.4f}",
+            blend=f"{alpha:.2f}",
             t=t[0].item(),
         )
 
