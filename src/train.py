@@ -32,6 +32,7 @@ STEPS = 2000
 BATCH_SIZE = 8
 NOISE_LOSS_WEIGHT = 0.7
 DIVERSITY_WEIGHT = 0.3
+ANTI_MEAN_WEIGHT = 0.2
 
 STEPS //= BATCH_SIZE
 
@@ -99,6 +100,7 @@ def compute_loss(
     noise_scale,
     alphas_cumprod,
     diversity_weight=DIVERSITY_WEIGHT,
+    anti_mean_weight=ANTI_MEAN_WEIGHT,
 ):
     with torch.amp.autocast("cuda", dtype=torch.float16):
         pred = unet(noisy_latents, t, encoder_hidden_states=text_emb).sample
@@ -113,20 +115,43 @@ def compute_loss(
 
     specified_loss = (per_pixel * mask_f).mean()
 
-    if diversity_weight > 0 and pred_f.shape[0] > 1:
+    if pred_f.shape[0] > 1:
         a = alphas_cumprod[t.long()].view(-1, 1, 1, 1).sqrt()
         b = (1 - alphas_cumprod[t.long()]).view(-1, 1, 1, 1).sqrt()
         pred_x0 = (noisy_latents.float() - b * pred_f) / a
 
-        flat = F.normalize(pred_x0.flatten(1), dim=1)
-        sim = flat @ flat.T
-        off_diag = sim * (1 - torch.eye(flat.shape[0], device=flat.device))
-        anti_average_loss = off_diag.sum() / (flat.shape[0] * (flat.shape[0] - 1))
+        if diversity_weight > 0:
+            flat = F.normalize(pred_x0.flatten(1), dim=1)
+            sim = flat @ flat.T
+            off_diag = sim * (1 - torch.eye(flat.shape[0], device=flat.device))
+            anti_average_loss = off_diag.sum() / (flat.shape[0] * (flat.shape[0] - 1))
+        else:
+            anti_average_loss = torch.zeros(1, device=pred_f.device).squeeze()
+
+        if anti_mean_weight > 0:
+            masked_pred = pred_x0 * mask_f
+            mean_x0 = masked_pred.mean(0, keepdim=True)
+            flat = F.normalize(masked_pred.flatten(1), dim=1)
+            mean_norm = F.normalize(mean_x0.flatten(1), dim=1)
+            sim_to_mean = (flat * mean_norm).sum(1)
+            anti_mean_loss = sim_to_mean.mean()
+        else:
+            anti_mean_loss = torch.zeros(1, device=pred_f.device).squeeze()
     else:
         anti_average_loss = torch.zeros(1, device=pred_f.device).squeeze()
+        anti_mean_loss = torch.zeros(1, device=pred_f.device).squeeze()
 
-    loss = NOISE_LOSS_WEIGHT * specified_loss + diversity_weight * anti_average_loss
-    return loss, specified_loss.detach(), anti_average_loss.detach()
+    loss = (
+        NOISE_LOSS_WEIGHT * specified_loss
+        + diversity_weight * anti_average_loss
+        + anti_mean_weight * anti_mean_loss
+    )
+    return (
+        loss,
+        specified_loss.detach(),
+        anti_average_loss.detach(),
+        anti_mean_loss.detach(),
+    )
 
 
 def save_lora(model, path):
@@ -271,7 +296,7 @@ def train_segment(
 
         alphas = scheduler.alphas_cumprod.to(DEVICE)
 
-        loss, spec, div = compute_loss(
+        loss, spec, div, anti_mean = compute_loss(
             unet,
             noisy_latents,
             noise,
@@ -281,6 +306,7 @@ def train_segment(
             noise_scale,
             alphas_cumprod=alphas,
             diversity_weight=0.0 if segment_name == "final" else DIVERSITY_WEIGHT,
+            anti_mean_weight=0.0 if segment_name == "final" else ANTI_MEAN_WEIGHT,
         )
 
         optimizer.zero_grad()
@@ -291,6 +317,7 @@ def train_segment(
             loss=f"{loss.item():.4f}",
             spec=f"{spec.item():.4f}",
             div=f"{div.item():.4f}",
+            anti_mean=f"{anti_mean.item():.4f}",
             blend=f"{alpha:.2f}",
             t=t[0].item(),
         )
