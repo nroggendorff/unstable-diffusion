@@ -30,8 +30,8 @@ from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scal
 
 STEPS = 2000
 BATCH_SIZE = 8
-NOISE_LOSS_WEIGHT = 0.6
-DIVERSITY_WEIGHT = 1.2
+NOISE_LOSS_WEIGHT = 0.7
+DIVERSITY_WEIGHT = 0.3
 
 STEPS //= BATCH_SIZE
 
@@ -89,7 +89,16 @@ def _blend_masks(
     return (1.0 - alpha) * attn_mask + alpha * clip_mask
 
 
-def compute_loss(unet, noisy_latents, noise, t, text_emb, mask, noise_scale):
+def compute_loss(
+    unet,
+    noisy_latents,
+    noise,
+    t,
+    text_emb,
+    mask,
+    noise_scale,
+    diversity_weight=DIVERSITY_WEIGHT,
+):
     with torch.amp.autocast("cuda", dtype=torch.float16):
         pred = unet(noisy_latents, t, encoder_hidden_states=text_emb).sample
 
@@ -103,12 +112,16 @@ def compute_loss(unet, noisy_latents, noise, t, text_emb, mask, noise_scale):
 
     specified_loss = (per_pixel * mask_f).mean()
 
-    mean_pred = pred_f.mean(dim=0, keepdim=True)
-    deviation = pred_f - mean_pred
-    variance_per_pixel = (deviation.pow(2) * mask_f).mean()
-    anti_average_loss = -variance_per_pixel
+    if diversity_weight > 0 and pred_f.shape[0] > 1:
+        mean_pred = pred_f.mean(dim=0, keepdim=True).detach()
+        deviation = F.normalize((pred_f - mean_pred).flatten(1), dim=1)
+        mean_dir = F.normalize(mean_pred.expand_as(pred_f).flatten(1), dim=1)
+        cos_to_mean = (deviation * mean_dir).sum(dim=1).mean()
+        anti_average_loss = cos_to_mean
+    else:
+        anti_average_loss = torch.zeros(1, device=pred_f.device).squeeze()
 
-    loss = NOISE_LOSS_WEIGHT * specified_loss + DIVERSITY_WEIGHT * anti_average_loss
+    loss = NOISE_LOSS_WEIGHT * specified_loss + diversity_weight * anti_average_loss
     return loss, specified_loss.detach(), anti_average_loss.detach()
 
 
@@ -121,6 +134,7 @@ def save_lora(model, path):
         k = k.replace(".early", str())
         k = k.replace(".mid", str())
         k = k.replace(".late", str())
+        k = k.replace(".final", str())
         converted[k] = v
 
     os.makedirs(path, exist_ok=True)
@@ -252,7 +266,14 @@ def train_segment(
         noisy_latents = scheduler.add_noise(latents, noise, t, noise_scale=noise_scale)
 
         loss, spec, div = compute_loss(
-            unet, noisy_latents, noise, t, text_emb, mask, noise_scale
+            unet,
+            noisy_latents,
+            noise,
+            t,
+            text_emb,
+            mask,
+            noise_scale,
+            diversity_weight=0.0 if segment_name == "final" else DIVERSITY_WEIGHT,
         )
 
         optimizer.zero_grad()
