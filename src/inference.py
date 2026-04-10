@@ -1,5 +1,6 @@
 import argparse
 import torch
+import numpy as np
 
 from diffusers import StableDiffusionPipeline
 from PIL import Image
@@ -63,6 +64,15 @@ def make_segment_callback(use_lora, num_inference_steps):
     return callback
 
 
+def _decode_latents(pipe, latents: torch.Tensor) -> Image.Image:
+    latents = latents.to(dtype=pipe.vae.dtype)
+    with torch.no_grad():
+        decoded = pipe.vae.decode(latents / pipe.vae.config.scaling_factor).sample
+    decoded = (decoded.float() / 2 + 0.5).clamp(0, 1)
+    arr = (decoded[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    return Image.fromarray(arr)
+
+
 def infer_batch(
     pipe,
     prompt,
@@ -90,9 +100,53 @@ def infer_batch(
         guidance_scale=guidance_scale,
         generator=generators,
         callback_on_step_end=make_segment_callback(use_lora, num_inference_steps),
+        callback_on_step_end_tensor_inputs=["latents"],
     ).images
 
     return images
+
+
+def infer_with_evolution(
+    pipe,
+    prompt,
+    use_lora=True,
+    num_inference_steps=30,
+    guidance_scale=7.0,
+    seed=None,
+):
+    if use_lora:
+        pipe.enable_lora()
+        pipe.set_adapters(BLEND_SEGMENTS, adapter_weights=_adapter_weights(0))
+    else:
+        pipe.disable_lora()
+
+    captured_latents = []
+    segment_cb = make_segment_callback(use_lora, num_inference_steps)
+
+    def callback(p, step_index, timestep, callback_kwargs):
+        result = segment_cb(p, step_index, timestep, callback_kwargs)
+        if step_index % 2 == 0:
+            captured_latents.append(callback_kwargs["latents"][:1].clone())
+        return result
+
+    # pyrefly: ignore [bad-argument-type]
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+
+    result = pipe(
+        prompt=[prompt],
+        width=1024,
+        height=1024,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        generator=generator,
+        callback_on_step_end=callback,
+        callback_on_step_end_tensor_inputs=["latents"],
+    )
+
+    final_image = result.images[0]
+    evolution_frames = [_decode_latents(pipe, lat) for lat in captured_latents]
+
+    return final_image, evolution_frames
 
 
 def make_grid(images, rows=2, cols=3):
@@ -102,6 +156,27 @@ def make_grid(images, rows=2, cols=3):
         row = i // cols
         col = i % cols
         grid.paste(img, (col * w, row * h))
+    return grid
+
+
+def make_evolution_grid(
+    lora_frames: list[Image.Image], base_frames: list[Image.Image]
+) -> Image.Image:
+    cols = max(len(lora_frames), len(base_frames))
+    w, h = lora_frames[0].size
+
+    def pad_row(frames, target_cols):
+        blank = Image.new("RGB", (w, h), color=(0, 0, 0))
+        return frames + [blank] * (target_cols - len(frames))
+
+    lora_row = pad_row(lora_frames, cols)
+    base_row = pad_row(base_frames, cols)
+
+    grid = Image.new("RGB", size=(cols * w, 2 * h))
+    for col, img in enumerate(lora_row):
+        grid.paste(img, (col * w, 0))
+    for col, img in enumerate(base_row):
+        grid.paste(img, (col * w, h))
     return grid
 
 
@@ -115,6 +190,7 @@ def main():
         "She has a prominent gold chain around her neck.",
     )
     parser.add_argument("--output", "-o", type=str, default="output.png")
+    parser.add_argument("--evolution-output", "-e", type=str, default="evolution.png")
     parser.add_argument("--steps", "-s", type=int, default=30)
     parser.add_argument("--guidance", "-g", type=float, default=7.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -124,31 +200,54 @@ def main():
     pipe = load_pipe()
 
     print(f"Generating: {args.prompt}")
-    images = []
-    images.extend(
-        infer_batch(
-            pipe,
-            args.prompt,
-            use_lora=True,
-            num_inference_steps=args.steps,
-            guidance_scale=args.guidance,
-            seed=args.seed,
-        )
-    )
-    images.extend(
-        infer_batch(
-            pipe,
-            args.prompt,
-            use_lora=False,
-            num_inference_steps=args.steps,
-            guidance_scale=args.guidance,
-            seed=args.seed,
-        )
+
+    lora_final, lora_frames = infer_with_evolution(
+        pipe,
+        args.prompt,
+        use_lora=True,
+        num_inference_steps=args.steps,
+        guidance_scale=args.guidance,
+        seed=args.seed,
     )
 
-    grid = make_grid(images, rows=2, cols=3)
+    base_final, base_frames = infer_with_evolution(
+        pipe,
+        args.prompt,
+        use_lora=False,
+        num_inference_steps=args.steps,
+        guidance_scale=args.guidance,
+        seed=args.seed,
+    )
+
+    lora_rest = infer_batch(
+        pipe,
+        args.prompt,
+        use_lora=True,
+        num_inference_steps=args.steps,
+        guidance_scale=args.guidance,
+        seed=args.seed + 1,
+        batch_size=2,
+    )
+
+    base_rest = infer_batch(
+        pipe,
+        args.prompt,
+        use_lora=False,
+        num_inference_steps=args.steps,
+        guidance_scale=args.guidance,
+        seed=args.seed + 1,
+        batch_size=2,
+    )
+
+    grid = make_grid(
+        [lora_final] + lora_rest + [base_final] + base_rest, rows=2, cols=3
+    )
     grid.save(args.output)
     print(f"Saved to {args.output}")
+
+    evolution_grid = make_evolution_grid(lora_frames, base_frames)
+    evolution_grid.save(args.evolution_output)
+    print(f"Evolution saved to {args.evolution_output}")
 
 
 if __name__ == "__main__":
