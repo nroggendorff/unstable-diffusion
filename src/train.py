@@ -97,6 +97,7 @@ def compute_loss(
     text_emb,
     mask,
     noise_scale,
+    alphas_cumprod,
     diversity_weight=DIVERSITY_WEIGHT,
 ):
     with torch.amp.autocast("cuda", dtype=torch.float16):
@@ -113,11 +114,14 @@ def compute_loss(
     specified_loss = (per_pixel * mask_f).mean()
 
     if diversity_weight > 0 and pred_f.shape[0] > 1:
-        mean_pred = pred_f.mean(dim=0, keepdim=True).detach()
-        deviation = F.normalize((pred_f - mean_pred).flatten(1), dim=1)
-        mean_dir = F.normalize(mean_pred.expand_as(pred_f).flatten(1), dim=1)
-        cos_to_mean = (deviation * mean_dir).sum(dim=1).mean()
-        anti_average_loss = cos_to_mean
+        a = alphas_cumprod[t.long()].view(-1, 1, 1, 1).sqrt()
+        b = (1 - alphas_cumprod[t.long()]).view(-1, 1, 1, 1).sqrt()
+        pred_x0 = (noisy_latents.float() - b * pred_f) / a
+
+        flat = F.normalize(pred_x0.flatten(1), dim=1)
+        sim = flat @ flat.T
+        off_diag = sim * (1 - torch.eye(flat.shape[0], device=flat.device))
+        anti_average_loss = off_diag.sum() / (flat.shape[0] * (flat.shape[0] - 1))
     else:
         anti_average_loss = torch.zeros(1, device=pred_f.device).squeeze()
 
@@ -265,6 +269,8 @@ def train_segment(
         )
         noisy_latents = scheduler.add_noise(latents, noise, t, noise_scale=noise_scale)
 
+        alphas = scheduler.alphas_cumprod.to(DEVICE)
+
         loss, spec, div = compute_loss(
             unet,
             noisy_latents,
@@ -273,6 +279,7 @@ def train_segment(
             text_emb,
             mask,
             noise_scale,
+            alphas_cumprod=alphas,
             diversity_weight=0.0 if segment_name == "final" else DIVERSITY_WEIGHT,
         )
 
