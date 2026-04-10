@@ -111,9 +111,6 @@ def compute_loss(
     mask_f = mask.float().to(pred_f.device)
 
     per_pixel = (pred_f - noise_f).pow(2)
-    if noise_scale is not None:
-        per_pixel = per_pixel * noise_scale.float().to(pred_f.device)
-
     specified_loss = (per_pixel * mask_f).mean()
 
     t_gate = (t_normalized.mean() < 0.35).float()
@@ -121,7 +118,8 @@ def compute_loss(
     if pred_f.shape[0] > 1 and t_gate > 0:
         a = alphas_cumprod[t.long()].view(-1, 1, 1, 1).sqrt()
         b = (1 - alphas_cumprod[t.long()]).view(-1, 1, 1, 1).sqrt()
-        pred_x0 = (noisy_latents.float() - b * pred_f) / a
+        ns = noise_scale.float().to(pred_f.device) if noise_scale is not None else 1.0
+        pred_x0 = (noisy_latents.float() - b * ns * pred_f) / a
 
         if diversity_weight > 0:
             masked_pred = pred_x0 * mask_f
