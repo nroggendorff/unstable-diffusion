@@ -63,10 +63,11 @@ class SpatiallyVaryingDDPMScheduler(DDPMScheduler):
 def compute_spatial_noise_scale(
     mask: torch.Tensor,
     t_normalized: torch.Tensor,
-    subject_power: float = 1.5,
-    bg_scale: float = 0.4,
+    subject_power: float = 0.6,
+    bg_scale: float = 0.75,
+    min_scale: float = 0.0,
 ) -> torch.Tensor:
     t = t_normalized.view(-1, 1, 1, 1)
-    sigma_subject = t**subject_power
-    sigma_background = bg_scale * t
+    sigma_subject = min_scale + (1.0 - min_scale) * t**subject_power
+    sigma_background = min_scale + (bg_scale - min_scale) * t
     return mask * sigma_subject + (1 - mask) * sigma_background

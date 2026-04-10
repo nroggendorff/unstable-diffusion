@@ -38,17 +38,21 @@ STEPS //= BATCH_SIZE
 MASK_BLUR_SIGMA_START = 5.0
 MASK_BLUR_SIGMA_END = 1.0
 MASK_MIN_VALUE = 0.05
-SCHEDULER_SUBJECT_POWER = 1.5
-SCHEDULER_BG_SCALE = 0.4
+SCHEDULER_SUBJECT_POWER = 0.6
+SCHEDULER_BG_SCALE = 0.75
+SCHEDULER_MIN_SCALE = 0.25
 
 VISION_ENCODER_MODEL = "openai/clip-vit-base-patch32"
 FEATURE_LAYERS = [2, 4, 6, 8]
 MASK_BLEND_ALPHA_MAX = 0.2
 
+LATE_START = EARLY_SEG + MID_SEG
+
 SEGMENTS = [
     ("early", range(0, EARLY_SEG)),
-    ("mid", range(EARLY_SEG, EARLY_SEG + MID_SEG)),
-    ("late", range(EARLY_SEG + MID_SEG, NUM_INFERENCE_STEPS)),
+    ("mid", range(EARLY_SEG, LATE_START)),
+    ("late", range(LATE_START, NUM_INFERENCE_STEPS)),
+    ("final", range(LATE_START, NUM_INFERENCE_STEPS)),
 ]
 
 
@@ -93,23 +97,16 @@ def compute_loss(unet, noisy_latents, noise, t, text_emb, mask, noise_scale):
     noise_f = noise.float()
     mask_f = mask.float().to(pred_f.device)
 
+    per_pixel = (pred_f - noise_f).pow(2)
     if noise_scale is not None:
-        noise_target = noise_f * noise_scale
-    else:
-        noise_target = noise_f
-
-    per_pixel = (pred_f - noise_target).pow(2)
+        per_pixel = per_pixel * noise_scale.float().to(pred_f.device)
 
     specified_loss = (per_pixel * mask_f).mean()
 
-    mean_pred = pred_f.mean(dim=0, keepdim=True).detach()
+    mean_pred = pred_f.mean(dim=0, keepdim=True)
     deviation = pred_f - mean_pred
-
-    deviation_norm = deviation / (deviation.norm(dim=1, keepdim=True) + 1e-6)
-    mean_norm = mean_pred / (mean_pred.norm(dim=1, keepdim=True) + 1e-6)
-
-    cos_to_mean = (deviation_norm * mean_norm).sum(dim=1, keepdim=True)
-    anti_average_loss = (cos_to_mean * mask_f).mean()
+    variance_per_pixel = (deviation.pow(2) * mask_f).mean()
+    anti_average_loss = -variance_per_pixel
 
     loss = NOISE_LOSS_WEIGHT * specified_loss + DIVERSITY_WEIGHT * anti_average_loss
     return loss, specified_loss.detach(), anti_average_loss.detach()
@@ -250,6 +247,7 @@ def train_segment(
             t_norm,
             subject_power=SCHEDULER_SUBJECT_POWER,
             bg_scale=SCHEDULER_BG_SCALE,
+            min_scale=SCHEDULER_MIN_SCALE,
         )
         noisy_latents = scheduler.add_noise(latents, noise, t, noise_scale=noise_scale)
 

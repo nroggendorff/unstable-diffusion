@@ -9,7 +9,9 @@ from .model import EARLY_SEG, MID_SEG, LATE_SEG
 
 MODEL_ID = "glides/counterfeit"
 ADAPTER_BASE_PATH = "./creative-lora"
-SEGMENTS = ["early", "mid", "late"]
+
+BLEND_SEGMENTS = ["early", "mid", "late"]
+ALL_SEGMENTS = ["early", "mid", "late", "final"]
 
 _SEGMENT_CENTERS = [
     EARLY_SEG / 2,
@@ -34,7 +36,7 @@ def load_pipe():
         MODEL_ID, torch_dtype=torch.float16
     ).to("cuda")
 
-    for segment in SEGMENTS:
+    for segment in ALL_SEGMENTS:
         pipe.load_lora_weights(
             f"{ADAPTER_BASE_PATH}/{segment}",
             weight_name="pytorch_lora_weights.safetensors",
@@ -44,12 +46,18 @@ def load_pipe():
     return pipe
 
 
-def make_segment_callback(use_lora):
+def make_segment_callback(use_lora, num_inference_steps):
+    last_step = num_inference_steps - 1
+
     def callback(pipe, step_index, timestep, callback_kwargs):  # noqa: ARG001
         if not use_lora:
             return callback_kwargs
-        weights = _adapter_weights(step_index)
-        pipe.set_adapters(SEGMENTS, adapter_weights=weights)
+        if step_index == last_step:
+            pipe.set_adapters(["final"], adapter_weights=[1.0])
+        else:
+            pipe.set_adapters(
+                BLEND_SEGMENTS, adapter_weights=_adapter_weights(step_index)
+            )
         return callback_kwargs
 
     return callback
@@ -66,7 +74,7 @@ def infer_batch(
 ):
     if use_lora:
         pipe.enable_lora()
-        pipe.set_adapters(SEGMENTS, adapter_weights=_adapter_weights(0))
+        pipe.set_adapters(BLEND_SEGMENTS, adapter_weights=_adapter_weights(0))
     else:
         pipe.disable_lora()
 
@@ -81,7 +89,7 @@ def infer_batch(
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         generator=generators,
-        callback_on_step_end=make_segment_callback(use_lora),
+        callback_on_step_end=make_segment_callback(use_lora, num_inference_steps),
     ).images
 
     return images

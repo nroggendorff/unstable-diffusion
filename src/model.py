@@ -11,7 +11,7 @@ EARLY_SEG = 10
 MID_SEG = 10
 LATE_SEG = 10
 
-LR = 5e-6
+LR = 1e-4
 LORA_RANK = 32
 LORA_ALPHA = 32
 LORA_TARGET_MODULES = ["to_k", "to_q", "to_v", "to_out.0"]
