@@ -70,4 +70,9 @@ def compute_spatial_noise_scale(
     t = t_normalized.view(-1, 1, 1, 1)
     sigma_subject = min_scale + (1.0 - min_scale) * t**subject_power
     sigma_background = min_scale + (bg_scale - min_scale) * t
-    return mask * sigma_subject + (1 - mask) * sigma_background
+    spatial = mask * sigma_subject + (1 - mask) * sigma_background
+
+    uniform = min_scale + (1.0 - min_scale) * t
+    envelope = 4.0 * t * (1.0 - t)
+
+    return envelope * spatial + (1.0 - envelope) * uniform

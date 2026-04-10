@@ -31,8 +31,8 @@ from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scal
 STEPS = 2000
 BATCH_SIZE = 8
 NOISE_LOSS_WEIGHT = 0.7
-DIVERSITY_WEIGHT = 0.3
-ANTI_MEAN_WEIGHT = 0.2
+DIVERSITY_WEIGHT = 0.05
+ANTI_MEAN_WEIGHT = 0.05
 
 STEPS //= BATCH_SIZE
 
@@ -40,8 +40,8 @@ MASK_BLUR_SIGMA_START = 5.0
 MASK_BLUR_SIGMA_END = 1.0
 MASK_MIN_VALUE = 0.05
 SCHEDULER_SUBJECT_POWER = 0.6
-SCHEDULER_BG_SCALE = 0.75
-SCHEDULER_MIN_SCALE = 0.25
+SCHEDULER_BG_SCALE = 0.9
+SCHEDULER_MIN_SCALE = 0.0
 
 VISION_ENCODER_MODEL = "openai/clip-vit-base-patch32"
 FEATURE_LAYERS = [2, 4, 6, 8]
@@ -99,6 +99,7 @@ def compute_loss(
     mask,
     noise_scale,
     alphas_cumprod,
+    t_normalized,
     diversity_weight=DIVERSITY_WEIGHT,
     anti_mean_weight=ANTI_MEAN_WEIGHT,
 ):
@@ -115,13 +116,16 @@ def compute_loss(
 
     specified_loss = (per_pixel * mask_f).mean()
 
-    if pred_f.shape[0] > 1:
+    t_gate = (t_normalized.mean() < 0.35).float()
+
+    if pred_f.shape[0] > 1 and t_gate > 0:
         a = alphas_cumprod[t.long()].view(-1, 1, 1, 1).sqrt()
         b = (1 - alphas_cumprod[t.long()]).view(-1, 1, 1, 1).sqrt()
         pred_x0 = (noisy_latents.float() - b * pred_f) / a
 
         if diversity_weight > 0:
-            flat = F.normalize(pred_x0.flatten(1), dim=1)
+            masked_pred = pred_x0 * mask_f
+            flat = F.normalize(masked_pred.flatten(1), dim=1)
             sim = flat @ flat.T
             off_diag = sim * (1 - torch.eye(flat.shape[0], device=flat.device))
             anti_average_loss = off_diag.sum() / (flat.shape[0] * (flat.shape[0] - 1))
@@ -130,11 +134,8 @@ def compute_loss(
 
         if anti_mean_weight > 0:
             masked_pred = pred_x0 * mask_f
-            mean_x0 = masked_pred.mean(0, keepdim=True)
-            flat = F.normalize(masked_pred.flatten(1), dim=1)
-            mean_norm = F.normalize(mean_x0.flatten(1), dim=1)
-            sim_to_mean = (flat * mean_norm).sum(1)
-            anti_mean_loss = sim_to_mean.mean()
+            variance = masked_pred.var(dim=0).mean()
+            anti_mean_loss = -variance
         else:
             anti_mean_loss = torch.zeros(1, device=pred_f.device).squeeze()
     else:
@@ -305,6 +306,7 @@ def train_segment(
             mask,
             noise_scale,
             alphas_cumprod=alphas,
+            t_normalized=t_norm,
             diversity_weight=0.0 if segment_name == "final" else DIVERSITY_WEIGHT,
             anti_mean_weight=0.0 if segment_name == "final" else ANTI_MEAN_WEIGHT,
         )
