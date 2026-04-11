@@ -36,7 +36,7 @@ GROUNDING_WEIGHT = 0.25
 BASE_DRIFT_WEIGHT = 0.15
 BASE_DRIFT_TARGET_SIM = 0.1
 
-STEPS //= BATCH_SIZE
+TRAIN_STEPS = STEPS // BATCH_SIZE
 
 MASK_BLUR_SIGMA_START = 5.0
 MASK_BLUR_SIGMA_END = 1.0
@@ -50,8 +50,6 @@ FEATURE_LAYERS = [2, 4, 6, 8]
 MASK_BLEND_ALPHA_MAX = 0.2
 
 LATE_START = EARLY_SEG + MID_SEG
-
-CLIP_LATENT_SIZE = 28
 
 SEGMENTS = [
     ("early", range(0, EARLY_SEG)),
@@ -78,9 +76,7 @@ def decode_for_clip(
 def decode_for_clip_small(
     vae, latents: torch.Tensor, clip_mean: torch.Tensor, clip_std: torch.Tensor
 ) -> torch.Tensor:
-    stride = max(1, latents.shape[-1] // CLIP_LATENT_SIZE)
-    small = F.avg_pool2d(latents.to(dtype=vae.dtype), kernel_size=stride, stride=stride)
-    decoded = vae.decode(small / vae.config.scaling_factor).sample
+    decoded = vae.decode(latents.to(dtype=vae.dtype) / vae.config.scaling_factor).sample
     decoded = (decoded.float().clamp(-1, 1) + 1) / 2
     if decoded.shape[-1] != 224:
         decoded = F.interpolate(
@@ -284,6 +280,10 @@ def build_cache(
     return cached
 
 
+def _make_inputs_require_grad(module, input, output):  # noqa: ARG001
+    output.requires_grad_(True)
+
+
 def train_segment(
     segment_name,
     t_indices,
@@ -300,10 +300,9 @@ def train_segment(
     print(f"\nTraining segment: {segment_name}")
 
     unet = get_peft_model(copy.deepcopy(base_unet), get_lora_config())
+    unet.base_model.model.conv_in.register_forward_hook(_make_inputs_require_grad)
     # pyrefly: ignore [not-callable]
-    unet.enable_input_require_grads()
-    # pyrefly: ignore [not-callable]
-    unet.gradient_checkpointing_enable()
+    unet.enable_gradient_checkpointing()
     unet.train()
 
     optimizer = torch.optim.AdamW(unet.parameters(), lr=LR)
@@ -312,7 +311,7 @@ def train_segment(
 
     capture = CrossAttentionCapture(base_unet)
 
-    for step in (pbar := tqdm(range(STEPS))):
+    for step in (pbar := tqdm(range(TRAIN_STEPS))):
         indices = list(range(len(cached)))
         random.shuffle(indices)
         items = [cached[i] for i in indices[:BATCH_SIZE]]
@@ -342,8 +341,8 @@ def train_segment(
                         encoder_hidden_states=text_emb,
                     ).sample.float()
 
-            # pyrefly: ignore [bad-argument-type]
-            attn_mask = capture.build_mask(token_mask, latents.shape[2:])
+                # pyrefly: ignore [bad-argument-type]
+                attn_mask = capture.build_mask(token_mask, latents.shape[2:])
 
             a = alphas[t.long()].view(-1, 1, 1, 1) ** 0.5
             b = (1 - alphas[t.long()]).view(-1, 1, 1, 1) ** 0.5
@@ -357,11 +356,11 @@ def train_segment(
             raw_diff = compute_perceptual_discrepancy(pred_features, target_features)
             del pred_features
 
-            alpha = _blend_alpha(step, STEPS)
+            alpha = _blend_alpha(step, TRAIN_STEPS)
             mask = _blend_masks(attn_mask, raw_diff, latents.shape[2:], alpha=alpha)
             del attn_mask, raw_diff
 
-        blur_sigma = mask_builder.blur_sigma_for_step(step, STEPS)
+        blur_sigma = mask_builder.blur_sigma_for_step(step, TRAIN_STEPS)
         mask = mask_builder.build_mask(mask, blur_sigma)
 
         t_norm = t.float() / 1000.0
@@ -453,7 +452,7 @@ def train():
     clip_mean = torch.tensor([0.481, 0.457, 0.408]).view(1, 3, 1, 1).to(DEVICE)
     clip_std = torch.tensor([0.269, 0.261, 0.276]).view(1, 3, 1, 1).to(DEVICE)
 
-    samples = get_samples(STEPS)
+    samples = get_samples(TRAIN_STEPS)
     transform = get_transform()
 
     print("Building latent cache...")
