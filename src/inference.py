@@ -22,13 +22,15 @@ _SEGMENT_CENTERS = [
 _BLEND_WINDOW = 8
 
 
-def _adapter_weights(step_index: int) -> list[float]:
+def _adapter_weights(step_index: int, strength: float = 1.0) -> list[float]:
     raw = [
         max(0.0, 1.0 - abs(step_index - center) / _BLEND_WINDOW)
         for center in _SEGMENT_CENTERS
     ]
     total = sum(raw) + 1e-8
-    return [w / total for w in raw]
+    normalized = [w / total for w in raw]
+
+    return [w * strength for w in normalized]
 
 
 def load_pipe():
@@ -47,17 +49,19 @@ def load_pipe():
     return pipe
 
 
-def make_segment_callback(use_lora, num_inference_steps):
+def make_segment_callback(use_lora, num_inference_steps, strength):
     last_step = num_inference_steps - 1
 
     def callback(pipe, step_index, timestep, callback_kwargs):  # noqa: ARG001
         if not use_lora:
             return callback_kwargs
+
         if step_index == last_step:
-            pipe.set_adapters(["final"], adapter_weights=[1.0])
+            pipe.set_adapters(["final"], adapter_weights=[strength])
         else:
             pipe.set_adapters(
-                BLEND_SEGMENTS, adapter_weights=_adapter_weights(step_index)
+                BLEND_SEGMENTS,
+                adapter_weights=_adapter_weights(step_index, strength),
             )
         return callback_kwargs
 
@@ -81,10 +85,14 @@ def infer_batch(
     guidance_scale=7.0,
     seed=None,
     batch_size=3,
+    strength=1.0,
 ):
     if use_lora:
         pipe.enable_lora()
-        pipe.set_adapters(BLEND_SEGMENTS, adapter_weights=_adapter_weights(0))
+        pipe.set_adapters(
+            BLEND_SEGMENTS,
+            adapter_weights=_adapter_weights(0, strength),
+        )
     else:
         pipe.disable_lora()
 
@@ -99,7 +107,9 @@ def infer_batch(
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         generator=generators,
-        callback_on_step_end=make_segment_callback(use_lora, num_inference_steps),
+        callback_on_step_end=make_segment_callback(
+            use_lora, num_inference_steps, strength
+        ),
         callback_on_step_end_tensor_inputs=["latents"],
     ).images
 
@@ -113,15 +123,19 @@ def infer_with_evolution(
     num_inference_steps=30,
     guidance_scale=7.0,
     seed=None,
+    strength=1.0,
 ):
     if use_lora:
         pipe.enable_lora()
-        pipe.set_adapters(BLEND_SEGMENTS, adapter_weights=_adapter_weights(0))
+        pipe.set_adapters(
+            BLEND_SEGMENTS,
+            adapter_weights=_adapter_weights(0, strength),
+        )
     else:
         pipe.disable_lora()
 
     captured_latents = []
-    segment_cb = make_segment_callback(use_lora, num_inference_steps)
+    segment_cb = make_segment_callback(use_lora, num_inference_steps, strength)
 
     def callback(p, step_index, timestep, callback_kwargs):
         result = segment_cb(p, step_index, timestep, callback_kwargs)
@@ -192,6 +206,7 @@ def main():
     parser.add_argument("--output", "-o", type=str, default="output.png")
     parser.add_argument("--evolution-output", "-e", type=str, default="evolution.png")
     parser.add_argument("--steps", "-s", type=int, default=30)
+    parser.add_argument("--strength", type=float, default=1.0)
     parser.add_argument("--guidance", "-g", type=float, default=7.0)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -208,6 +223,7 @@ def main():
         num_inference_steps=args.steps,
         guidance_scale=args.guidance,
         seed=args.seed,
+        strength=args.strength,
     )
 
     base_final, base_frames = infer_with_evolution(
@@ -227,6 +243,7 @@ def main():
         guidance_scale=args.guidance,
         seed=args.seed + 1,
         batch_size=2,
+        strength=args.strength,
     )
 
     base_rest = infer_batch(
