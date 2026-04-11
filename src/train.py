@@ -31,8 +31,10 @@ from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scal
 STEPS = 2000
 BATCH_SIZE = 8
 NOISE_LOSS_WEIGHT = 0.7
-DIVERSITY_WEIGHT = 0.05
-ANTI_MEAN_WEIGHT = 0.05
+DIVERSITY_WEIGHT = 0.1
+GROUNDING_WEIGHT = 0.25
+BASE_DRIFT_WEIGHT = 0.15
+BASE_DRIFT_TARGET_SIM = 0.1
 
 STEPS //= BATCH_SIZE
 
@@ -90,6 +92,14 @@ def _blend_masks(
     return (1.0 - alpha) * attn_mask + alpha * clip_mask
 
 
+def _masked_mse(
+    pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
+) -> torch.Tensor:
+    mask = mask.float().clamp(0.0, 1.0)
+    denom = mask.sum(dim=(1, 2, 3), keepdim=True).clamp_min(1.0)
+    return ((pred - target).pow(2) * mask).sum(dim=(1, 2, 3), keepdim=True) / denom
+
+
 def compute_loss(
     unet,
     noisy_latents,
@@ -100,56 +110,70 @@ def compute_loss(
     noise_scale,
     alphas_cumprod,
     t_normalized,
+    clean_latents,
+    base_pred,
     diversity_weight=DIVERSITY_WEIGHT,
-    anti_mean_weight=ANTI_MEAN_WEIGHT,
+    grounding_weight=GROUNDING_WEIGHT,
+    drift_weight=BASE_DRIFT_WEIGHT,
 ):
     with torch.amp.autocast("cuda", dtype=torch.float16):
         pred = unet(noisy_latents, t, encoder_hidden_states=text_emb).sample
 
     pred_f = pred.float()
     noise_f = noise.float()
-    mask_f = mask.float().to(pred_f.device)
+    clean_f = clean_latents.float().to(pred_f.device)
+    base_f = base_pred.float().to(pred_f.device)
+    mask_f = mask.float().to(pred_f.device).clamp(0.0, 1.0)
 
     per_pixel = (pred_f - noise_f).pow(2)
-    specified_loss = (per_pixel * mask_f).mean()
+    mask_mass = mask_f.sum(dim=(1, 2, 3), keepdim=True).clamp_min(1.0)
+    specified_loss = (per_pixel * mask_f).sum(dim=(1, 2, 3), keepdim=True) / mask_mass
+    specified_loss = specified_loss.mean()
 
-    t_gate = (t_normalized.mean() < 0.35).float()
+    a = alphas_cumprod[t.long()].view(-1, 1, 1, 1).sqrt()
+    b = (1 - alphas_cumprod[t.long()]).view(-1, 1, 1, 1).sqrt()
+    ns = noise_scale.float().to(pred_f.device) if noise_scale is not None else 1.0
 
-    if pred_f.shape[0] > 1 and t_gate > 0:
-        a = alphas_cumprod[t.long()].view(-1, 1, 1, 1).sqrt()
-        b = (1 - alphas_cumprod[t.long()]).view(-1, 1, 1, 1).sqrt()
-        ns = noise_scale.float().to(pred_f.device) if noise_scale is not None else 1.0
-        pred_x0 = (noisy_latents.float() - b * ns * pred_f) / a
+    pred_x0 = (noisy_latents.float() - b * ns * pred_f) / a
+    base_x0 = (noisy_latents.float() - b * ns * base_f) / a
 
-        if diversity_weight > 0:
-            masked_pred = pred_x0 * mask_f
-            flat = F.normalize(masked_pred.flatten(1), dim=1)
-            sim = flat @ flat.T
-            off_diag = sim * (1 - torch.eye(flat.shape[0], device=flat.device))
-            anti_average_loss = off_diag.sum() / (flat.shape[0] * (flat.shape[0] - 1))
-        else:
-            anti_average_loss = torch.zeros(1, device=pred_f.device).squeeze()
+    grounding_loss = _masked_mse(pred_x0, clean_f, mask_f).mean()
 
-        if anti_mean_weight > 0:
-            masked_pred = pred_x0 * mask_f
-            variance = masked_pred.var(dim=0).mean()
-            anti_mean_loss = -variance
-        else:
-            anti_mean_loss = torch.zeros(1, device=pred_f.device).squeeze()
+    bg_mask = (1.0 - mask_f).clamp(0.0, 1.0)
+    bg_mask = F.avg_pool2d(bg_mask, kernel_size=3, stride=1, padding=1).clamp(0.0, 1.0)
+
+    t_scalar = float(t_normalized.mean().item())
+    drift_gate = 1.0 if 0.15 <= t_scalar <= 0.85 else 0.0
+
+    if drift_gate > 0 and drift_weight > 0:
+        pred_bg = (pred_x0 * bg_mask).flatten(1)
+        base_bg = (base_x0 * bg_mask).flatten(1)
+        drift_sim = F.cosine_similarity(pred_bg, base_bg, dim=1, eps=1e-6)
+        drift_loss = F.relu(drift_sim - BASE_DRIFT_TARGET_SIM).mean()
     else:
-        anti_average_loss = torch.zeros(1, device=pred_f.device).squeeze()
-        anti_mean_loss = torch.zeros(1, device=pred_f.device).squeeze()
+        drift_loss = pred_f.new_tensor(0.0)
+
+    if pred_f.shape[0] > 1 and t_scalar < 0.35 and diversity_weight > 0:
+        masked_pred = pred_x0 * mask_f
+        flat = F.normalize(masked_pred.flatten(1), dim=1)
+        sim = flat @ flat.T
+        off_diag = sim * (1 - torch.eye(flat.shape[0], device=flat.device))
+        anti_average_loss = off_diag.sum() / (flat.shape[0] * (flat.shape[0] - 1))
+    else:
+        anti_average_loss = pred_f.new_tensor(0.0)
 
     loss = (
         NOISE_LOSS_WEIGHT * specified_loss
+        + grounding_weight * grounding_loss
+        + drift_weight * drift_loss
         + diversity_weight * anti_average_loss
-        + anti_mean_weight * anti_mean_loss
     )
     return (
         loss,
         specified_loss.detach(),
+        grounding_loss.detach(),
+        drift_loss.detach(),
         anti_average_loss.detach(),
-        anti_mean_loss.detach(),
     )
 
 
@@ -236,7 +260,7 @@ def train_segment(
     t_indices_list = list(t_indices)
     alphas = scheduler.alphas_cumprod.to(DEVICE)
 
-    capture = CrossAttentionCapture(unet)
+    capture = CrossAttentionCapture(base_unet)
 
     for step in (pbar := tqdm(range(STEPS))):
         indices = list(range(len(cached)))
@@ -260,17 +284,18 @@ def train_segment(
 
             with capture:
                 with torch.amp.autocast("cuda", dtype=torch.float16):
-                    init_pred = unet(
+                    base_pred = base_unet(
                         uniform_noisy.to(dtype=torch.float16),
                         t,
                         encoder_hidden_states=text_emb.to(dtype=torch.float16),
                     ).sample.float()
 
+            # pyrefly: ignore [bad-argument-type]
             attn_mask = capture.build_mask(token_mask, latents.shape[2:])
 
             a = alphas[t.long()].view(-1, 1, 1, 1) ** 0.5
             b = (1 - alphas[t.long()]).view(-1, 1, 1, 1) ** 0.5
-            denoised_latents = (uniform_noisy.float() - b * init_pred) / a
+            denoised_latents = (uniform_noisy.float() - b * base_pred) / a
 
             pred_features = vision_encoder.extract_features(
                 decode_for_clip(vae, denoised_latents, clip_mean, clip_std)
@@ -293,9 +318,7 @@ def train_segment(
         )
         noisy_latents = scheduler.add_noise(latents, noise, t, noise_scale=noise_scale)
 
-        alphas = scheduler.alphas_cumprod.to(DEVICE)
-
-        loss, spec, div, anti_mean = compute_loss(
+        loss, spec, ground, drift, div = compute_loss(
             unet,
             noisy_latents,
             noise,
@@ -305,8 +328,11 @@ def train_segment(
             noise_scale,
             alphas_cumprod=alphas,
             t_normalized=t_norm,
+            clean_latents=latents,
+            base_pred=base_pred,
             diversity_weight=0.0 if segment_name == "final" else DIVERSITY_WEIGHT,
-            anti_mean_weight=0.0 if segment_name == "final" else ANTI_MEAN_WEIGHT,
+            grounding_weight=GROUNDING_WEIGHT,
+            drift_weight=BASE_DRIFT_WEIGHT,
         )
 
         optimizer.zero_grad()
@@ -316,8 +342,9 @@ def train_segment(
         pbar.set_postfix(
             loss=f"{loss.item():.4f}",
             spec=f"{spec.item():.4f}",
+            ground=f"{ground.item():.4f}",
+            drift=f"{drift.item():.4f}",
             div=f"{div.item():.4f}",
-            anti_mean=f"{anti_mean.item():.4f}",
             blend=f"{alpha:.2f}",
             t=t[0].item(),
         )
@@ -336,6 +363,11 @@ def train():
     vae = models["vae"]
     text_encoder = models["text_encoder"]
     tokenizer = models["tokenizer"]
+
+    # pyrefly: ignore [missing-attribute]
+    base_unet = models["pipe"].unet.eval()
+    for param in base_unet.parameters():
+        param.requires_grad_(False)
 
     scheduler = SpatiallyVaryingDDPMScheduler.from_config(
         # pyrefly: ignore [missing-attribute]
@@ -372,9 +404,6 @@ def train():
         clip_mean,
         clip_std,
     )
-
-    # pyrefly: ignore [missing-attribute]
-    base_unet = models["pipe"].unet
 
     for segment_name, t_indices in SEGMENTS:
         train_segment(
