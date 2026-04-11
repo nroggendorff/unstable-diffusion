@@ -51,6 +51,8 @@ MASK_BLEND_ALPHA_MAX = 0.2
 
 LATE_START = EARLY_SEG + MID_SEG
 
+CLIP_LATENT_SIZE = 28
+
 SEGMENTS = [
     ("early", range(0, EARLY_SEG)),
     ("mid", range(EARLY_SEG, LATE_START)),
@@ -70,6 +72,20 @@ def decode_for_clip(
     decoded = F.interpolate(
         decoded, size=(224, 224), mode="bilinear", align_corners=False
     )
+    return (decoded - clip_mean) / clip_std
+
+
+def decode_for_clip_small(
+    vae, latents: torch.Tensor, clip_mean: torch.Tensor, clip_std: torch.Tensor
+) -> torch.Tensor:
+    stride = max(1, latents.shape[-1] // CLIP_LATENT_SIZE)
+    small = F.avg_pool2d(latents.to(dtype=vae.dtype), kernel_size=stride, stride=stride)
+    decoded = vae.decode(small / vae.config.scaling_factor).sample
+    decoded = (decoded.float().clamp(-1, 1) + 1) / 2
+    if decoded.shape[-1] != 224:
+        decoded = F.interpolate(
+            decoded, size=(224, 224), mode="bilinear", align_corners=False
+        )
     return (decoded - clip_mean) / clip_std
 
 
@@ -112,6 +128,10 @@ def compute_loss(
     t_normalized,
     clean_latents,
     base_pred,
+    vision_encoder=None,
+    vae=None,
+    clip_mean=None,
+    clip_std=None,
     diversity_weight=DIVERSITY_WEIGHT,
     grounding_weight=GROUNDING_WEIGHT,
     drift_weight=BASE_DRIFT_WEIGHT,
@@ -129,6 +149,7 @@ def compute_loss(
     mask_mass = mask_f.sum(dim=(1, 2, 3), keepdim=True).clamp_min(1.0)
     specified_loss = (per_pixel * mask_f).sum(dim=(1, 2, 3), keepdim=True) / mask_mass
     specified_loss = specified_loss.mean()
+    del per_pixel
 
     a = alphas_cumprod[t.long()].view(-1, 1, 1, 1).sqrt()
     b = (1 - alphas_cumprod[t.long()]).view(-1, 1, 1, 1).sqrt()
@@ -138,6 +159,7 @@ def compute_loss(
     base_x0 = (noisy_latents.float() - b * ns * base_f) / a
 
     grounding_loss = _masked_mse(pred_x0, clean_f, mask_f).mean()
+    del clean_f
 
     bg_mask = (1.0 - mask_f).clamp(0.0, 1.0)
     bg_mask = F.avg_pool2d(bg_mask, kernel_size=3, stride=1, padding=1).clamp(0.0, 1.0)
@@ -153,12 +175,32 @@ def compute_loss(
     else:
         drift_loss = pred_f.new_tensor(0.0)
 
-    if pred_f.shape[0] > 1 and t_scalar < 0.35 and diversity_weight > 0:
-        masked_pred = pred_x0 * mask_f
-        flat = F.normalize(masked_pred.flatten(1), dim=1)
-        sim = flat @ flat.T
+    del base_x0, bg_mask, base_f, noise_f
+
+    if (
+        pred_f.shape[0] > 1
+        and diversity_weight > 0
+        and vision_encoder is not None
+        and vae is not None
+        and clip_mean is not None
+        and clip_std is not None
+    ):
+        with torch.no_grad():
+            clip_input = decode_for_clip_small(
+                vae, pred_x0.detach().to(dtype=vae.dtype), clip_mean, clip_std
+            )
+            clip_feats = vision_encoder.extract_features(clip_input)
+            del clip_input
+
+        feat_vec = clip_feats[-1].mean(dim=(2, 3))
+        del clip_feats
+        feat_vec = F.normalize(feat_vec, dim=1)
+        sim = feat_vec @ feat_vec.T
         pair_mask = torch.ones(
-            flat.shape[0], flat.shape[0], dtype=torch.bool, device=flat.device
+            feat_vec.shape[0],
+            feat_vec.shape[0],
+            dtype=torch.bool,
+            device=feat_vec.device,
         ).triu(diagonal=1)
         anti_average_loss = sim[pair_mask].mean()
     else:
@@ -224,7 +266,7 @@ def build_cache(
             text_emb = text_encoder(**inputs).last_hidden_state
 
             target_features = [
-                f.cpu()
+                f.cpu().half()
                 for f in vision_encoder.extract_features(
                     decode_for_clip(vae, latents, clip_mean, clip_std)
                 )
@@ -232,8 +274,8 @@ def build_cache(
 
         cached.append(
             {
-                "latents": latents.cpu().float(),
-                "text_emb": text_emb.cpu(),
+                "latents": latents.cpu().half(),
+                "text_emb": text_emb.cpu().half(),
                 "token_attention_mask": inputs.attention_mask.cpu(),
                 "target_features": target_features,
             }
@@ -257,7 +299,13 @@ def train_segment(
 ):
     print(f"\nTraining segment: {segment_name}")
 
-    unet = get_peft_model(copy.deepcopy(base_unet), get_lora_config()).train()
+    unet = get_peft_model(copy.deepcopy(base_unet), get_lora_config())
+    # pyrefly: ignore [not-callable]
+    unet.enable_input_require_grads()
+    # pyrefly: ignore [not-callable]
+    unet.gradient_checkpointing_enable()
+    unet.train()
+
     optimizer = torch.optim.AdamW(unet.parameters(), lr=LR)
     t_indices_list = list(t_indices)
     alphas = scheduler.alphas_cumprod.to(DEVICE)
@@ -269,11 +317,13 @@ def train_segment(
         random.shuffle(indices)
         items = [cached[i] for i in indices[:BATCH_SIZE]]
 
-        latents = torch.cat([x["latents"] for x in items]).to(DEVICE)
-        text_emb = torch.cat([x["text_emb"] for x in items]).to(DEVICE)
+        latents = torch.cat([x["latents"] for x in items]).float().to(DEVICE)
+        text_emb = torch.cat([x["text_emb"] for x in items]).to(
+            DEVICE, dtype=torch.float16
+        )
         token_mask = torch.cat([x["token_attention_mask"] for x in items]).to(DEVICE)
         target_features = [
-            torch.cat([x["target_features"][i] for x in items]).to(DEVICE)
+            torch.cat([x["target_features"][i] for x in items]).float().to(DEVICE)
             for i in range(len(items[0]["target_features"]))
         ]
 
@@ -289,7 +339,7 @@ def train_segment(
                     base_pred = base_unet(
                         uniform_noisy.to(dtype=torch.float16),
                         t,
-                        encoder_hidden_states=text_emb.to(dtype=torch.float16),
+                        encoder_hidden_states=text_emb,
                     ).sample.float()
 
             # pyrefly: ignore [bad-argument-type]
@@ -302,10 +352,14 @@ def train_segment(
             pred_features = vision_encoder.extract_features(
                 decode_for_clip(vae, denoised_latents, clip_mean, clip_std)
             )
+            del denoised_latents
+
             raw_diff = compute_perceptual_discrepancy(pred_features, target_features)
+            del pred_features
 
             alpha = _blend_alpha(step, STEPS)
             mask = _blend_masks(attn_mask, raw_diff, latents.shape[2:], alpha=alpha)
+            del attn_mask, raw_diff
 
         blur_sigma = mask_builder.blur_sigma_for_step(step, STEPS)
         mask = mask_builder.build_mask(mask, blur_sigma)
@@ -319,6 +373,7 @@ def train_segment(
             min_scale=SCHEDULER_MIN_SCALE,
         )
         noisy_latents = scheduler.add_noise(latents, noise, t, noise_scale=noise_scale)
+        del uniform_noisy
 
         loss, spec, ground, drift, div = compute_loss(
             unet,
@@ -332,6 +387,10 @@ def train_segment(
             t_normalized=t_norm,
             clean_latents=latents,
             base_pred=base_pred,
+            vision_encoder=vision_encoder,
+            vae=vae,
+            clip_mean=clip_mean,
+            clip_std=clip_std,
             diversity_weight=0.0 if segment_name == "final" else DIVERSITY_WEIGHT,
             grounding_weight=GROUNDING_WEIGHT,
             drift_weight=BASE_DRIFT_WEIGHT,
@@ -340,6 +399,8 @@ def train_segment(
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        del noisy_latents, noise_scale, mask, base_pred
 
         pbar.set_postfix(
             loss=f"{loss.item():.4f}",
@@ -351,7 +412,7 @@ def train_segment(
             t=t[0].item(),
         )
 
-        if step % 50 == 0:
+        if step % 20 == 0:
             torch.cuda.empty_cache()
 
     save_lora(unet, f"creative-lora/{segment_name}")

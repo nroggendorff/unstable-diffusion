@@ -57,10 +57,11 @@ class _CapturingProcessor:
         if attention_mask is not None:
             scores = scores + attention_mask
 
-        weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-        self.store.append(weights.detach().cpu())
+        weights = torch.softmax(scores.float(), dim=-1)
+        self.store.append(weights.detach().half().cpu())
 
-        out = torch.bmm(weights, v)
+        weights_typed = weights.to(q.dtype)
+        out = torch.bmm(weights_typed, v)
         out = attn.batch_to_head_dim(out)
         out = attn.to_out[0](out)
         out = attn.to_out[1](out)
@@ -119,7 +120,7 @@ class CrossAttentionCapture:
         accumulated = []
 
         for weights in self.store:
-            weights = weights.to(token_attention_mask.device)
+            weights = weights.float().to(token_attention_mask.device)
             BH, S, T = weights.shape
             if BH % B != 0:
                 continue
@@ -142,6 +143,8 @@ class CrossAttentionCapture:
             )
 
             accumulated.append(w_resized.squeeze(1))
+
+        self.store.clear()
 
         if not accumulated:
             raise RuntimeError(

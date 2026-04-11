@@ -199,14 +199,12 @@ def main():
     parser.add_argument(
         "--prompt",
         type=str,
-        default="A woman with long, wavy pink hair is shown in profile, "
-        "wearing a dark, strapless dress with lace trim around the neckline and armholes. "
-        "She has a prominent gold chain around her neck.",
+        default="A woman with long, wavy pink hair is shown in profile",
     )
     parser.add_argument("--output", "-o", type=str, default="output.png")
     parser.add_argument("--evolution-output", "-e", type=str, default="evolution.png")
     parser.add_argument("--steps", "-s", type=int, default=30)
-    parser.add_argument("--strength", type=float, default=1.0)
+    parser.add_argument("--strength", type=float, default=0.4)
     parser.add_argument("--guidance", "-g", type=float, default=7.0)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
