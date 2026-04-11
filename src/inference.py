@@ -102,6 +102,7 @@ def infer_batch(
 
     images = pipe(
         prompt=[prompt] * batch_size,
+        negative_prompt=["watermark, text"] * batch_size,
         width=1024,
         height=1024,
         num_inference_steps=num_inference_steps,
