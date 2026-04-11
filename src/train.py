@@ -126,17 +126,12 @@ def compute_loss(
     t_scalar = float(t_normalized.mean().item())
     gated = 0.15 <= t_scalar <= 0.85
 
-    if gated and grounding_weight > 0:
-        lora_delta = ((pred_x0 - base_x0) * mask_f).flatten(1)
-        target_delta = ((clean_f - base_x0) * mask_f).flatten(1)
-        grounding_loss = -F.cosine_similarity(
-            lora_delta, target_delta, dim=1, eps=1e-6
-        ).mean()
-        del lora_delta, target_delta
-    else:
-        grounding_loss = pred_f.new_tensor(0.0)
-
-    del clean_f
+    lora_delta = ((pred_x0 - base_x0) * mask_f).flatten(1)
+    target_delta = ((clean_f - base_x0) * mask_f).flatten(1)
+    grounding_loss = -F.cosine_similarity(
+        lora_delta, target_delta, dim=1, eps=1e-6
+    ).mean()
+    del lora_delta, target_delta, clean_f
 
     pred_subj = (pred_x0 * mask_f).flatten(1)
     if gated and drift_weight > 0:
