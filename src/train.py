@@ -157,8 +157,10 @@ def compute_loss(
         masked_pred = pred_x0 * mask_f
         flat = F.normalize(masked_pred.flatten(1), dim=1)
         sim = flat @ flat.T
-        off_diag = sim * (1 - torch.eye(flat.shape[0], device=flat.device))
-        anti_average_loss = off_diag.sum() / (flat.shape[0] * (flat.shape[0] - 1))
+        pair_mask = torch.ones(
+            flat.shape[0], flat.shape[0], dtype=torch.bool, device=flat.device
+        ).triu(diagonal=1)
+        anti_average_loss = sim[pair_mask].mean()
     else:
         anti_average_loss = pred_f.new_tensor(0.0)
 

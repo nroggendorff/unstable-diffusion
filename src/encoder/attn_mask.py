@@ -148,7 +148,16 @@ class CrossAttentionCapture:
                 "Cross-attention was captured, but no usable maps were produced."
             )
 
-        avg = torch.stack(accumulated).mean(0)
+        stack = torch.stack(accumulated, dim=1)
+
+        n = stack.shape[1]
+        layer_weights = torch.linspace(0.5, 1.0, n, device=stack.device)
+        layer_weights = layer_weights / layer_weights.sum()
+
+        layer_weights = layer_weights.view(1, n, 1, 1)
+
+        avg = (stack * layer_weights).sum(dim=1)
+
         spatial = avg.unsqueeze(1)
 
         mn = spatial.flatten(1).min(1).values.view(B, 1, 1, 1)
