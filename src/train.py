@@ -30,18 +30,20 @@ from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scal
 
 STEPS = 2000
 BATCH_SIZE = 8
-GROUNDING_WEIGHT = 0.5
-DRIFT_WEIGHT = 0.3
+
+GROUNDING_WEIGHT = 0.4
+SUBJECT_DRIFT_WEIGHT = 0.25
 DIVERSITY_WEIGHT = 0.1
-BASE_DRIFT_TARGET_SIM = 0.1
+
+SUBJECT_DRIFT_TARGET_SIM = 0.1
 
 TRAIN_STEPS = STEPS // BATCH_SIZE
 
-MASK_BLUR_SIGMA_START = 5.0
+MASK_BLUR_SIGMA_START = 7.0
 MASK_BLUR_SIGMA_END = 1.0
-MASK_MIN_VALUE = 0.05
+MASK_MIN_VALUE = 0.0
 SCHEDULER_SUBJECT_POWER = 0.6
-SCHEDULER_BG_SCALE = 0.9
+SCHEDULER_BG_SCALE = 1.0
 SCHEDULER_MIN_SCALE = 0.0
 
 VISION_ENCODER_MODEL = "openai/clip-vit-base-patch32"
@@ -104,7 +106,7 @@ def compute_loss(
     base_pred,
     uniform_noisy,
     grounding_weight=GROUNDING_WEIGHT,
-    drift_weight=DRIFT_WEIGHT,
+    subject_drift_weight=SUBJECT_DRIFT_WEIGHT,
     diversity_weight=DIVERSITY_WEIGHT,
 ):
     with torch.amp.autocast("cuda", dtype=torch.float16):
@@ -128,19 +130,19 @@ def compute_loss(
 
     lora_delta = ((pred_x0 - base_x0) * mask_f).flatten(1)
     target_delta = ((clean_f - base_x0) * mask_f).flatten(1)
-    grounding_loss = -F.cosine_similarity(
-        lora_delta, target_delta, dim=1, eps=1e-6
+    grounding_loss = (
+        1.0 - F.cosine_similarity(lora_delta, target_delta, dim=1, eps=1e-6)
     ).mean()
     del lora_delta, target_delta, clean_f
 
     pred_subj = (pred_x0 * mask_f).flatten(1)
-    if gated and drift_weight > 0:
+    if gated and subject_drift_weight > 0:
         base_subj = (base_x0 * mask_f).flatten(1)
         subj_sim = F.cosine_similarity(pred_subj, base_subj, dim=1, eps=1e-6)
-        drift_loss = F.relu(subj_sim - BASE_DRIFT_TARGET_SIM).mean()
+        subject_drift_loss = F.relu(subj_sim - SUBJECT_DRIFT_TARGET_SIM).mean()
         del base_subj
     else:
-        drift_loss = pred_f.new_tensor(0.0)
+        subject_drift_loss = pred_f.new_tensor(0.0)
 
     del base_x0, mask_f
 
@@ -160,13 +162,13 @@ def compute_loss(
 
     loss = (
         grounding_weight * grounding_loss
-        + drift_weight * drift_loss
+        + subject_drift_weight * subject_drift_loss
         + diversity_weight * batch_diversity_loss
     )
     return (
         loss,
         grounding_loss.detach(),
-        drift_loss.detach(),
+        subject_drift_loss.detach(),
         batch_diversity_loss.detach(),
     )
 
@@ -327,7 +329,7 @@ def train_segment(
         )
         noisy_latents = scheduler.add_noise(latents, noise, t, noise_scale=noise_scale)
 
-        loss, ground, drift, diversity = compute_loss(
+        loss, ground, subj_drift, diversity = compute_loss(
             unet,
             noisy_latents,
             t,
@@ -340,7 +342,9 @@ def train_segment(
             base_pred=base_pred,
             uniform_noisy=uniform_noisy,
             grounding_weight=GROUNDING_WEIGHT,
-            drift_weight=0.0 if segment_name == "final" else DRIFT_WEIGHT,
+            subject_drift_weight=(
+                0.0 if segment_name == "final" else SUBJECT_DRIFT_WEIGHT
+            ),
             diversity_weight=0.0 if segment_name == "final" else DIVERSITY_WEIGHT,
         )
 
@@ -353,7 +357,7 @@ def train_segment(
         pbar.set_postfix(
             loss=f"{loss.item():.4f}",
             ground=f"{ground.item():.4f}",
-            drift=f"{drift.item():.4f}",
+            s_drift=f"{subj_drift.item():.4f}",
             div=f"{diversity.item():.4f}",
             blend=f"{alpha:.2f}",
             t=t[0].item(),
