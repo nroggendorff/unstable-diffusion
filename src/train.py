@@ -59,6 +59,40 @@ SEGMENTS = [
     ("final", range(LATE_START, NUM_INFERENCE_STEPS)),
 ]
 
+TARGET_SIZE = 1024
+_TIME_IDS_BASE = [TARGET_SIZE, TARGET_SIZE, 0, 0, TARGET_SIZE, TARGET_SIZE]
+
+
+def _make_time_ids(batch_size: int, device: torch.device) -> torch.Tensor:
+    ids = torch.tensor(_TIME_IDS_BASE, dtype=torch.float32, device=device)
+    return ids.unsqueeze(0).expand(batch_size, -1)
+
+
+def encode_prompt(
+    prompts, text_encoder, text_encoder_2, tokenizer, tokenizer_2, device
+):
+    def tokenize(tok, text):
+        return tok(
+            text,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=tok.model_max_length,
+            truncation=True,
+        ).to(device)
+
+    inputs1 = tokenize(tokenizer, prompts)
+    inputs2 = tokenize(tokenizer_2, prompts)
+
+    out1 = text_encoder(input_ids=inputs1.input_ids, output_hidden_states=True)
+    hidden1 = out1.hidden_states[-2]
+
+    out2 = text_encoder_2(input_ids=inputs2.input_ids, output_hidden_states=True)
+    hidden2 = out2.hidden_states[-2]
+    pooled = out2[0]
+
+    encoder_hidden_states = torch.cat([hidden1, hidden2], dim=-1)
+    return encoder_hidden_states, pooled, inputs1.attention_mask
+
 
 def decode_for_clip(
     vae, latents: torch.Tensor, clip_mean: torch.Tensor, clip_std: torch.Tensor
@@ -98,6 +132,7 @@ def compute_loss(
     noisy_latents,
     t,
     text_emb,
+    added_cond_kwargs,
     mask,
     noise_scale,
     alphas_cumprod,
@@ -110,7 +145,12 @@ def compute_loss(
     diversity_weight=DIVERSITY_WEIGHT,
 ):
     with torch.amp.autocast("cuda", dtype=torch.float16):
-        pred = unet(noisy_latents, t, encoder_hidden_states=text_emb).sample
+        pred = unet(
+            noisy_latents,
+            t,
+            encoder_hidden_states=text_emb,
+            added_cond_kwargs=added_cond_kwargs,
+        ).sample
 
     pred_f = pred.float()
     clean_f = clean_latents.float().to(pred_f.device)
@@ -194,7 +234,9 @@ def build_cache(
     transform,
     vae,
     text_encoder,
+    text_encoder_2,
     tokenizer,
+    tokenizer_2,
     vision_encoder,
     clip_mean,
     clip_std,
@@ -208,14 +250,14 @@ def build_cache(
         with torch.no_grad():
             latents = vae.encode(image).latent_dist.sample() * vae.config.scaling_factor
 
-            inputs = tokenizer(
+            text_emb, pooled, attn_mask = encode_prompt(
                 prompt,
-                return_tensors="pt",
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-            ).to(DEVICE)
-            text_emb = text_encoder(**inputs).last_hidden_state
+                text_encoder,
+                text_encoder_2,
+                tokenizer,
+                tokenizer_2,
+                DEVICE,
+            )
 
             target_features = [
                 f.cpu().half()
@@ -228,7 +270,8 @@ def build_cache(
             {
                 "latents": latents.cpu().half(),
                 "text_emb": text_emb.cpu().half(),
-                "token_attention_mask": inputs.attention_mask.cpu(),
+                "pooled_text_emb": pooled.cpu().half(),
+                "token_attention_mask": attn_mask.cpu(),
                 "target_features": target_features,
             }
         )
@@ -276,11 +319,18 @@ def train_segment(
         text_emb = torch.cat([x["text_emb"] for x in items]).to(
             DEVICE, dtype=torch.float16
         )
+        pooled = torch.cat([x["pooled_text_emb"] for x in items]).to(
+            DEVICE, dtype=torch.float16
+        )
         token_mask = torch.cat([x["token_attention_mask"] for x in items]).to(DEVICE)
         target_features = [
             torch.cat([x["target_features"][i] for x in items]).float().to(DEVICE)
             for i in range(len(items[0]["target_features"]))
         ]
+
+        # pyrefly: ignore [bad-argument-type]
+        time_ids = _make_time_ids(BATCH_SIZE, DEVICE)
+        added_cond_kwargs = {"text_embeds": pooled, "time_ids": time_ids}
 
         noise = torch.randn_like(latents)
         t_idx = random.choice(t_indices_list)
@@ -295,6 +345,7 @@ def train_segment(
                         uniform_noisy.to(dtype=torch.float16),
                         t,
                         encoder_hidden_states=text_emb,
+                        added_cond_kwargs=added_cond_kwargs,
                     ).sample.float()
 
                 # pyrefly: ignore [bad-argument-type]
@@ -334,6 +385,7 @@ def train_segment(
             noisy_latents,
             t,
             text_emb,
+            added_cond_kwargs,
             mask,
             noise_scale,
             alphas_cumprod=alphas,
@@ -376,7 +428,9 @@ def train():
     models = load_model()
     vae = models["vae"]
     text_encoder = models["text_encoder"]
+    text_encoder_2 = models["text_encoder_2"]
     tokenizer = models["tokenizer"]
+    tokenizer_2 = models["tokenizer_2"]
 
     # pyrefly: ignore [missing-attribute]
     base_unet = models["pipe"].unet.eval()
@@ -413,7 +467,9 @@ def train():
         transform,
         vae,
         text_encoder,
+        text_encoder_2,
         tokenizer,
+        tokenizer_2,
         vision_encoder,
         clip_mean,
         clip_std,

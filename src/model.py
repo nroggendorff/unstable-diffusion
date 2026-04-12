@@ -1,9 +1,9 @@
 import torch
 
-from diffusers import StableDiffusionPipeline, DDPMScheduler
+from diffusers import StableDiffusionXLPipeline, DDPMScheduler
 from peft import LoraConfig
 
-MODEL_ID = "glides/counterfeit"
+MODEL_ID = "glides/illustriousxl"
 DEVICE = "cuda"
 NUM_INFERENCE_STEPS = 30
 
@@ -28,13 +28,15 @@ def get_lora_config():
 
 def load_model():
     # pyrefly: ignore [missing-attribute]
-    pipe = StableDiffusionPipeline.from_pretrained(
+    pipe = StableDiffusionXLPipeline.from_pretrained(
         MODEL_ID, torch_dtype=torch.float16
     ).to(DEVICE)
 
     vae = pipe.vae.to(dtype=torch.float16)
     text_encoder = pipe.text_encoder.to(dtype=torch.float16)
+    text_encoder_2 = pipe.text_encoder_2.to(dtype=torch.float16)
     tokenizer = pipe.tokenizer
+    tokenizer_2 = pipe.tokenizer_2
 
     scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
     # pyrefly: ignore [missing-attribute]
@@ -44,6 +46,8 @@ def load_model():
         "pipe": pipe,
         "vae": vae,
         "text_encoder": text_encoder,
+        "text_encoder_2": text_encoder_2,
         "tokenizer": tokenizer,
+        "tokenizer_2": tokenizer_2,
         "scheduler": scheduler,
     }

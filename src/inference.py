@@ -2,13 +2,13 @@ import argparse
 import torch
 import numpy as np
 
-from diffusers import StableDiffusionPipeline
+from diffusers import StableDiffusionXLPipeline
 from PIL import Image
 
 from .model import EARLY_SEG, MID_SEG, LATE_SEG
 
 
-MODEL_ID = "glides/counterfeit"
+MODEL_ID = "glides/illustriousxl"
 ADAPTER_BASE_PATH = "./creative-lora"
 
 BLEND_SEGMENTS = ["early", "mid", "late"]
@@ -35,7 +35,7 @@ def _adapter_weights(step_index: int, strength: float = 1.0) -> list[float]:
 
 def load_pipe():
     # pyrefly: ignore [missing-attribute]
-    pipe = StableDiffusionPipeline.from_pretrained(
+    pipe = StableDiffusionXLPipeline.from_pretrained(
         MODEL_ID, torch_dtype=torch.float16
     ).to("cuda")
 
