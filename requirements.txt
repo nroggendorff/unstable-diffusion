@@ -6,4 +6,3 @@ types-tqdm
 torchvision
 pillow
 datasets
-lpips
