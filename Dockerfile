@@ -15,8 +15,6 @@ WORKDIR /app/
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY src .
+COPY src /app/src/
 
-WORKDIR /app/
-
-CMD ["python", "-m", "train"]
+CMD ["python3", "-m", "src.train"]
