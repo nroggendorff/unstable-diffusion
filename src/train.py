@@ -57,7 +57,6 @@ SEGMENTS = [
     ("early", range(0, EARLY_SEG)),
     ("mid", range(EARLY_SEG, LATE_START)),
     ("late", range(LATE_START, NUM_INFERENCE_STEPS)),
-    ("final", range(LATE_START, NUM_INFERENCE_STEPS)),
 ]
 
 

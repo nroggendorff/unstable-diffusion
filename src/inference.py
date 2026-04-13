@@ -11,7 +11,7 @@ from .model import EARLY_SEG, MID_SEG
 MODEL_ID = "glides/illustriousxl"
 ADAPTER_BASE_PATH = "./creative-lora"
 
-ALL_SEGMENTS = ["early", "mid", "late", "final"]
+ALL_SEGMENTS = ["early", "mid", "late"]
 
 _BOUNDARIES = [EARLY_SEG, EARLY_SEG + MID_SEG]
 _BLEND_HALF = 2
@@ -22,12 +22,12 @@ def _adapter_weights(step_index: int, strength: float = 1.0) -> list[float]:
         dist = step_index - boundary
         if abs(dist) <= _BLEND_HALF:
             t = (dist + _BLEND_HALF) / (2 * _BLEND_HALF)
-            weights = [0.0, 0.0, 0.0, 0.0]
+            weights = [0.0, 0.0, 0.0]
             weights[i] = (1.0 - t) * strength
             weights[i + 1] = t * strength
             return weights
 
-    weights = [0.0, 0.0, 0.0, 0.0]
+    weights = [0.0, 0.0, 0.0]
     if step_index < _BOUNDARIES[0]:
         weights[0] = strength
     elif step_index < _BOUNDARIES[1]:
@@ -61,7 +61,7 @@ def make_segment_callback(use_lora, num_inference_steps, strength):
             return callback_kwargs
 
         if step_index == last_step:
-            pipe.set_adapters(ALL_SEGMENTS, [0.0, 0.0, 0.0, strength])
+            pipe.set_adapters(ALL_SEGMENTS, [0.0, 0.0, 0.0])
         else:
             pipe.set_adapters(ALL_SEGMENTS, _adapter_weights(step_index, strength))
         return callback_kwargs
