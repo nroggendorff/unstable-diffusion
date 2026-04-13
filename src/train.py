@@ -34,8 +34,8 @@ from .loss import (
 from .cache import build_cache, make_time_ids, blend_alpha, blend_masks
 from .io import save_lora
 
-STEPS = 2000
-MINI_BATCH_SIZE = 1
+STEPS = 15000
+MINI_BATCH_SIZE = 2
 GRAD_ACCUM_STEPS = 4
 EFFECTIVE_BATCH_SIZE = MINI_BATCH_SIZE * GRAD_ACCUM_STEPS
 
