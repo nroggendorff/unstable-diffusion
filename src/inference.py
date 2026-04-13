@@ -29,8 +29,7 @@ def _adapter_weights(step_index: int, strength: float = 1.0) -> list[float]:
     ]
     total = sum(raw) + 1e-8
     normalized = [w / total for w in raw]
-
-    return [w * strength for w in normalized]
+    return [w * strength for w in normalized] + [0.0]
 
 
 def load_pipe():
@@ -57,12 +56,9 @@ def make_segment_callback(use_lora, num_inference_steps, strength):
             return callback_kwargs
 
         if step_index == last_step:
-            pipe.set_adapters(["final"], adapter_weights=[strength])
+            pipe.set_adapters(ALL_SEGMENTS, [0.0, 0.0, 0.0, strength])
         else:
-            pipe.set_adapters(
-                BLEND_SEGMENTS,
-                adapter_weights=_adapter_weights(step_index, strength),
-            )
+            pipe.set_adapters(ALL_SEGMENTS, _adapter_weights(step_index, strength))
         return callback_kwargs
 
     return callback
@@ -89,10 +85,7 @@ def infer_batch(
 ):
     if use_lora:
         pipe.enable_lora()
-        pipe.set_adapters(
-            BLEND_SEGMENTS,
-            adapter_weights=_adapter_weights(0, strength),
-        )
+        pipe.set_adapters(ALL_SEGMENTS, _adapter_weights(0, strength))
     else:
         pipe.disable_lora()
 
@@ -128,10 +121,7 @@ def infer_with_evolution(
 ):
     if use_lora:
         pipe.enable_lora()
-        pipe.set_adapters(
-            BLEND_SEGMENTS,
-            adapter_weights=_adapter_weights(0, strength),
-        )
+        pipe.set_adapters(ALL_SEGMENTS, _adapter_weights(0, strength))
     else:
         pipe.disable_lora()
 
