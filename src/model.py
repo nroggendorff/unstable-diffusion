@@ -17,10 +17,10 @@ LORA_ALPHA = 32
 LORA_TARGET_MODULES = ["to_k", "to_q", "to_v", "to_out.0"]
 
 
-def get_lora_config():
+def get_lora_config(rank: int = LORA_RANK, alpha: int = LORA_ALPHA):
     return LoraConfig(
-        r=LORA_RANK,
-        lora_alpha=LORA_ALPHA,
+        r=rank,
+        lora_alpha=alpha,
         target_modules=LORA_TARGET_MODULES,
         inference_mode=False,
     )

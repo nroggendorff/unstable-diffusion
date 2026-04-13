@@ -1,3 +1,5 @@
+import argparse
+import os
 import random
 import copy
 
@@ -7,6 +9,7 @@ from tqdm import tqdm
 
 from peft import get_peft_model
 
+from .config import get_config
 from .model import (
     load_model,
     get_lora_config,
@@ -14,7 +17,6 @@ from .model import (
     NUM_INFERENCE_STEPS,
     EARLY_SEG,
     MID_SEG,
-    LR,
 )
 from .dataset import get_samples, get_transform
 from .encoder import (
@@ -25,28 +27,9 @@ from .encoder import (
 )
 from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scale
 from .encoding import decode_for_clip
-from .loss import (
-    compute_loss,
-    GROUNDING_WEIGHT,
-    SUBJECT_DRIFT_WEIGHT,
-    DIVERSITY_WEIGHT,
-)
+from .loss import compute_loss
 from .cache import build_cache, make_time_ids, blend_alpha, blend_masks
 from .io import save_lora
-
-STEPS = 15000
-MINI_BATCH_SIZE = 2
-GRAD_ACCUM_STEPS = 4
-EFFECTIVE_BATCH_SIZE = MINI_BATCH_SIZE * GRAD_ACCUM_STEPS
-
-TRAIN_STEPS = STEPS // EFFECTIVE_BATCH_SIZE
-
-MASK_BLUR_SIGMA_START = 7.0
-MASK_BLUR_SIGMA_END = 1.0
-MASK_MIN_VALUE = 0.0
-SCHEDULER_SUBJECT_POWER = 0.6
-SCHEDULER_BG_SCALE = 1.0
-SCHEDULER_MIN_SCALE = 0.0
 
 VISION_ENCODER_MODEL = "openai/clip-vit-base-patch32"
 FEATURE_LAYERS = [2, 4, 6, 8]
@@ -76,11 +59,14 @@ def train_segment(
     clip_mean,
     clip_std,
     cached,
+    cfg: argparse.Namespace,
 ):
     print(f"\nTraining segment: {segment_name}")
 
     base_unet.to(DEVICE)
-    unet = get_peft_model(copy.deepcopy(base_unet), get_lora_config())
+    unet = get_peft_model(
+        copy.deepcopy(base_unet), get_lora_config(cfg.lora_rank, cfg.lora_alpha)
+    )
     base_unet.to("cpu")
     torch.cuda.empty_cache()
 
@@ -89,25 +75,25 @@ def train_segment(
     unet.enable_gradient_checkpointing()
     unet.train()
 
-    optimizer = bnb.optim.AdamW8bit(unet.parameters(), lr=LR)
+    optimizer = bnb.optim.AdamW8bit(unet.parameters(), lr=cfg.lr)
     scaler = torch.amp.GradScaler("cuda")
     t_indices_list = list(t_indices)
     alphas = scheduler.alphas_cumprod.to(DEVICE)
 
     capture = CrossAttentionCapture(unet)
 
-    for step in (pbar := tqdm(range(TRAIN_STEPS))):
+    for step in (pbar := tqdm(range(cfg.train_steps))):
         optimizer.zero_grad(set_to_none=True)
 
         accum_loss = accum_ground = accum_subj = accum_div = 0.0
-        alpha = blend_alpha(step, TRAIN_STEPS)
+        alpha = blend_alpha(step, cfg.train_steps)
         t_idx = random.choice(t_indices_list)
         t_base = timesteps[t_idx]
 
-        for _ in range(GRAD_ACCUM_STEPS):
+        for _ in range(cfg.grad_accum_steps):
             indices = list(range(len(cached)))
             random.shuffle(indices)
-            items = [cached[i] for i in indices[:MINI_BATCH_SIZE]]
+            items = [cached[i] for i in indices[: cfg.mini_batch_size]]
 
             latents = torch.cat([x["latents"] for x in items]).float().to(DEVICE)
             text_emb = torch.cat([x["text_emb"] for x in items]).to(
@@ -125,11 +111,11 @@ def train_segment(
             ]
 
             # pyrefly: ignore [bad-argument-type]
-            time_ids = make_time_ids(MINI_BATCH_SIZE, DEVICE)
+            time_ids = make_time_ids(cfg.mini_batch_size, DEVICE)
             added_cond_kwargs = {"text_embeds": pooled, "time_ids": time_ids}
 
             noise = torch.randn_like(latents)
-            t = t_base.unsqueeze(0).expand(MINI_BATCH_SIZE).clone()
+            t = t_base.unsqueeze(0).expand(cfg.mini_batch_size).clone()
 
             with torch.no_grad():
                 uniform_noisy = scheduler.add_noise(latents, noise, t)
@@ -163,16 +149,16 @@ def train_segment(
                 mask = blend_masks(attn_mask, raw_diff, latents.shape[2:], alpha=alpha)
                 del attn_mask, raw_diff
 
-            blur_sigma = mask_builder.blur_sigma_for_step(step, TRAIN_STEPS)
+            blur_sigma = mask_builder.blur_sigma_for_step(step, cfg.train_steps)
             mask = mask_builder.build_mask(mask, blur_sigma)
 
             t_norm = t.float() / 1000.0
             noise_scale = compute_spatial_noise_scale(
                 mask,
                 t_norm,
-                subject_power=SCHEDULER_SUBJECT_POWER,
-                bg_scale=SCHEDULER_BG_SCALE,
-                min_scale=SCHEDULER_MIN_SCALE,
+                subject_power=cfg.scheduler_subject_power,
+                bg_scale=cfg.scheduler_bg_scale,
+                min_scale=cfg.scheduler_min_scale,
             )
             noisy_latents = scheduler.add_noise(
                 latents, noise, t, noise_scale=noise_scale
@@ -191,15 +177,17 @@ def train_segment(
                 clean_latents=latents,
                 base_pred=base_pred,
                 uniform_noisy=uniform_noisy,
-                grounding_weight=GROUNDING_WEIGHT,
+                grounding_weight=cfg.grounding_weight,
                 subject_drift_weight=(
-                    0.0 if segment_name == "final" else SUBJECT_DRIFT_WEIGHT
+                    0.0 if segment_name == "final" else cfg.subject_drift_weight
                 ),
-                diversity_weight=0.0 if segment_name == "final" else DIVERSITY_WEIGHT,
+                diversity_weight=(
+                    0.0 if segment_name == "final" else cfg.diversity_weight
+                ),
             )
 
             # pyrefly: ignore [missing-attribute]
-            scaler.scale(loss / GRAD_ACCUM_STEPS).backward()
+            scaler.scale(loss / cfg.grad_accum_steps).backward()
 
             accum_loss += loss.item()
             accum_ground += ground.item()
@@ -212,10 +200,10 @@ def train_segment(
         scaler.update()
 
         pbar.set_postfix(
-            loss=f"{accum_loss / GRAD_ACCUM_STEPS:.4f}",
-            ground=f"{accum_ground / GRAD_ACCUM_STEPS:.4f}",
-            s_drift=f"{accum_subj / GRAD_ACCUM_STEPS:.4f}",
-            div=f"{accum_div / GRAD_ACCUM_STEPS:.4f}",
+            loss=f"{accum_loss / cfg.grad_accum_steps:.4f}",
+            ground=f"{accum_ground / cfg.grad_accum_steps:.4f}",
+            s_drift=f"{accum_subj / cfg.grad_accum_steps:.4f}",
+            div=f"{accum_div / cfg.grad_accum_steps:.4f}",
             blend=f"{alpha:.2f}",
             t=t_base.item(),
         )
@@ -223,15 +211,22 @@ def train_segment(
         if step % 20 == 0:
             torch.cuda.empty_cache()
 
-    save_lora(unet, f"creative-lora/{segment_name}")
+    save_lora(unet, os.path.join(cfg.output_dir, segment_name))
 
     del unet, optimizer, scaler
     torch.cuda.empty_cache()
 
 
-def train():
+def train(cfg: argparse.Namespace):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+
+    print(
+        f"Config: steps={cfg.steps}, mini_batch={cfg.mini_batch_size}, "
+        f"grad_accum={cfg.grad_accum_steps}, train_steps={cfg.train_steps}, "
+        f"lr={cfg.lr}, lora_rank={cfg.lora_rank}, lora_alpha={cfg.lora_alpha}, "
+        f"output_dir={cfg.output_dir}"
+    )
 
     models = load_model()
     vae = models["vae"]
@@ -260,15 +255,15 @@ def train():
     ).to(DEVICE)
 
     mask_builder = SubjectMaskBuilder(
-        blur_sigma_start=MASK_BLUR_SIGMA_START,
-        blur_sigma_end=MASK_BLUR_SIGMA_END,
-        min_mask_value=MASK_MIN_VALUE,
+        blur_sigma_start=cfg.mask_blur_sigma_start,
+        blur_sigma_end=cfg.mask_blur_sigma_end,
+        min_mask_value=cfg.mask_min_value,
     )
 
     clip_mean = torch.tensor([0.481, 0.457, 0.408]).view(1, 3, 1, 1).to(DEVICE)
     clip_std = torch.tensor([0.269, 0.261, 0.276]).view(1, 3, 1, 1).to(DEVICE)
 
-    samples = get_samples(TRAIN_STEPS)
+    samples = get_samples(cfg.train_steps)
     transform = get_transform()
 
     print("Building latent cache...")
@@ -303,8 +298,9 @@ def train():
             clip_mean=clip_mean,
             clip_std=clip_std,
             cached=cached,
+            cfg=cfg,
         )
 
 
 if __name__ == "__main__":
-    train()
+    train(get_config())

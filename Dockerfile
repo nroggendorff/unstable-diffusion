@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM public.ecr.aws/deep-learning-containers/pytorch-training:2.10.0-gpu-py313-cu130-ubuntu22.04-sagemaker
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11 \
@@ -17,4 +17,5 @@ RUN pip install -r requirements.txt
 
 COPY src /app/src/
 
-CMD ["python3", "-m", "src.train"]
+ENTRYPOINT ["src/entrypoint.sh"]
+CMD ["train"]
