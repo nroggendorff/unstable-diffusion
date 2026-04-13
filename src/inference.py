@@ -5,31 +5,36 @@ import numpy as np
 from diffusers import StableDiffusionXLPipeline
 from PIL import Image
 
-from .model import EARLY_SEG, MID_SEG, LATE_SEG
+from .model import EARLY_SEG, MID_SEG
 
 
 MODEL_ID = "glides/illustriousxl"
 ADAPTER_BASE_PATH = "./creative-lora"
 
-BLEND_SEGMENTS = ["early", "mid", "late"]
 ALL_SEGMENTS = ["early", "mid", "late", "final"]
 
-_SEGMENT_CENTERS = [
-    EARLY_SEG / 2,
-    EARLY_SEG + MID_SEG / 2,
-    EARLY_SEG + MID_SEG + LATE_SEG / 2,
-]
-_BLEND_WINDOW = 8
+_BOUNDARIES = [EARLY_SEG, EARLY_SEG + MID_SEG]
+_BLEND_HALF = 2
 
 
 def _adapter_weights(step_index: int, strength: float = 1.0) -> list[float]:
-    raw = [
-        max(0.0, 1.0 - abs(step_index - center) / _BLEND_WINDOW)
-        for center in _SEGMENT_CENTERS
-    ]
-    total = sum(raw) + 1e-8
-    normalized = [w / total for w in raw]
-    return [w * strength for w in normalized] + [0.0]
+    for i, boundary in enumerate(_BOUNDARIES):
+        dist = step_index - boundary
+        if abs(dist) <= _BLEND_HALF:
+            t = (dist + _BLEND_HALF) / (2 * _BLEND_HALF)
+            weights = [0.0, 0.0, 0.0, 0.0]
+            weights[i] = (1.0 - t) * strength
+            weights[i + 1] = t * strength
+            return weights
+
+    weights = [0.0, 0.0, 0.0, 0.0]
+    if step_index < _BOUNDARIES[0]:
+        weights[0] = strength
+    elif step_index < _BOUNDARIES[1]:
+        weights[1] = strength
+    else:
+        weights[2] = strength
+    return weights
 
 
 def load_pipe():
@@ -139,6 +144,7 @@ def infer_with_evolution(
 
     result = pipe(
         prompt=[prompt],
+        negative_prompt=["watermark, text"],
         width=1024,
         height=1024,
         num_inference_steps=num_inference_steps,
