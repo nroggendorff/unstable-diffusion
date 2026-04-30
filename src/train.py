@@ -25,8 +25,9 @@ from .encoder import (
     CrossAttentionCapture,
 )
 from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scale
-from .loss import compute_loss
+from .loss import compute_diffusion_loss
 from .cache import build_cache, make_time_ids, blend_alpha, blend_masks
+from .rl import rl_segment
 from .io import save_lora
 
 LATE_START = EARLY_SEG + MID_SEG
@@ -76,7 +77,7 @@ def train_segment(
     for step in (pbar := tqdm(range(cfg.train_steps))):
         optimizer.zero_grad(set_to_none=True)
 
-        accum_loss = accum_ground = accum_subj = accum_div = 0.0
+        accum_loss = 0.0
         alpha = blend_alpha(step, cfg.train_steps)
         t_idx = random.choice(t_indices_list)
         t_base = timesteps[t_idx]
@@ -144,57 +145,35 @@ def train_segment(
                 latents, noise, t, noise_scale=noise_scale
             )
 
-            loss, ground, subj_drift, diversity = compute_loss(
+            loss = compute_diffusion_loss(
                 unet,
                 noisy_latents,
                 t,
                 text_emb,
                 added_cond_kwargs,
-                mask,
-                noise_scale,
-                alphas_cumprod=alphas,
-                t_normalized=t_norm,
-                clean_latents=latents,
-                base_pred=base_pred,
-                uniform_noisy=uniform_noisy,
-                grounding_weight=cfg.grounding_weight,
-                subject_drift_weight=(
-                    0.0 if segment_name == "final" else cfg.subject_drift_weight
-                ),
-                diversity_weight=(
-                    0.0 if segment_name == "final" else cfg.diversity_weight
-                ),
+                noise,
+                noise_scale=noise_scale,
+                mask=mask,
             )
 
             # pyrefly: ignore [missing-attribute]
             scaler.scale(loss / cfg.grad_accum_steps).backward()
-
             accum_loss += loss.item()
-            accum_ground += ground.item()
-            accum_subj += subj_drift.item()
-            accum_div += diversity.item()
 
             del noisy_latents, noise_scale, mask, base_pred, uniform_noisy
 
         scaler.step(optimizer)
         scaler.update()
 
-        pbar.set_postfix(
-            loss=f"{accum_loss / cfg.grad_accum_steps:.4f}",
-            ground=f"{accum_ground / cfg.grad_accum_steps:.4f}",
-            s_drift=f"{accum_subj / cfg.grad_accum_steps:.4f}",
-            div=f"{accum_div / cfg.grad_accum_steps:.4f}",
-            blend=f"{alpha:.2f}",
-            t=t_base.item(),
-        )
+        pbar.set_postfix(loss=f"{accum_loss / cfg.grad_accum_steps:.4f}")
 
         if step % 20 == 0:
             torch.cuda.empty_cache()
 
-    save_lora(unet, os.path.join(cfg.output_dir, segment_name))
-
-    del unet, optimizer, scaler
+    del optimizer, scaler
     torch.cuda.empty_cache()
+
+    return unet
 
 
 def train(cfg: argparse.Namespace):
@@ -205,6 +184,7 @@ def train(cfg: argparse.Namespace):
         f"Config: steps={cfg.steps}, mini_batch={cfg.mini_batch_size}, "
         f"grad_accum={cfg.grad_accum_steps}, train_steps={cfg.train_steps}, "
         f"lr={cfg.lr}, lora_rank={cfg.lora_rank}, lora_alpha={cfg.lora_alpha}, "
+        f"rl_steps={cfg.rl_steps}, rl_lr={cfg.rl_lr}, "
         f"output_dir={cfg.output_dir}"
     )
 
@@ -255,7 +235,7 @@ def train(cfg: argparse.Namespace):
     print("Text encoders released.")
 
     for segment_name, t_indices in SEGMENTS:
-        train_segment(
+        unet = train_segment(
             segment_name=segment_name,
             t_indices=t_indices,
             base_unet=base_unet,
@@ -265,6 +245,23 @@ def train(cfg: argparse.Namespace):
             cached=cached,
             cfg=cfg,
         )
+
+        unet = rl_segment(
+            segment_name=segment_name,
+            unet=unet,
+            base_unet=base_unet,
+            t_indices=t_indices,
+            timesteps=timesteps,
+            scheduler=scheduler,
+            vae=vae,
+            cached=cached,
+            cfg=cfg,
+        )
+
+        save_lora(unet, os.path.join(cfg.output_dir, segment_name))
+
+        del unet
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

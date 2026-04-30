@@ -37,9 +37,12 @@ def get_config() -> argparse.Namespace:
     add("scheduler_subject_power", float, 0.6)
     add("scheduler_bg_scale", float, 1.0)
     add("scheduler_min_scale", float, 0.0)
-    add("grounding_weight", float, 0.4)
-    add("subject_drift_weight", float, 0.25)
-    add("diversity_weight", float, 0.1)
+
+    add("rl_steps", int, 300)
+    add("rl_lr", float, 5e-6)
+    add("rl_grounding_weight", float, 0.4)
+    add("rl_diversity_weight", float, 0.1)
+    add("rl_baseline_momentum", float, 0.95)
 
     sm_default_output = (
         _SM_MODEL_DIR if os.path.isdir(_SM_MODEL_DIR) else _LOCAL_MODEL_DIR
