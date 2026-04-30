@@ -13,8 +13,10 @@ _CLIP_MODEL = "openai/clip-vit-base-patch32"
 
 def _decode_to_clip(vae, latents: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
-        decoded = vae.decode(latents.float() / vae.config.scaling_factor).sample
-        decoded = (decoded.clamp(-1, 1) + 1) / 2
+        decoded = vae.decode(
+            latents.to(dtype=vae.dtype) / vae.config.scaling_factor
+        ).sample
+        decoded = (decoded.float().clamp(-1, 1) + 1) / 2
         decoded = F.interpolate(
             decoded, size=(224, 224), mode="bilinear", align_corners=False
         )
