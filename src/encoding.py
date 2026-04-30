@@ -19,14 +19,12 @@ def apply_prompt_seed_offset(
         encoder_hidden_states.shape,
         generator=gen_seq,
         device=encoder_hidden_states.device,
-        dtype=encoder_hidden_states.dtype,
-    )
+    ).to(encoder_hidden_states.dtype)
     pool_noise = torch.randn(
         pooled.shape,
         generator=gen_pool,
         device=pooled.device,
-        dtype=pooled.dtype,
-    )
+    ).to(pooled.dtype)
 
     seq_scale = (
         encoder_hidden_states.float().norm(dim=-1, keepdim=True).mean() * strength
