@@ -1,10 +1,8 @@
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 
 from .dataset import prepare_sample
-from .encoding import encode_prompt, decode_for_clip
-
+from .encoding import encode_prompt
 
 TARGET_SIZE = 1024
 _TIME_IDS_BASE = [TARGET_SIZE, TARGET_SIZE, 0, 0, TARGET_SIZE, TARGET_SIZE]
@@ -23,17 +21,19 @@ def blend_alpha(step: int, total_steps: int) -> float:
 
 def blend_masks(
     attn_mask: torch.Tensor,
-    clip_raw: torch.Tensor,
+    latent_diff: torch.Tensor,
     spatial_size: tuple,
     alpha: float,
 ) -> torch.Tensor:
-    clip_mask = F.interpolate(
-        clip_raw, size=spatial_size, mode="bilinear", align_corners=False
+    import torch.nn.functional as F
+
+    diff_resized = F.interpolate(
+        latent_diff, size=spatial_size, mode="bilinear", align_corners=False
     )
-    mn = clip_mask.flatten(1).min(1).values.view(-1, 1, 1, 1)
-    mx = clip_mask.flatten(1).max(1).values.view(-1, 1, 1, 1)
-    clip_mask = (clip_mask - mn) / (mx - mn + 1e-8)
-    return (1.0 - alpha) * attn_mask + alpha * clip_mask
+    mn = diff_resized.flatten(1).min(1).values.view(-1, 1, 1, 1)
+    mx = diff_resized.flatten(1).max(1).values.view(-1, 1, 1, 1)
+    diff_norm = (diff_resized - mn) / (mx - mn + 1e-8)
+    return (1.0 - alpha) * attn_mask + alpha * diff_norm
 
 
 def build_cache(
@@ -44,9 +44,6 @@ def build_cache(
     text_encoder_2,
     tokenizer,
     tokenizer_2,
-    vision_encoder,
-    clip_mean,
-    clip_std,
     device,
 ):
     cached = []
@@ -67,20 +64,12 @@ def build_cache(
                 device,
             )
 
-            target_features = [
-                f.cpu().half()
-                for f in vision_encoder.extract_features(
-                    decode_for_clip(vae, latents, clip_mean, clip_std)
-                )
-            ]
-
         cached.append(
             {
                 "latents": latents.cpu().half(),
                 "text_emb": text_emb.cpu().half(),
                 "pooled_text_emb": pooled.cpu().half(),
                 "token_attention_mask": attn_mask.cpu(),
-                "target_features": target_features,
             }
         )
 

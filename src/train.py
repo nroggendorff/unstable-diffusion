@@ -20,19 +20,14 @@ from .model import (
 )
 from .dataset import get_samples, get_transform
 from .encoder import (
-    CLIPVisionEncoder,
     compute_perceptual_discrepancy,
     SubjectMaskBuilder,
     CrossAttentionCapture,
 )
 from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scale
-from .encoding import decode_for_clip
 from .loss import compute_loss
 from .cache import build_cache, make_time_ids, blend_alpha, blend_masks
 from .io import save_lora
-
-VISION_ENCODER_MODEL = "openai/clip-vit-base-patch32"
-FEATURE_LAYERS = [2, 4, 6, 8]
 
 LATE_START = EARLY_SEG + MID_SEG
 
@@ -52,12 +47,8 @@ def train_segment(
     t_indices,
     base_unet,
     timesteps,
-    vae,
     scheduler,
-    vision_encoder,
     mask_builder,
-    clip_mean,
-    clip_std,
     cached,
     cfg: argparse.Namespace,
 ):
@@ -105,10 +96,6 @@ def train_segment(
             token_mask = torch.cat([x["token_attention_mask"] for x in items]).to(
                 DEVICE
             )
-            target_features = [
-                torch.cat([x["target_features"][i] for x in items]).float().to(DEVICE)
-                for i in range(len(items[0]["target_features"]))
-            ]
 
             # pyrefly: ignore [bad-argument-type]
             time_ids = make_time_ids(cfg.mini_batch_size, DEVICE)
@@ -136,15 +123,8 @@ def train_segment(
                 b = (1 - alphas[t.long()]).view(-1, 1, 1, 1) ** 0.5
                 denoised_latents = (uniform_noisy.float() - b * base_pred) / a
 
-                pred_features = vision_encoder.extract_features(
-                    decode_for_clip(vae, denoised_latents, clip_mean, clip_std)
-                )
+                raw_diff = compute_perceptual_discrepancy([denoised_latents], [latents])
                 del denoised_latents
-
-                raw_diff = compute_perceptual_discrepancy(
-                    pred_features, target_features
-                )
-                del pred_features
 
                 mask = blend_masks(attn_mask, raw_diff, latents.shape[2:], alpha=alpha)
                 del attn_mask, raw_diff
@@ -249,19 +229,11 @@ def train(cfg: argparse.Namespace):
     scheduler.set_timesteps(NUM_INFERENCE_STEPS)
     timesteps = scheduler.timesteps.to(DEVICE)
 
-    vision_encoder = CLIPVisionEncoder(
-        model_name=VISION_ENCODER_MODEL,
-        feature_layers=FEATURE_LAYERS,
-    ).to(DEVICE)
-
     mask_builder = SubjectMaskBuilder(
         blur_sigma_start=cfg.mask_blur_sigma_start,
         blur_sigma_end=cfg.mask_blur_sigma_end,
         min_mask_value=cfg.mask_min_value,
     )
-
-    clip_mean = torch.tensor([0.481, 0.457, 0.408]).view(1, 3, 1, 1).to(DEVICE)
-    clip_std = torch.tensor([0.269, 0.261, 0.276]).view(1, 3, 1, 1).to(DEVICE)
 
     samples = get_samples(cfg.train_steps)
     transform = get_transform()
@@ -275,9 +247,6 @@ def train(cfg: argparse.Namespace):
         text_encoder_2,
         tokenizer,
         tokenizer_2,
-        vision_encoder,
-        clip_mean,
-        clip_std,
         DEVICE,
     )
 
@@ -291,12 +260,8 @@ def train(cfg: argparse.Namespace):
             t_indices=t_indices,
             base_unet=base_unet,
             timesteps=timesteps,
-            vae=vae,
             scheduler=scheduler,
-            vision_encoder=vision_encoder,
             mask_builder=mask_builder,
-            clip_mean=clip_mean,
-            clip_std=clip_std,
             cached=cached,
             cfg=cfg,
         )

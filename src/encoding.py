@@ -2,6 +2,43 @@ import torch
 import torch.nn.functional as F
 
 
+def apply_prompt_seed_offset(
+    encoder_hidden_states: torch.Tensor,
+    pooled: torch.Tensor,
+    prompt_seed: int,
+    strength: float = 0.08,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    gen_seq = torch.Generator(device=encoder_hidden_states.device).manual_seed(
+        prompt_seed
+    )
+    gen_pool = torch.Generator(device=pooled.device).manual_seed(
+        prompt_seed ^ 0xABCD1234
+    )
+
+    seq_noise = torch.randn(
+        encoder_hidden_states.shape,
+        generator=gen_seq,
+        device=encoder_hidden_states.device,
+        dtype=encoder_hidden_states.dtype,
+    )
+    pool_noise = torch.randn(
+        pooled.shape,
+        generator=gen_pool,
+        device=pooled.device,
+        dtype=pooled.dtype,
+    )
+
+    seq_scale = (
+        encoder_hidden_states.float().norm(dim=-1, keepdim=True).mean() * strength
+    )
+    pool_scale = pooled.float().norm(dim=-1, keepdim=True).mean() * strength
+
+    return (
+        encoder_hidden_states + seq_noise * seq_scale.to(encoder_hidden_states.dtype),
+        pooled + pool_noise * pool_scale.to(pooled.dtype),
+    )
+
+
 def encode_prompt(
     prompts, text_encoder, text_encoder_2, tokenizer, tokenizer_2, device
 ):
