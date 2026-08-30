@@ -1,77 +1,200 @@
+import string
+
 import torch
 import torch.nn.functional as F
 
+CHUNK_TOKENS = 75
+MAX_CHUNKS = 2
+SEQUENCE_LENGTH = MAX_CHUNKS * (CHUNK_TOKENS + 2)
 
-def apply_prompt_seed_offset(
-    encoder_hidden_states: torch.Tensor,
-    pooled: torch.Tensor,
-    prompt_seed: int,
-    strength: float = 0.08,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    gen_seq = torch.Generator(device=encoder_hidden_states.device).manual_seed(
-        prompt_seed
+_CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+_CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "but",
+    "if",
+    "of",
+    "at",
+    "by",
+    "for",
+    "with",
+    "about",
+    "into",
+    "through",
+    "during",
+    "to",
+    "from",
+    "up",
+    "down",
+    "in",
+    "out",
+    "on",
+    "off",
+    "over",
+    "under",
+    "again",
+    "then",
+    "once",
+    "here",
+    "there",
+    "all",
+    "any",
+    "both",
+    "each",
+    "few",
+    "more",
+    "most",
+    "other",
+    "some",
+    "such",
+    "no",
+    "nor",
+    "not",
+    "only",
+    "own",
+    "same",
+    "so",
+    "than",
+    "too",
+    "very",
+    "can",
+    "will",
+    "just",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "having",
+    "do",
+    "does",
+    "did",
+    "doing",
+    "as",
+    "while",
+    "that",
+    "this",
+    "these",
+    "those",
+    "it",
+    "its",
+    "he",
+    "she",
+    "they",
+    "them",
+    "his",
+    "her",
+    "their",
+    "who",
+    "which",
+    "what",
+    "where",
+    "when",
+    "how",
+    "why",
+    "also",
+    "against",
+    "between",
+}
+
+
+def clip_normalization(device, dtype=torch.float32):
+    mean = torch.tensor(_CLIP_MEAN, device=device, dtype=dtype).view(1, 3, 1, 1)
+    std = torch.tensor(_CLIP_STD, device=device, dtype=dtype).view(1, 3, 1, 1)
+    return mean, std
+
+
+def rms_scaled_noise(reference: torch.Tensor, sigma: float, generator=None):
+    noise = torch.randn(
+        reference.shape,
+        generator=generator,
+        device=reference.device,
+        dtype=torch.float32,
     )
-    gen_pool = torch.Generator(device=pooled.device).manual_seed(
-        prompt_seed ^ 0xABCD1234
-    )
-
-    seq_noise = torch.randn(
-        encoder_hidden_states.shape,
-        generator=gen_seq,
-        device=encoder_hidden_states.device,
-    ).to(encoder_hidden_states.dtype)
-    pool_noise = torch.randn(
-        pooled.shape,
-        generator=gen_pool,
-        device=pooled.device,
-    ).to(pooled.dtype)
-
-    seq_scale = (
-        encoder_hidden_states.float().norm(dim=-1, keepdim=True).mean() * strength
-    )
-    pool_scale = pooled.float().norm(dim=-1, keepdim=True).mean() * strength
-
-    return (
-        encoder_hidden_states + seq_noise * seq_scale.to(encoder_hidden_states.dtype),
-        pooled + pool_noise * pool_scale.to(pooled.dtype),
-    )
+    rms = reference[0].float().norm() / (reference[0].numel() ** 0.5)
+    return (noise * sigma * rms).to(reference.dtype)
 
 
-def encode_prompt(
-    prompts, text_encoder, text_encoder_2, tokenizer, tokenizer_2, device
-):
-    def tokenize(tok, text):
-        return tok(
-            text,
-            return_tensors="pt",
-            padding="max_length",
-            max_length=tok.model_max_length,
+def _token_text(tokenizer, token_id: int) -> str:
+    token = tokenizer.convert_ids_to_tokens(int(token_id))
+    if token is None:
+        return ""
+    return token.replace("</w>", "").strip().lower()
+
+
+def _is_content(tokenizer, token_id: int, cache: dict) -> bool:
+    if token_id not in cache:
+        text = _token_text(tokenizer, token_id)
+        cache[token_id] = bool(
+            text
+            and text not in _STOPWORDS
+            and not all(ch in string.punctuation for ch in text)
+        )
+    return cache[token_id]
+
+
+def encode_prompt(prompts, text_encoder, tokenizer, device, content_cache=None):
+    if isinstance(prompts, str):
+        prompts = [prompts]
+    if content_cache is None:
+        content_cache = {}
+
+    bos = tokenizer.bos_token_id
+    eos = tokenizer.eos_token_id
+    pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
+
+    batch_ids = []
+    batch_content = []
+
+    for prompt in prompts:
+        ids = tokenizer(
+            prompt,
+            add_special_tokens=False,
             truncation=True,
-        ).to(device)
+            max_length=CHUNK_TOKENS * MAX_CHUNKS,
+        )["input_ids"]
 
-    inputs1 = tokenize(tokenizer, prompts)
-    inputs2 = tokenize(tokenizer_2, prompts)
+        for chunk in range(MAX_CHUNKS):
+            window = ids[chunk * CHUNK_TOKENS : (chunk + 1) * CHUNK_TOKENS]
+            padding = [pad] * (CHUNK_TOKENS - len(window))
 
-    out1 = text_encoder(input_ids=inputs1.input_ids, output_hidden_states=True)
-    hidden1 = out1.hidden_states[-2]
+            batch_ids.append([bos] + window + padding + [eos])
+            batch_content.append(
+                [0]
+                + [int(_is_content(tokenizer, t, content_cache)) for t in window]
+                + [0] * len(padding)
+                + [0]
+            )
 
-    out2 = text_encoder_2(input_ids=inputs2.input_ids, output_hidden_states=True)
-    hidden2 = out2.hidden_states[-2]
-    pooled = out2[0]
+    input_ids = torch.tensor(batch_ids, dtype=torch.long, device=device)
+    hidden = text_encoder(input_ids=input_ids).last_hidden_state
 
-    encoder_hidden_states = torch.cat([hidden1, hidden2], dim=-1)
-    return encoder_hidden_states, pooled, inputs1.attention_mask
+    batch = len(prompts)
+    embeddings = hidden.reshape(batch, SEQUENCE_LENGTH, hidden.shape[-1])
+    content = torch.tensor(batch_content, dtype=torch.float32, device=device).reshape(
+        batch, SEQUENCE_LENGTH
+    )
+
+    return embeddings, content
 
 
-def decode_for_clip(
-    vae, latents: torch.Tensor, clip_mean: torch.Tensor, clip_std: torch.Tensor
-) -> torch.Tensor:
-    latents = latents.to(dtype=vae.dtype)
-
-    decoded = vae.decode(latents / vae.config.scaling_factor).sample
+def decode_for_clip(vae, latents: torch.Tensor) -> torch.Tensor:
+    decoded = vae.decode(latents.to(dtype=vae.dtype) / vae.config.scaling_factor).sample
 
     decoded = (decoded.float().clamp(-1, 1) + 1) / 2
     decoded = F.interpolate(
         decoded, size=(224, 224), mode="bilinear", align_corners=False
     )
-    return (decoded - clip_mean) / clip_std
+
+    mean, std = clip_normalization(decoded.device, decoded.dtype)
+    return (decoded - mean) / std

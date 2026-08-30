@@ -1,5 +1,3 @@
 [tool.ruff.lint]
 select = ["F", "ARG"]
-
-[tool.pyrefly]
-python_path = ".venv\\Scripts\\python.exe"
+ignore = ["E731", "E401"]

@@ -6,3 +6,5 @@ types-tqdm
 torchvision
 pillow
 datasets
+transformers
+safetensors

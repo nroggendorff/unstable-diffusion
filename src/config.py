@@ -28,20 +28,26 @@ def get_config() -> argparse.Namespace:
     add("steps", int, 15000)
     add("mini_batch_size", int, 2)
     add("grad_accum_steps", int, 4)
+    add("cache_size", int, 4000)
     add("lr", float, 1e-4)
     add("lora_rank", int, 32)
     add("lora_alpha", int, 32)
+
     add("mask_blur_sigma_start", float, 7.0)
     add("mask_blur_sigma_end", float, 1.0)
     add("mask_min_value", float, 0.0)
-    add("scheduler_subject_power", float, 0.6)
-    add("scheduler_bg_scale", float, 1.0)
-    add("scheduler_min_scale", float, 0.0)
+
+    add("noise_bg_boost", float, 1.5)
+    add("noise_t_ramp", float, 0.3)
+
+    add("loss_bg_weight", float, 0.25)
+
+    add("cond_dropout_prob", float, 0.1)
+    add("embed_jitter_max", float, 0.3)
 
     add("rl_steps", int, 300)
-    add("rl_lr", float, 5e-6)
+    add("rl_lr", float, 1e-8)
     add("rl_grounding_weight", float, 0.4)
-    add("rl_diversity_weight", float, 0.1)
     add("rl_baseline_momentum", float, 0.95)
 
     sm_default_output = (

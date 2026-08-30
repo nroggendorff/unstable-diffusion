@@ -2,13 +2,13 @@ import argparse
 import torch
 import numpy as np
 
-from diffusers import StableDiffusionXLPipeline, EulerDiscreteScheduler
+from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler
 from PIL import Image
 
 from .model import EARLY_SEG, MID_SEG
-from .encoding import encode_prompt, apply_prompt_seed_offset
+from .encoding import encode_prompt
 
-MODEL_ID = "glides/illustriousxl"
+MODEL_ID = "glides/counterfeit"
 ADAPTER_BASE_PATH = "./creative-lora"
 
 ALL_SEGMENTS = ["early", "mid", "late"]
@@ -41,51 +41,34 @@ def _adapter_weights(step_index: int, strength: float = 1.0) -> list[float]:
 
 def load_pipe():
     # pyrefly: ignore [missing-attribute]
-    pipe = StableDiffusionXLPipeline.from_pretrained(
-        MODEL_ID, torch_dtype=torch.float16
+    pipe = StableDiffusionPipeline.from_pretrained(
+        MODEL_ID,
+        dtype=torch.float16,
+        safety_checker=None,
+        requires_safety_checker=False,
     ).to("cuda")
 
     pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
 
     for segment in ALL_SEGMENTS:
         pipe.load_lora_weights(
-            f"{ADAPTER_BASE_PATH}/{segment}",
-            weight_name="pytorch_lora_weights.safetensors",
+            ADAPTER_BASE_PATH,
+            weight_name=f"{segment}.safetensors",
             adapter_name=segment,
         )
 
     return pipe
 
 
-def _encode_for_pipe(pipe, prompt, prompt_seed=None):
+def _encode_for_pipe(pipe, prompt):
     device = pipe.text_encoder.device
 
-    text_emb, pooled, _ = encode_prompt(
-        prompt,
-        pipe.text_encoder,
-        pipe.text_encoder_2,
-        pipe.tokenizer,
-        pipe.tokenizer_2,
-        device,
-    )
-    neg_emb, neg_pooled, _ = encode_prompt(
-        _NEGATIVE_PROMPT,
-        pipe.text_encoder,
-        pipe.text_encoder_2,
-        pipe.tokenizer,
-        pipe.tokenizer_2,
-        device,
+    text_emb, _ = encode_prompt(prompt, pipe.text_encoder, pipe.tokenizer, device)
+    neg_emb, _ = encode_prompt(
+        _NEGATIVE_PROMPT, pipe.text_encoder, pipe.tokenizer, device
     )
 
-    if prompt_seed is not None:
-        text_emb, pooled = apply_prompt_seed_offset(text_emb, pooled, prompt_seed)
-
-    return (
-        text_emb.to(dtype=torch.float16),
-        neg_emb.to(dtype=torch.float16),
-        pooled.to(dtype=torch.float16),
-        neg_pooled.to(dtype=torch.float16),
-    )
+    return text_emb.to(dtype=torch.float16), neg_emb.to(dtype=torch.float16)
 
 
 def make_segment_callback(use_lora, num_inference_steps, strength):
@@ -95,10 +78,10 @@ def make_segment_callback(use_lora, num_inference_steps, strength):
         if not use_lora:
             return callback_kwargs
 
-        if step_index == last_step:
+        if step_index + 1 == last_step:
             pipe.set_adapters(ALL_SEGMENTS, [0.0, 0.0, 0.0])
         else:
-            pipe.set_adapters(ALL_SEGMENTS, _adapter_weights(step_index, strength))
+            pipe.set_adapters(ALL_SEGMENTS, _adapter_weights(step_index + 1, strength))
         return callback_kwargs
 
     return callback
@@ -122,14 +105,13 @@ def infer_batch(
     seed=None,
     batch_size=3,
     strength=1.0,
-    prompt_seed=None,
+    width=512,
+    height=512,
 ):
-    text_emb, neg_emb, pooled, neg_pooled = _encode_for_pipe(pipe, prompt, prompt_seed)
+    text_emb, neg_emb = _encode_for_pipe(pipe, prompt)
 
     text_emb = text_emb.expand(batch_size, -1, -1)
     neg_emb = neg_emb.expand(batch_size, -1, -1)
-    pooled = pooled.expand(batch_size, -1)
-    neg_pooled = neg_pooled.expand(batch_size, -1)
 
     if use_lora:
         pipe.enable_lora()
@@ -141,13 +123,11 @@ def infer_batch(
     seeds = [seed + i for i in range(batch_size)]
     generators = [torch.Generator(device="cuda").manual_seed(s) for s in seeds]
 
-    images = pipe(
+    return pipe(
         prompt_embeds=text_emb,
         negative_prompt_embeds=neg_emb,
-        pooled_prompt_embeds=pooled,
-        negative_pooled_prompt_embeds=neg_pooled,
-        width=1024,
-        height=1024,
+        width=width,
+        height=height,
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         generator=generators,
@@ -156,8 +136,6 @@ def infer_batch(
         ),
         callback_on_step_end_tensor_inputs=["latents"],
     ).images
-
-    return images
 
 
 def infer_with_evolution(
@@ -168,9 +146,10 @@ def infer_with_evolution(
     guidance_scale=7.0,
     seed=None,
     strength=1.0,
-    prompt_seed=None,
+    width=512,
+    height=512,
 ):
-    text_emb, neg_emb, pooled, neg_pooled = _encode_for_pipe(pipe, prompt, prompt_seed)
+    text_emb, neg_emb = _encode_for_pipe(pipe, prompt)
 
     if use_lora:
         pipe.enable_lora()
@@ -193,10 +172,8 @@ def infer_with_evolution(
     result = pipe(
         prompt_embeds=text_emb,
         negative_prompt_embeds=neg_emb,
-        pooled_prompt_embeds=pooled,
-        negative_pooled_prompt_embeds=neg_pooled,
-        width=1024,
-        height=1024,
+        width=width,
+        height=height,
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         generator=generator,
@@ -251,67 +228,47 @@ def main():
     parser.add_argument("--output", "-o", type=str, default="output.png")
     parser.add_argument("--evolution-output", "-e", type=str, default="evolution.png")
     parser.add_argument("--steps", "-s", type=int, default=30)
-    parser.add_argument("--strength", type=float, default=0.4)
+    parser.add_argument("--strength", type=float, default=1.0)
     parser.add_argument("--guidance", "-g", type=float, default=7.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--prompt-seed",
-        type=int,
-        default=None,
-        help="Seed for a random offset applied to the text embeddings after encoding. "
-        "Shifts the UNet cross-attention context without changing any input tokens.",
-    )
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--height", type=int, default=512)
     args = parser.parse_args()
 
     print("Loading model...")
     pipe = load_pipe()
 
     print(f"Generating: {args.prompt}")
-    if args.prompt_seed is not None:
-        print(f"Prompt seed {args.prompt_seed} active (embedding-space offset)")
+
+    shared = dict(
+        num_inference_steps=args.steps,
+        guidance_scale=args.guidance,
+        width=args.width,
+        height=args.height,
+    )
 
     lora_final, lora_frames = infer_with_evolution(
         pipe,
         args.prompt,
         use_lora=True,
-        num_inference_steps=args.steps,
-        guidance_scale=args.guidance,
         seed=args.seed,
         strength=args.strength,
-        prompt_seed=args.prompt_seed,
+        **shared,
     )
-
     base_final, base_frames = infer_with_evolution(
-        pipe,
-        args.prompt,
-        use_lora=False,
-        num_inference_steps=args.steps,
-        guidance_scale=args.guidance,
-        seed=args.seed,
-        prompt_seed=args.prompt_seed,
+        pipe, args.prompt, use_lora=False, seed=args.seed, **shared
     )
-
     lora_rest = infer_batch(
         pipe,
         args.prompt,
         use_lora=True,
-        num_inference_steps=args.steps,
-        guidance_scale=args.guidance,
         seed=args.seed + 1,
         batch_size=2,
         strength=args.strength,
-        prompt_seed=args.prompt_seed,
+        **shared,
     )
-
     base_rest = infer_batch(
-        pipe,
-        args.prompt,
-        use_lora=False,
-        num_inference_steps=args.steps,
-        guidance_scale=args.guidance,
-        seed=args.seed + 1,
-        batch_size=2,
-        prompt_seed=args.prompt_seed,
+        pipe, args.prompt, use_lora=False, seed=args.seed + 1, batch_size=2, **shared
     )
 
     grid = make_grid(

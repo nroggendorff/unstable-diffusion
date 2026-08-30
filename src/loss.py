@@ -6,10 +6,10 @@ def compute_diffusion_loss(
     noisy_latents,
     t,
     text_emb,
-    added_cond_kwargs,
     noise,
     noise_scale=None,
     mask=None,
+    bg_weight=0.25,
 ):
     target = noise * noise_scale if noise_scale is not None else noise
 
@@ -18,13 +18,12 @@ def compute_diffusion_loss(
             noisy_latents,
             t,
             encoder_hidden_states=text_emb,
-            added_cond_kwargs=added_cond_kwargs,
         ).sample
 
     residual = (pred.float() - target.float()).pow(2)
 
     if mask is not None:
-        weight = 1.0 + mask.float().clamp(0.0, 1.0)
+        weight = bg_weight + mask.float().clamp(0.0, 1.0)
         return (residual * weight).mean()
 
     return residual.mean()

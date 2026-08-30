@@ -37,42 +37,20 @@ class SpatiallyVaryingDDPMScheduler(DDPMScheduler):
 
         return (x_t - b * noise_pred) / a
 
-    def get_x0_target(self, x_t, noise, t, noise_scale=None):
-        alphas = self.alphas_cumprod.to(x_t.device)
-
-        a = alphas[t.long()].view(-1, 1, 1, 1).sqrt()
-        b = (1 - alphas[t.long()]).view(-1, 1, 1, 1).sqrt()
-
-        if noise_scale is not None:
-            noise = noise * noise_scale
-
-        return (x_t - b * noise) / a
-
-    def predict_noise_from_x0(self, x_t, x0, t, noise_scale=None):
-        alphas = self.alphas_cumprod.to(x_t.device)
-
-        a = alphas[t.long()].view(-1, 1, 1, 1).sqrt()
-        b = (1 - alphas[t.long()]).view(-1, 1, 1, 1).sqrt()
-
-        if noise_scale is not None:
-            b = b * noise_scale
-
-        return (x_t - a * x0) / (b + 1e-6)
-
 
 def compute_spatial_noise_scale(
     mask: torch.Tensor,
     t_normalized: torch.Tensor,
-    subject_power: float = 0.6,
-    bg_scale: float = 0.75,
-    min_scale: float = 0.0,
+    bg_boost: float = 1.5,
+    t_ramp: float = 0.3,
+    eps: float = 1e-8,
 ) -> torch.Tensor:
     t = t_normalized.view(-1, 1, 1, 1)
-    sigma_subject = min_scale + (1.0 - min_scale) * t**subject_power
-    sigma_background = min_scale + (bg_scale - min_scale) * t
-    spatial = mask * sigma_subject + (1 - mask) * sigma_background
 
-    uniform = min_scale + (1.0 - min_scale) * t
-    envelope = 4.0 * t * (1.0 - t)
+    scale = 1.0 + (1.0 - mask) * (bg_boost - 1.0)
 
-    return envelope * spatial + (1.0 - envelope) * uniform
+    envelope = (t / t_ramp).clamp(0.0, 1.0)
+    scale = 1.0 + envelope * (scale - 1.0)
+
+    rms = scale.pow(2).flatten(1).mean(1).sqrt().view(-1, 1, 1, 1)
+    return scale / (rms + eps)

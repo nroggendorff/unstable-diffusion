@@ -1,9 +1,9 @@
 import torch
 
-from diffusers import StableDiffusionXLPipeline, DDPMScheduler
+from diffusers import StableDiffusionPipeline, DDPMScheduler
 from peft import LoraConfig
 
-MODEL_ID = "glides/illustriousxl"
+MODEL_ID = "glides/counterfeit"
 DEVICE = "cuda"
 NUM_INFERENCE_STEPS = 30
 
@@ -15,6 +15,12 @@ LR = 1e-4
 LORA_RANK = 32
 LORA_ALPHA = 32
 LORA_TARGET_MODULES = ["to_k", "to_q", "to_v", "to_out.0"]
+
+SEGMENT_TIMESTEP_RANGES = {
+    "early": (595, 999),
+    "mid": (265, 694),
+    "late": (1, 364),
+}
 
 
 def get_lora_config(rank: int = LORA_RANK, alpha: int = LORA_ALPHA):
@@ -28,15 +34,16 @@ def get_lora_config(rank: int = LORA_RANK, alpha: int = LORA_ALPHA):
 
 def load_model():
     # pyrefly: ignore [missing-attribute]
-    pipe = StableDiffusionXLPipeline.from_pretrained(
-        MODEL_ID, torch_dtype=torch.float16
+    pipe = StableDiffusionPipeline.from_pretrained(
+        MODEL_ID,
+        dtype=torch.float16,
+        safety_checker=None,
+        requires_safety_checker=False,
     ).to(DEVICE)
 
     vae = pipe.vae.to(dtype=torch.float16)
     text_encoder = pipe.text_encoder.to(dtype=torch.float16)
-    text_encoder_2 = pipe.text_encoder_2.to(dtype=torch.float16)
     tokenizer = pipe.tokenizer
-    tokenizer_2 = pipe.tokenizer_2
 
     scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
     # pyrefly: ignore [missing-attribute]
@@ -46,8 +53,6 @@ def load_model():
         "pipe": pipe,
         "vae": vae,
         "text_encoder": text_encoder,
-        "text_encoder_2": text_encoder_2,
         "tokenizer": tokenizer,
-        "tokenizer_2": tokenizer_2,
         "scheduler": scheduler,
     }

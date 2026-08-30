@@ -2,6 +2,15 @@ import torch
 import torch.nn.functional as F
 
 
+def percentile_normalize(
+    x: torch.Tensor, low: float = 0.02, high: float = 0.98, eps: float = 1e-8
+) -> torch.Tensor:
+    flat = x.flatten(1).float()
+    lo = torch.quantile(flat, low, dim=1).view(-1, 1, 1, 1)
+    hi = torch.quantile(flat, high, dim=1).view(-1, 1, 1, 1)
+    return ((x.float() - lo) / (hi - lo + eps)).clamp(0.0, 1.0)
+
+
 def _gaussian_kernel(kernel_size: int, sigma: float) -> torch.Tensor:
     ax = torch.arange(-kernel_size // 2 + 1.0, kernel_size // 2 + 1.0)
     xx, yy = torch.meshgrid(ax, ax, indexing="ij")
@@ -36,10 +45,7 @@ class SubjectMaskBuilder:
     def build_mask(
         self, raw_discrepancy: torch.Tensor, blur_sigma: float
     ) -> torch.Tensor:
-        kernel_size = int(4 * blur_sigma + 1)
+        kernel_size = int(6 * blur_sigma + 1)
         kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
         blurred = _gaussian_blur(raw_discrepancy, kernel_size, blur_sigma)
-        bmin = blurred.amin(dim=(2, 3), keepdim=True)
-        bmax = blurred.amax(dim=(2, 3), keepdim=True)
-        normalized = (blurred - bmin) / (bmax - bmin + 1e-8)
-        return torch.clamp(normalized, min=self.min_mask_value)
+        return torch.clamp(percentile_normalize(blurred), min=self.min_mask_value)

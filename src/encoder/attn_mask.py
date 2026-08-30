@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 
+from .mask_builder import percentile_normalize
+
 
 def _unwrap_unet(module):
     current = module
@@ -29,9 +31,17 @@ def _unwrap_unet(module):
     return module
 
 
+def _grid_for(tokens: int, latent_h: int, latent_w: int):
+    for factor in (1, 2, 4, 8, 16):
+        grid_h, grid_w = latent_h // factor, latent_w // factor
+        if grid_h > 0 and grid_w > 0 and grid_h * grid_w == tokens:
+            return grid_h, grid_w
+    return None
+
+
 class _CapturingProcessor:
-    def __init__(self, store):
-        self.store = store
+    def __init__(self, capture):
+        self.capture = capture
 
     def __call__(
         self,
@@ -39,6 +49,8 @@ class _CapturingProcessor:
         hidden_states,
         encoder_hidden_states=None,
         attention_mask=None,
+        temb=None,  # noqa: ARG002
+        **kwargs,  # noqa: ARG002
     ):
         kv = encoder_hidden_states
         if kv is None:
@@ -58,10 +70,10 @@ class _CapturingProcessor:
             scores = scores + attention_mask
 
         weights = torch.softmax(scores.float(), dim=-1)
-        self.store.append(weights.detach().half().cpu())
 
-        weights_typed = weights.to(q.dtype)
-        out = torch.bmm(weights_typed, v)
+        self.capture.absorb(weights)
+
+        out = torch.bmm(weights.to(q.dtype), v)
         out = attn.batch_to_head_dim(out)
         out = attn.to_out[0](out)
         out = attn.to_out[1](out)
@@ -74,6 +86,33 @@ class CrossAttentionCapture:
         self._target = _unwrap_unet(unet)
         self._original = {}
         self.store = []
+        self._content = None
+        self._latent_hw = None
+
+    def set_context(self, token_content_mask: torch.Tensor, latent_hw: tuple):
+        self._content = token_content_mask.float()
+        self._latent_hw = latent_hw
+
+    def absorb(self, weights: torch.Tensor):
+        if self._content is None or self._latent_hw is None:
+            return
+
+        content = self._content.to(weights.device)
+        batch, tokens = content.shape
+        heads_batch, positions, kv_tokens = weights.shape
+
+        if heads_batch % batch != 0 or kv_tokens != tokens:
+            return
+
+        grid = _grid_for(positions, *self._latent_hw)
+        if grid is None:
+            return
+
+        heads = heads_batch // batch
+        averaged = weights.view(batch, heads, positions, tokens).mean(1)
+
+        reduced = torch.bmm(averaged, content.unsqueeze(-1)).squeeze(-1)
+        self.store.append(reduced.view(batch, 1, grid[0], grid[1]))
 
     def __enter__(self):
         self.store.clear()
@@ -87,7 +126,7 @@ class CrossAttentionCapture:
 
         self._original = dict(self._target.attn_processors)
         merged = {
-            name: _CapturingProcessor(self.store) if "attn2" in name else proc
+            name: _CapturingProcessor(self) if "attn2" in name else proc
             for name, proc in self._original.items()
         }
 
@@ -105,66 +144,27 @@ class CrossAttentionCapture:
         if self._original:
             self._target.set_attn_processor(self._original)
 
-    def build_mask(
-        self,
-        token_attention_mask: torch.Tensor,
-        spatial_size: tuple[int, int],
-    ) -> torch.Tensor:
+    def build_mask(self, spatial_size: tuple[int, int]) -> torch.Tensor:
         if not self.store:
             raise RuntimeError(
                 "No cross-attention weights were captured. "
                 "The attention processor hook did not run."
             )
 
-        B = token_attention_mask.shape[0]
-        accumulated = []
-
-        for weights in self.store:
-            weights = weights.float().to(token_attention_mask.device)
-            BH, S, T = weights.shape
-            if BH % B != 0:
-                continue
-            H = BH // B
-            w = weights.reshape(B, H, S, T).mean(1)
-
-            content = token_attention_mask.float().to(w.device)
-            w = (w * content.unsqueeze(1)).sum(-1)
-
-            side = int(S**0.5)
-            if side * side != S:
-                continue
-
-            w_spatial = w.reshape(B, 1, side, side)
-            w_resized = F.interpolate(
-                w_spatial,
-                size=spatial_size,
-                mode="bilinear",
-                align_corners=False,
-            )
-
-            accumulated.append(w_resized.squeeze(1))
-
+        resized = [
+            F.interpolate(
+                m, size=spatial_size, mode="bilinear", align_corners=False
+            ).squeeze(1)
+            for m in self.store
+        ]
         self.store.clear()
 
-        if not accumulated:
-            raise RuntimeError(
-                "Cross-attention was captured, but no usable maps were produced."
-            )
-
-        stack = torch.stack(accumulated, dim=1)
+        stack = torch.stack(resized, dim=1)
 
         n = stack.shape[1]
         layer_weights = torch.linspace(0.5, 1.0, n, device=stack.device)
         layer_weights = layer_weights / layer_weights.sum()
 
-        layer_weights = layer_weights.view(1, n, 1, 1)
+        averaged = (stack * layer_weights.view(1, n, 1, 1)).sum(dim=1)
 
-        avg = (stack * layer_weights).sum(dim=1)
-
-        spatial = avg.unsqueeze(1)
-
-        mn = spatial.flatten(1).min(1).values.view(B, 1, 1, 1)
-        mx = spatial.flatten(1).max(1).values.view(B, 1, 1, 1)
-        spatial = (spatial - mn) / (mx - mn + 1e-8)
-
-        return spatial
+        return percentile_normalize(averaged.unsqueeze(1))

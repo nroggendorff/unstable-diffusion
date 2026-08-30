@@ -1,2 +1,3 @@
 #!/bin/bash
-python3 -m src.$1
+set -e
+python3 -m src."$1" "${@:2}"

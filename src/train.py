@@ -1,7 +1,6 @@
 import argparse
-import os
-import random
 import copy
+import random
 
 import torch
 import bitsandbytes as bnb
@@ -17,26 +16,38 @@ from .model import (
     NUM_INFERENCE_STEPS,
     EARLY_SEG,
     MID_SEG,
+    SEGMENT_TIMESTEP_RANGES,
 )
-from .dataset import get_samples, get_transform
+from .dataset import get_samples
 from .encoder import (
     compute_perceptual_discrepancy,
     SubjectMaskBuilder,
     CrossAttentionCapture,
 )
+from .encoding import encode_prompt, rms_scaled_noise
 from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scale
 from .loss import compute_diffusion_loss
-from .cache import build_cache, make_time_ids, blend_alpha, blend_masks
+from .cache import (
+    build_cache,
+    blend_alpha,
+    blend_masks,
+    group_by_bucket,
+    sample_minibatch,
+)
 from .rl import rl_segment
 from .io import save_lora
 
 LATE_START = EARLY_SEG + MID_SEG
 
-SEGMENTS = [
-    ("early", range(0, EARLY_SEG)),
-    ("mid", range(EARLY_SEG, LATE_START)),
-    ("late", range(LATE_START, NUM_INFERENCE_STEPS)),
-]
+SEGMENTS = ["early", "mid", "late"]
+
+SEGMENT_INDICES = {
+    "early": range(0, EARLY_SEG),
+    "mid": range(EARLY_SEG, LATE_START),
+    "late": range(LATE_START, NUM_INFERENCE_STEPS),
+}
+
+DISCREPANCY_MAX_T = 600
 
 
 def _make_inputs_require_grad(module, input, output):  # noqa: ARG001
@@ -45,15 +56,16 @@ def _make_inputs_require_grad(module, input, output):  # noqa: ARG001
 
 def train_segment(
     segment_name,
-    t_indices,
     base_unet,
-    timesteps,
     scheduler,
     mask_builder,
     cached,
+    groups,
+    empty_emb,
     cfg: argparse.Namespace,
 ):
     print(f"\nTraining segment: {segment_name}")
+    t_low, t_high = SEGMENT_TIMESTEP_RANGES[segment_name]
 
     base_unet.to(DEVICE)
     unet = get_peft_model(
@@ -69,8 +81,6 @@ def train_segment(
 
     optimizer = bnb.optim.AdamW8bit(unet.parameters(), lr=cfg.lr)
     scaler = torch.amp.GradScaler("cuda")
-    t_indices_list = list(t_indices)
-    alphas = scheduler.alphas_cumprod.to(DEVICE)
 
     capture = CrossAttentionCapture(unet)
 
@@ -79,67 +89,70 @@ def train_segment(
 
         accum_loss = 0.0
         alpha = blend_alpha(step, cfg.train_steps)
-        t_idx = random.choice(t_indices_list)
-        t_base = timesteps[t_idx]
 
         for _ in range(cfg.grad_accum_steps):
-            indices = list(range(len(cached)))
-            random.shuffle(indices)
-            items = [cached[i] for i in indices[: cfg.mini_batch_size]]
+            items = sample_minibatch(cached, groups, cfg.mini_batch_size)
 
             latents = torch.cat([x["latents"] for x in items]).float().to(DEVICE)
             text_emb = torch.cat([x["text_emb"] for x in items]).to(
                 DEVICE, dtype=torch.float16
             )
-            pooled = torch.cat([x["pooled_text_emb"] for x in items]).to(
-                DEVICE, dtype=torch.float16
-            )
-            token_mask = torch.cat([x["token_attention_mask"] for x in items]).to(
+            token_content = torch.cat([x["token_content_mask"] for x in items]).to(
                 DEVICE
             )
 
-            # pyrefly: ignore [bad-argument-type]
-            time_ids = make_time_ids(cfg.mini_batch_size, DEVICE)
-            added_cond_kwargs = {"text_embeds": pooled, "time_ids": time_ids}
+            batch = latents.shape[0]
+            spatial_size = (latents.shape[2], latents.shape[3])
+
+            if cfg.cond_dropout_prob > 0.0:
+                drop = torch.rand(batch, device=DEVICE) < cfg.cond_dropout_prob
+                if drop.any():
+                    empty = empty_emb.expand(batch, -1, -1).to(text_emb.dtype)
+                    text_emb = torch.where(drop.view(-1, 1, 1), empty, text_emb)
+                    token_content = token_content * (~drop).float().view(-1, 1)
+
+            if cfg.embed_jitter_max > 0.0:
+                text_emb = text_emb + rms_scaled_noise(
+                    text_emb, random.uniform(0.0, cfg.embed_jitter_max)
+                )
 
             noise = torch.randn_like(latents)
-            t = t_base.unsqueeze(0).expand(cfg.mini_batch_size).clone()
+            t = torch.randint(
+                t_low, t_high + 1, (batch,), device=DEVICE, dtype=torch.long
+            )
 
             with torch.no_grad():
                 uniform_noisy = scheduler.add_noise(latents, noise, t)
 
+                capture.set_context(token_content, spatial_size)
                 with capture, unet.disable_adapter():
                     with torch.amp.autocast("cuda", dtype=torch.float16):
                         base_pred = unet(
                             uniform_noisy.to(dtype=torch.float16),
                             t,
                             encoder_hidden_states=text_emb,
-                            added_cond_kwargs=added_cond_kwargs,
                         ).sample.float()
 
-                    # pyrefly: ignore [bad-argument-type]
-                    attn_mask = capture.build_mask(token_mask, latents.shape[2:])
+                    attn_mask = capture.build_mask(spatial_size)
 
-                a = alphas[t.long()].view(-1, 1, 1, 1) ** 0.5
-                b = (1 - alphas[t.long()]).view(-1, 1, 1, 1) ** 0.5
-                denoised_latents = (uniform_noisy.float() - b * base_pred) / a
-
+                denoised_latents = scheduler.predict_x0(
+                    uniform_noisy.float(), base_pred, t
+                )
                 raw_diff = compute_perceptual_discrepancy([denoised_latents], [latents])
                 del denoised_latents
 
-                mask = blend_masks(attn_mask, raw_diff, latents.shape[2:], alpha=alpha)
+                gate = (t < DISCREPANCY_MAX_T).float().view(-1, 1, 1, 1)
+                mask = blend_masks(attn_mask, raw_diff, spatial_size, alpha * gate)
                 del attn_mask, raw_diff
 
             blur_sigma = mask_builder.blur_sigma_for_step(step, cfg.train_steps)
             mask = mask_builder.build_mask(mask, blur_sigma)
 
-            t_norm = t.float() / 1000.0
             noise_scale = compute_spatial_noise_scale(
                 mask,
-                t_norm,
-                subject_power=cfg.scheduler_subject_power,
-                bg_scale=cfg.scheduler_bg_scale,
-                min_scale=cfg.scheduler_min_scale,
+                t.float() / 1000.0,
+                bg_boost=cfg.noise_bg_boost,
+                t_ramp=cfg.noise_t_ramp,
             )
             noisy_latents = scheduler.add_noise(
                 latents, noise, t, noise_scale=noise_scale
@@ -150,10 +163,10 @@ def train_segment(
                 noisy_latents,
                 t,
                 text_emb,
-                added_cond_kwargs,
                 noise,
                 noise_scale=noise_scale,
                 mask=mask,
+                bg_weight=cfg.loss_bg_weight,
             )
 
             # pyrefly: ignore [missing-attribute]
@@ -183,17 +196,15 @@ def train(cfg: argparse.Namespace):
     print(
         f"Config: steps={cfg.steps}, mini_batch={cfg.mini_batch_size}, "
         f"grad_accum={cfg.grad_accum_steps}, train_steps={cfg.train_steps}, "
-        f"lr={cfg.lr}, lora_rank={cfg.lora_rank}, lora_alpha={cfg.lora_alpha}, "
-        f"rl_steps={cfg.rl_steps}, rl_lr={cfg.rl_lr}, "
-        f"output_dir={cfg.output_dir}"
+        f"cache_size={cfg.cache_size}, lr={cfg.lr}, lora_rank={cfg.lora_rank}, "
+        f"lora_alpha={cfg.lora_alpha}, bg_boost={cfg.noise_bg_boost}, "
+        f"rl_steps={cfg.rl_steps}, rl_lr={cfg.rl_lr}, output_dir={cfg.output_dir}"
     )
 
     models = load_model()
     vae = models["vae"]
     text_encoder = models["text_encoder"]
-    text_encoder_2 = models["text_encoder_2"]
     tokenizer = models["tokenizer"]
-    tokenizer_2 = models["tokenizer_2"]
 
     # pyrefly: ignore [missing-attribute]
     base_unet = models["pipe"].unet.eval()
@@ -215,34 +226,41 @@ def train(cfg: argparse.Namespace):
         min_mask_value=cfg.mask_min_value,
     )
 
-    samples = get_samples(cfg.train_steps)
-    transform = get_transform()
+    samples = get_samples(cfg.cache_size)
 
     print("Building latent cache...")
-    cached = build_cache(
-        samples,
-        transform,
-        vae,
-        text_encoder,
-        text_encoder_2,
-        tokenizer,
-        tokenizer_2,
-        DEVICE,
-    )
+    cached = build_cache(samples, vae, text_encoder, tokenizer, DEVICE)
 
-    del text_encoder, text_encoder_2
+    empty_emb, _ = encode_prompt("", text_encoder, tokenizer, DEVICE)
+    empty_emb = empty_emb.detach().to(dtype=torch.float16)
+
+    del text_encoder
     torch.cuda.empty_cache()
-    print("Text encoders released.")
+    print("Text encoder released.")
 
-    for segment_name, t_indices in SEGMENTS:
+    groups = group_by_bucket(cached, cfg.mini_batch_size)
+    if not groups:
+        raise RuntimeError(
+            f"No aspect bucket holds at least mini_batch_size={cfg.mini_batch_size} "
+            f"samples. Raise --cache_size or lower --mini_batch_size."
+        )
+
+    usable = sum(len(v) for v in groups.values())
+    print(
+        f"Cached {len(cached)} samples; {usable} usable across {len(groups)} buckets:"
+    )
+    for bucket, idxs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        print(f"  {bucket[0]:>3}x{bucket[1]:<3}  {len(idxs)}")
+
+    for segment_name in SEGMENTS:
         unet = train_segment(
             segment_name=segment_name,
-            t_indices=t_indices,
             base_unet=base_unet,
-            timesteps=timesteps,
             scheduler=scheduler,
             mask_builder=mask_builder,
             cached=cached,
+            groups=groups,
+            empty_emb=empty_emb,
             cfg=cfg,
         )
 
@@ -250,15 +268,16 @@ def train(cfg: argparse.Namespace):
             segment_name=segment_name,
             unet=unet,
             base_unet=base_unet,
-            t_indices=t_indices,
+            t_indices=SEGMENT_INDICES[segment_name],
             timesteps=timesteps,
             scheduler=scheduler,
             vae=vae,
             cached=cached,
+            groups=groups,
             cfg=cfg,
         )
 
-        save_lora(unet, os.path.join(cfg.output_dir, segment_name))
+        save_lora(unet, cfg.output_dir, segment_name)
 
         del unet
         torch.cuda.empty_cache()
