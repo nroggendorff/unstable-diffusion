@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from diffusers import DDPMScheduler
 
 
@@ -36,6 +37,34 @@ class SpatiallyVaryingDDPMScheduler(DDPMScheduler):
             noise_pred = noise_pred * noise_scale
 
         return (x_t - b * noise_pred) / a
+
+
+def pyramid_noise(
+    latents: torch.Tensor,
+    levels: int = 4,
+    decay: float = 0.35,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    noise = torch.randn(latents.shape, device=latents.device, dtype=torch.float32)
+
+    batch, channels, height, width = latents.shape
+    for level in range(1, max(levels, 1)):
+        stride = 2**level
+        low_h, low_w = height // stride, width // stride
+        if low_h < 1 or low_w < 1:
+            break
+
+        low = torch.randn(
+            (batch, channels, low_h, low_w),
+            device=latents.device,
+            dtype=torch.float32,
+        )
+        noise = noise + F.interpolate(
+            low, size=(height, width), mode="bilinear", align_corners=False
+        ) * (decay**level)
+
+    rms = noise.pow(2).flatten(1).mean(1).sqrt().view(-1, 1, 1, 1)
+    return (noise / (rms + eps)).to(latents.dtype)
 
 
 def compute_spatial_noise_scale(

@@ -5,41 +5,16 @@ import numpy as np
 from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler
 from PIL import Image
 
-from .model import EARLY_SEG, MID_SEG
 from .encoding import encode_prompt
+from .sampler import ALL_SEGMENTS, adapter_weights
 
 MODEL_ID = "glides/counterfeit"
 ADAPTER_BASE_PATH = "./creative-lora"
 
-ALL_SEGMENTS = ["early", "mid", "late"]
-
-_BOUNDARIES = [EARLY_SEG, EARLY_SEG + MID_SEG]
-_BLEND_HALF = 2
-
 _NEGATIVE_PROMPT = "watermark, text"
 
 
-def _adapter_weights(step_index: int, strength: float = 1.0) -> list[float]:
-    for i, boundary in enumerate(_BOUNDARIES):
-        dist = step_index - boundary
-        if abs(dist) <= _BLEND_HALF:
-            t = (dist + _BLEND_HALF) / (2 * _BLEND_HALF)
-            weights = [0.0, 0.0, 0.0]
-            weights[i] = (1.0 - t) * strength
-            weights[i + 1] = t * strength
-            return weights
-
-    weights = [0.0, 0.0, 0.0]
-    if step_index < _BOUNDARIES[0]:
-        weights[0] = strength
-    elif step_index < _BOUNDARIES[1]:
-        weights[1] = strength
-    else:
-        weights[2] = strength
-    return weights
-
-
-def load_pipe():
+def load_pipe(adapter_path: str = ADAPTER_BASE_PATH):
     # pyrefly: ignore [missing-attribute]
     pipe = StableDiffusionPipeline.from_pretrained(
         MODEL_ID,
@@ -52,7 +27,7 @@ def load_pipe():
 
     for segment in ALL_SEGMENTS:
         pipe.load_lora_weights(
-            ADAPTER_BASE_PATH,
+            adapter_path,
             weight_name=f"{segment}.safetensors",
             adapter_name=segment,
         )
@@ -81,7 +56,7 @@ def make_segment_callback(use_lora, num_inference_steps, strength):
         if step_index + 1 == last_step:
             pipe.set_adapters(ALL_SEGMENTS, [0.0, 0.0, 0.0])
         else:
-            pipe.set_adapters(ALL_SEGMENTS, _adapter_weights(step_index + 1, strength))
+            pipe.set_adapters(ALL_SEGMENTS, adapter_weights(step_index + 1, strength))
         return callback_kwargs
 
     return callback
@@ -115,7 +90,7 @@ def infer_batch(
 
     if use_lora:
         pipe.enable_lora()
-        pipe.set_adapters(ALL_SEGMENTS, _adapter_weights(0, strength))
+        pipe.set_adapters(ALL_SEGMENTS, adapter_weights(0, strength))
     else:
         pipe.disable_lora()
 
@@ -153,7 +128,7 @@ def infer_with_evolution(
 
     if use_lora:
         pipe.enable_lora()
-        pipe.set_adapters(ALL_SEGMENTS, _adapter_weights(0, strength))
+        pipe.set_adapters(ALL_SEGMENTS, adapter_weights(0, strength))
     else:
         pipe.disable_lora()
 
@@ -197,23 +172,21 @@ def make_grid(images, rows=2, cols=3):
     return grid
 
 
-def make_evolution_grid(
-    lora_frames: list[Image.Image], base_frames: list[Image.Image]
-) -> Image.Image:
-    cols = max(len(lora_frames), len(base_frames))
-    w, h = lora_frames[0].size
+def make_two_row_grid(top: list[Image.Image], bottom: list[Image.Image]) -> Image.Image:
+    cols = max(len(top), len(bottom))
+    w, h = top[0].size
 
     def pad_row(frames, target_cols):
         blank = Image.new("RGB", (w, h), color=(0, 0, 0))
         return frames + [blank] * (target_cols - len(frames))
 
-    lora_row = pad_row(lora_frames, cols)
-    base_row = pad_row(base_frames, cols)
+    top_row = pad_row(top, cols)
+    bottom_row = pad_row(bottom, cols)
 
     grid = Image.new("RGB", size=(cols * w, 2 * h))
-    for col, img in enumerate(lora_row):
+    for col, img in enumerate(top_row):
         grid.paste(img, (col * w, 0))
-    for col, img in enumerate(base_row):
+    for col, img in enumerate(bottom_row):
         grid.paste(img, (col * w, h))
     return grid
 
@@ -277,7 +250,7 @@ def main():
     grid.save(args.output)
     print(f"Saved to {args.output}")
 
-    evolution_grid = make_evolution_grid(lora_frames, base_frames)
+    evolution_grid = make_two_row_grid(lora_frames, base_frames)
     evolution_grid.save(args.evolution_output)
     print(f"Evolution saved to {args.evolution_output}")
 

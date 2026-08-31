@@ -64,8 +64,35 @@ def group_by_bucket(cached: list, min_size: int) -> dict:
     return {b: idxs for b, idxs in groups.items() if len(idxs) >= min_size}
 
 
-def sample_minibatch(cached: list, groups: dict, mini_batch_size: int) -> list:
-    buckets = list(groups.keys())
-    weights = [len(groups[b]) for b in buckets]
-    bucket = random.choices(buckets, weights=weights, k=1)[0]
-    return [cached[i] for i in random.sample(groups[bucket], mini_batch_size)]
+class BucketSampler:
+    def __init__(self, cached: list, min_size: int):
+        self.cached = cached
+        self.groups = group_by_bucket(cached, min_size)
+        self.buckets = list(self.groups)
+        self.weights = [len(self.groups[b]) for b in self.buckets]
+        self._order = {b: list(idxs) for b, idxs in self.groups.items()}
+        self._cursor = dict.fromkeys(self.buckets, 0)
+        for bucket in self.buckets:
+            self._reshuffle(bucket)
+
+    def __bool__(self) -> bool:
+        return bool(self.buckets)
+
+    @property
+    def usable(self) -> int:
+        return sum(self.weights)
+
+    def _reshuffle(self, bucket) -> None:
+        random.shuffle(self._order[bucket])
+        self._cursor[bucket] = 0
+
+    def draw(self, mini_batch_size: int) -> list:
+        bucket = random.choices(self.buckets, weights=self.weights, k=1)[0]
+        order = self._order[bucket]
+
+        if self._cursor[bucket] + mini_batch_size > len(order):
+            self._reshuffle(bucket)
+
+        start = self._cursor[bucket]
+        self._cursor[bucket] = start + mini_batch_size
+        return [self.cached[i] for i in order[start : start + mini_batch_size]]

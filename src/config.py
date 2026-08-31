@@ -14,12 +14,22 @@ def _sm_defaults() -> dict:
         return json.load(f)
 
 
+def default_output_dir() -> str:
+    return _SM_MODEL_DIR if os.path.isdir(_SM_MODEL_DIR) else _LOCAL_MODEL_DIR
+
+
+def _bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 def get_config() -> argparse.Namespace:
     sm = _sm_defaults()
 
     parser = argparse.ArgumentParser()
 
-    def add(name: str, type_: type, default):
+    def add(name: str, type_, default):
         val = sm.get(name)
         parser.add_argument(
             f"--{name}", type=type_, default=type_(val) if val is not None else default
@@ -32,6 +42,7 @@ def get_config() -> argparse.Namespace:
     add("lr", float, 1e-4)
     add("lora_rank", int, 32)
     add("lora_alpha", int, 32)
+    add("grad_clip_norm", float, 1.0)
 
     add("mask_blur_sigma_start", float, 7.0)
     add("mask_blur_sigma_end", float, 1.0)
@@ -39,20 +50,27 @@ def get_config() -> argparse.Namespace:
 
     add("noise_bg_boost", float, 1.5)
     add("noise_t_ramp", float, 0.3)
+    add("noise_lf_levels", int, 6)
+    add("noise_lf_decay", float, 0.6)
 
     add("loss_bg_weight", float, 0.25)
+    add("snr_gamma", float, 5.0)
 
     add("cond_dropout_prob", float, 0.1)
+    add("cond_partial_prob", float, 0.1)
+    add("cond_partial_max", float, 0.6)
     add("embed_jitter_max", float, 0.3)
 
-    add("rl_steps", int, 300)
-    add("rl_lr", float, 1e-8)
-    add("rl_grounding_weight", float, 0.4)
-    add("rl_baseline_momentum", float, 0.95)
+    add("refresh_cache_per_segment", _bool, True)
 
-    sm_default_output = (
-        _SM_MODEL_DIR if os.path.isdir(_SM_MODEL_DIR) else _LOCAL_MODEL_DIR
-    )
+    add("rl_steps", int, 300)
+    add("rl_lr", float, 3e-6)
+    add("rl_grounding_weight", float, 0.4)
+    add("rl_refs", int, 2)
+    add("rl_group", int, 4)
+    add("rl_logprob_subsample", int, 2)
+
+    sm_default_output = default_output_dir()
     sm_output_val = sm.get("output_dir")
     parser.add_argument(
         "--output_dir",
@@ -61,6 +79,12 @@ def get_config() -> argparse.Namespace:
     )
 
     cfg = parser.parse_args()
+
+    if cfg.rl_steps > 0 and cfg.rl_group < 2:
+        parser.error(
+            "--rl_group must be at least 2; group-relative advantages need a spread."
+        )
+
     cfg.effective_batch_size = cfg.mini_batch_size * cfg.grad_accum_steps
     cfg.train_steps = cfg.steps // cfg.effective_batch_size
     return cfg

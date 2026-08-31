@@ -25,14 +25,17 @@ from .encoder import (
     CrossAttentionCapture,
 )
 from .encoding import encode_prompt, rms_scaled_noise
-from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scale
+from .scheduler import (
+    SpatiallyVaryingDDPMScheduler,
+    compute_spatial_noise_scale,
+    pyramid_noise,
+)
 from .loss import compute_diffusion_loss
 from .cache import (
     build_cache,
     blend_alpha,
     blend_masks,
-    group_by_bucket,
-    sample_minibatch,
+    BucketSampler,
 )
 from .rl import rl_segment
 from .io import save_lora
@@ -54,13 +57,45 @@ def _make_inputs_require_grad(module, input, output):  # noqa: ARG001
     output.requires_grad_(True)
 
 
+def apply_conditioning_augmentation(
+    text_emb: torch.Tensor,
+    token_content: torch.Tensor,
+    empty_emb: torch.Tensor,
+    cfg: argparse.Namespace,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch = text_emb.shape[0]
+    if cfg.cond_dropout_prob <= 0.0 and cfg.cond_partial_prob <= 0.0:
+        return text_emb, token_content
+
+    roll = torch.rand(batch, device=text_emb.device)
+    drop = roll < cfg.cond_dropout_prob
+    partial = (roll >= cfg.cond_dropout_prob) & (
+        roll < cfg.cond_dropout_prob + cfg.cond_partial_prob
+    )
+
+    if not bool((drop | partial).any()):
+        return text_emb, token_content
+
+    scale = torch.ones(batch, device=text_emb.device)
+    scale = torch.where(drop, torch.zeros_like(scale), scale)
+    scale = torch.where(
+        partial,
+        torch.rand(batch, device=text_emb.device) * cfg.cond_partial_max,
+        scale,
+    )
+
+    empty = empty_emb.expand(batch, -1, -1).to(text_emb.dtype)
+    blended = torch.lerp(empty.float(), text_emb.float(), scale.view(-1, 1, 1))
+
+    return blended.to(text_emb.dtype), token_content * scale.view(-1, 1)
+
+
 def train_segment(
     segment_name,
     base_unet,
     scheduler,
     mask_builder,
-    cached,
-    groups,
+    sampler,
     empty_emb,
     cfg: argparse.Namespace,
 ):
@@ -79,6 +114,7 @@ def train_segment(
     unet.enable_gradient_checkpointing()
     unet.train()
 
+    trainable = [p for p in unet.parameters() if p.requires_grad]
     optimizer = bnb.optim.AdamW8bit(unet.parameters(), lr=cfg.lr)
     scaler = torch.amp.GradScaler("cuda")
 
@@ -91,7 +127,7 @@ def train_segment(
         alpha = blend_alpha(step, cfg.train_steps)
 
         for _ in range(cfg.grad_accum_steps):
-            items = sample_minibatch(cached, groups, cfg.mini_batch_size)
+            items = sampler.draw(cfg.mini_batch_size)
 
             latents = torch.cat([x["latents"] for x in items]).float().to(DEVICE)
             text_emb = torch.cat([x["text_emb"] for x in items]).to(
@@ -104,19 +140,18 @@ def train_segment(
             batch = latents.shape[0]
             spatial_size = (latents.shape[2], latents.shape[3])
 
-            if cfg.cond_dropout_prob > 0.0:
-                drop = torch.rand(batch, device=DEVICE) < cfg.cond_dropout_prob
-                if drop.any():
-                    empty = empty_emb.expand(batch, -1, -1).to(text_emb.dtype)
-                    text_emb = torch.where(drop.view(-1, 1, 1), empty, text_emb)
-                    token_content = token_content * (~drop).float().view(-1, 1)
+            text_emb, token_content = apply_conditioning_augmentation(
+                text_emb, token_content, empty_emb, cfg
+            )
 
             if cfg.embed_jitter_max > 0.0:
                 text_emb = text_emb + rms_scaled_noise(
                     text_emb, random.uniform(0.0, cfg.embed_jitter_max)
                 )
 
-            noise = torch.randn_like(latents)
+            noise = pyramid_noise(
+                latents, levels=cfg.noise_lf_levels, decay=cfg.noise_lf_decay
+            )
             t = torch.randint(
                 t_low, t_high + 1, (batch,), device=DEVICE, dtype=torch.long
             )
@@ -167,6 +202,8 @@ def train_segment(
                 noise_scale=noise_scale,
                 mask=mask,
                 bg_weight=cfg.loss_bg_weight,
+                alphas_cumprod=scheduler.alphas_cumprod,
+                snr_gamma=cfg.snr_gamma,
             )
 
             # pyrefly: ignore [missing-attribute]
@@ -174,6 +211,11 @@ def train_segment(
             accum_loss += loss.item()
 
             del noisy_latents, noise_scale, mask, base_pred, uniform_noisy
+
+        if cfg.grad_clip_norm > 0.0:
+            # pyrefly: ignore [missing-attribute]
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip_norm)
 
         scaler.step(optimizer)
         scaler.update()
@@ -189,6 +231,42 @@ def train_segment(
     return unet
 
 
+def build_sampler(vae, text_encoder, tokenizer, min_size, seed, cfg):
+    text_encoder.to(DEVICE)
+
+    print(f"Building latent cache (seed={seed})...")
+    cached = build_cache(
+        get_samples(cfg.cache_size, seed=seed),
+        vae,
+        text_encoder,
+        tokenizer,
+        DEVICE,
+        total=cfg.cache_size,
+    )
+
+    empty_emb, _ = encode_prompt("", text_encoder, tokenizer, DEVICE)
+    empty_emb = empty_emb.detach().to(dtype=torch.float16)
+
+    text_encoder.to("cpu")
+    torch.cuda.empty_cache()
+
+    sampler = BucketSampler(cached, min_size)
+    if not sampler:
+        raise RuntimeError(
+            f"No aspect bucket holds at least {min_size} samples. "
+            f"Raise --cache_size, or lower --mini_batch_size / --rl_refs."
+        )
+
+    print(
+        f"Cached {len(cached)} samples; {sampler.usable} usable "
+        f"across {len(sampler.buckets)} buckets:"
+    )
+    for bucket, idxs in sorted(sampler.groups.items(), key=lambda kv: -len(kv[1])):
+        print(f"  {bucket[0]:>3}x{bucket[1]:<3}  {len(idxs)}")
+
+    return sampler, empty_emb
+
+
 def train(cfg: argparse.Namespace):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -196,9 +274,13 @@ def train(cfg: argparse.Namespace):
     print(
         f"Config: steps={cfg.steps}, mini_batch={cfg.mini_batch_size}, "
         f"grad_accum={cfg.grad_accum_steps}, train_steps={cfg.train_steps}, "
-        f"cache_size={cfg.cache_size}, lr={cfg.lr}, lora_rank={cfg.lora_rank}, "
+        f"cache_size={cfg.cache_size}, refresh_per_segment="
+        f"{cfg.refresh_cache_per_segment}, lr={cfg.lr}, lora_rank={cfg.lora_rank}, "
         f"lora_alpha={cfg.lora_alpha}, bg_boost={cfg.noise_bg_boost}, "
-        f"rl_steps={cfg.rl_steps}, rl_lr={cfg.rl_lr}, output_dir={cfg.output_dir}"
+        f"lf_levels={cfg.noise_lf_levels}, lf_decay={cfg.noise_lf_decay}, "
+        f"snr_gamma={cfg.snr_gamma}, cond_partial={cfg.cond_partial_prob}, "
+        f"rl_steps={cfg.rl_steps}, rl_lr={cfg.rl_lr}, rl_refs={cfg.rl_refs}, "
+        f"rl_group={cfg.rl_group}, output_dir={cfg.output_dir}"
     )
 
     models = load_model()
@@ -226,42 +308,26 @@ def train(cfg: argparse.Namespace):
         min_mask_value=cfg.mask_min_value,
     )
 
-    samples = get_samples(cfg.cache_size)
+    min_size = cfg.mini_batch_size
+    if cfg.rl_steps > 0:
+        min_size = max(min_size, cfg.rl_refs)
 
-    print("Building latent cache...")
-    cached = build_cache(
-        samples, vae, text_encoder, tokenizer, DEVICE, total=cfg.cache_size
-    )
+    sampler, empty_emb = build_sampler(vae, text_encoder, tokenizer, min_size, 0, cfg)
 
-    empty_emb, _ = encode_prompt("", text_encoder, tokenizer, DEVICE)
-    empty_emb = empty_emb.detach().to(dtype=torch.float16)
+    for index, segment_name in enumerate(SEGMENTS):
+        if index > 0 and cfg.refresh_cache_per_segment:
+            sampler = None
+            torch.cuda.empty_cache()
+            sampler, empty_emb = build_sampler(
+                vae, text_encoder, tokenizer, min_size, index, cfg
+            )
 
-    del text_encoder
-    torch.cuda.empty_cache()
-    print("Text encoder released.")
-
-    groups = group_by_bucket(cached, cfg.mini_batch_size)
-    if not groups:
-        raise RuntimeError(
-            f"No aspect bucket holds at least mini_batch_size={cfg.mini_batch_size} "
-            f"samples. Raise --cache_size or lower --mini_batch_size."
-        )
-
-    usable = sum(len(v) for v in groups.values())
-    print(
-        f"Cached {len(cached)} samples; {usable} usable across {len(groups)} buckets:"
-    )
-    for bucket, idxs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-        print(f"  {bucket[0]:>3}x{bucket[1]:<3}  {len(idxs)}")
-
-    for segment_name in SEGMENTS:
         unet = train_segment(
             segment_name=segment_name,
             base_unet=base_unet,
             scheduler=scheduler,
             mask_builder=mask_builder,
-            cached=cached,
-            groups=groups,
+            sampler=sampler,
             empty_emb=empty_emb,
             cfg=cfg,
         )
@@ -274,8 +340,7 @@ def train(cfg: argparse.Namespace):
             timesteps=timesteps,
             scheduler=scheduler,
             vae=vae,
-            cached=cached,
-            groups=groups,
+            sampler=sampler,
             cfg=cfg,
         )
 
