@@ -229,7 +229,9 @@ def train(cfg: argparse.Namespace):
     samples = get_samples(cfg.cache_size)
 
     print("Building latent cache...")
-    cached = build_cache(samples, vae, text_encoder, tokenizer, DEVICE)
+    cached = build_cache(
+        samples, vae, text_encoder, tokenizer, DEVICE, total=cfg.cache_size
+    )
 
     empty_emb, _ = encode_prompt("", text_encoder, tokenizer, DEVICE)
     empty_emb = empty_emb.detach().to(dtype=torch.float16)

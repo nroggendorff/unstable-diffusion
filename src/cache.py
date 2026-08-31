@@ -30,11 +30,11 @@ def blend_masks(
     return (1.0 - alpha) * attn_mask + alpha * percentile_normalize(diff_resized)
 
 
-def build_cache(samples, vae, text_encoder, tokenizer, device):
+def build_cache(samples, vae, text_encoder, tokenizer, device, total=None):
     cached = []
     content_cache: dict = {}
 
-    for sample in tqdm(samples, desc="Caching"):
+    for sample in tqdm(samples, desc="Caching", total=total):
         image, prompt, bucket = prepare_sample(sample, device)
         if image is None:
             continue

@@ -7,7 +7,7 @@ from PIL import Image
 from datasets import load_dataset
 
 DATASET_ID = "none-yet/processed-anime"
-SHUFFLE_BUFFER = 10000
+SHUFFLE_BUFFER = 3000
 
 BUCKETS = [
     (512, 512),
@@ -51,7 +51,7 @@ def get_samples(n=100, seed=0):
 
     iterator = iter(dataset)
     try:
-        return list(itertools.islice(iterator, n))
+        yield from itertools.islice(iterator, n)
     finally:
         close = getattr(iterator, "close", None)
         if close is not None:
