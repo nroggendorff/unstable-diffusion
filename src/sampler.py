@@ -1,6 +1,7 @@
 import contextlib
 
 import torch
+import torch.nn.functional as F
 
 from .encoding import rms_scaled_noise
 from .model import EARLY_SEG, MID_SEG, NUM_INFERENCE_STEPS
@@ -10,6 +11,54 @@ ALL_SEGMENTS = ["early", "mid", "late"]
 _BOUNDARIES = [EARLY_SEG, EARLY_SEG + MID_SEG]
 _BLEND_HALF = 2
 _MAX_RAW_GUIDANCE = 30.0
+
+LATENT_LF_LEVELS = 6
+LATENT_LF_DECAY = 0.6
+
+
+def pyramid_latents(
+    shape: tuple[int, int, int, int],
+    generators: list[torch.Generator],
+    device,
+    dtype,
+    lf: float = 1.0,
+    levels: int = LATENT_LF_LEVELS,
+    decay: float = LATENT_LF_DECAY,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    batch, channels, height, width = shape
+    samples = []
+
+    for index in range(batch):
+        generator = generators[index]
+        noise = torch.randn(
+            (1, channels, height, width),
+            generator=generator,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        if lf > 0.0:
+            for level in range(1, max(levels, 1)):
+                stride = 2**level
+                low_h, low_w = height // stride, width // stride
+                if low_h < 1 or low_w < 1:
+                    break
+
+                low = torch.randn(
+                    (1, channels, low_h, low_w),
+                    generator=generator,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                noise = noise + F.interpolate(
+                    low, size=(height, width), mode="bilinear", align_corners=False
+                ) * (decay**level * lf)
+
+        rms = noise.pow(2).flatten(1).mean(1).sqrt().view(-1, 1, 1, 1)
+        samples.append(noise / (rms + eps))
+
+    return torch.cat(samples).to(dtype)
 
 
 def adapter_weights(step_index: int, strength: float = 1.0) -> list[float]:
@@ -91,6 +140,7 @@ def anchor_generate(
     sigma_cutover: float = 0.8,
     offset: float = 0.0,
     gamma: float = 1.0,
+    latent_lf: float = 1.0,
 ):
     batch = len(seeds)
     last_step = num_inference_steps - 1
@@ -136,6 +186,16 @@ def anchor_generate(
         callback_kwargs["prompt_embeds"] = torch.cat([anchor, positive])
         return callback_kwargs
 
+    generators = [torch.Generator(device="cuda").manual_seed(s) for s in seeds]
+    scale = pipe.vae_scale_factor
+    latents = pyramid_latents(
+        (batch, pipe.unet.config.in_channels, height // scale, width // scale),
+        generators,
+        pipe.unet.device,
+        pipe.unet.dtype,
+        lf=latent_lf,
+    )
+
     try:
         with lie_about_noise(pipe, offset, gamma):
             result = pipe(
@@ -145,9 +205,8 @@ def anchor_generate(
                 height=height,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=raw_guidance(0),
-                generator=[
-                    torch.Generator(device="cuda").manual_seed(s) for s in seeds
-                ],
+                generator=generators,
+                latents=latents,
                 callback_on_step_end=callback,
                 callback_on_step_end_tensor_inputs=["latents", "prompt_embeds"],
             )

@@ -9,7 +9,7 @@ from .cache import BucketSampler
 from .eval import adherence, angular_spread, radius
 from .loss import compute_diffusion_loss, min_snr_weight
 from .rl import _ddpm_posterior, rollout_segment
-from .sampler import adapter_weights
+from .sampler import adapter_weights, pyramid_latents
 from .scheduler import (
     SpatiallyVaryingDDPMScheduler,
     compute_spatial_noise_scale,
@@ -400,6 +400,87 @@ def test_sampler_parity():
     check(
         "sampler.adapter_weights matches the app.py copy across the schedule",
         all(adapter_weights(i, 0.8) == app_weights(i, 0.8) for i in range(30)),
+    )
+
+    def app_pyramid_latents(shape, generators, device, dtype, lf=1.0, eps=1e-8):
+        levels, decay = 6, 0.6
+        batch, channels, height, width = shape
+        samples = []
+        for index in range(batch):
+            generator = generators[index]
+            noise = torch.randn(
+                (1, channels, height, width),
+                generator=generator,
+                device=device,
+                dtype=torch.float32,
+            )
+            if lf > 0.0:
+                for level in range(1, max(levels, 1)):
+                    stride = 2**level
+                    low_h, low_w = height // stride, width // stride
+                    if low_h < 1 or low_w < 1:
+                        break
+                    low = torch.randn(
+                        (1, channels, low_h, low_w),
+                        generator=generator,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    noise = noise + torch.nn.functional.interpolate(
+                        low, size=(height, width), mode="bilinear", align_corners=False
+                    ) * (decay**level * lf)
+            rms = noise.pow(2).flatten(1).mean(1).sqrt().view(-1, 1, 1, 1)
+            samples.append(noise / (rms + eps))
+        return torch.cat(samples).to(dtype)
+
+    shape = (2, 4, 64, 48)
+    matches = True
+    for lf in (0.0, 0.5, 1.0):
+        mine = pyramid_latents(
+            shape,
+            [torch.Generator().manual_seed(7 + i) for i in range(shape[0])],
+            "cpu",
+            torch.float32,
+            lf=lf,
+        )
+        theirs = app_pyramid_latents(
+            shape,
+            [torch.Generator().manual_seed(7 + i) for i in range(shape[0])],
+            "cpu",
+            torch.float32,
+            lf=lf,
+        )
+        matches = matches and bool(torch.equal(mine, theirs))
+
+    check("sampler.pyramid_latents matches the app.py copy across lf", matches)
+
+    latents = pyramid_latents(
+        shape,
+        [torch.Generator().manual_seed(3 + i) for i in range(shape[0])],
+        "cpu",
+        torch.float32,
+        lf=1.0,
+    )
+    rms = latents.pow(2).flatten(1).mean(1).sqrt()
+    check(
+        "pyramid_latents is unit RMS per sample",
+        bool((rms - 1.0).abs().max().item() < 1e-4),
+        f"max deviation {float((rms - 1.0).abs().max()):.2e}",
+    )
+
+    flat = pyramid_latents(
+        shape,
+        [torch.Generator().manual_seed(11 + i) for i in range(shape[0])],
+        "cpu",
+        torch.float32,
+        lf=0.0,
+    )
+    dc_pyramid = latents.mean(dim=(2, 3)).pow(2).mean().item()
+    dc_flat = flat.mean(dim=(2, 3)).pow(2).mean().item()
+    check(
+        "lf=1 carries more DC energy than lf=0",
+        dc_pyramid > 5.0 * dc_flat,
+        f"pyramid {dc_pyramid:.5f} vs flat {dc_flat:.5f}",
     )
 
 
