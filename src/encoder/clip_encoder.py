@@ -9,11 +9,13 @@ class CLIPVisionEncoder(nn.Module):
         model_name="openai/clip-vit-base-patch32",
         feature_layers=None,
         freeze=True,
+        detach=True,
     ):
         super().__init__()
         if feature_layers is None:
             feature_layers = [2, 4, 6, 8]
         self.feature_layers = feature_layers
+        self.detach = detach
 
         full_clip = CLIPModel.from_pretrained(model_name)
         self.model = full_clip.vision_model
@@ -31,7 +33,7 @@ class CLIPVisionEncoder(nn.Module):
 
     def _make_hook(self, layer_idx):
         def hook(module, input, output):  # noqa: ARG001
-            self._activations[layer_idx] = output.detach()
+            self._activations[layer_idx] = output.detach() if self.detach else output
 
         return hook
 

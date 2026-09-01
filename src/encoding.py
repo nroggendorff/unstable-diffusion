@@ -188,10 +188,16 @@ def encode_prompt(prompts, text_encoder, tokenizer, device, content_cache=None):
     return embeddings, content
 
 
-def decode_for_clip(vae, latents: torch.Tensor) -> torch.Tensor:
+def decode_for_clip(
+    vae, latents: torch.Tensor, straight_through: bool = False
+) -> torch.Tensor:
     decoded = vae.decode(latents.to(dtype=vae.dtype) / vae.config.scaling_factor).sample
 
-    decoded = (decoded.float().clamp(-1, 1) + 1) / 2
+    decoded = decoded.float()
+    clamped = decoded.clamp(-1, 1)
+    if straight_through:
+        clamped = decoded + (clamped - decoded).detach()
+    decoded = (clamped + 1) / 2
     decoded = F.interpolate(
         decoded, size=(224, 224), mode="bilinear", align_corners=False
     )

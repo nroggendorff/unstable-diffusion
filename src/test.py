@@ -1,11 +1,15 @@
 import argparse
+import os
 import random
 import sys
+import tempfile
 from types import SimpleNamespace
 
 import torch
 
 from .cache import BucketSampler
+from .chainrl import normalize_grad, save_chain_lora
+from .encoding import decode_for_clip
 from .eval import adherence, angular_spread, radius
 from .loss import compute_diffusion_loss, min_snr_weight
 from .rl import _ddpm_posterior, rollout_segment
@@ -513,6 +517,100 @@ def test_eval_metrics():
     )
 
 
+class _DummyVAE:
+    dtype = torch.float32
+    config = SimpleNamespace(scaling_factor=1.0)
+
+    def decode(self, latents):
+        return SimpleNamespace(sample=latents.expand(-1, 3, -1, -1))
+
+
+def test_straight_through_clamp():
+    print("\n--- chain RL: straight-through clamp on decode_for_clip ---")
+    vae = _DummyVAE()
+
+    saturated = torch.full((1, 1, 8, 8), 3.0, requires_grad=True)
+    decode_for_clip(vae, saturated).sum().backward()
+    hard_grad = saturated.grad.abs().sum().item()
+
+    saturated_st = torch.full((1, 1, 8, 8), 3.0, requires_grad=True)
+    decode_for_clip(vae, saturated_st, straight_through=True).sum().backward()
+    st_grad = saturated_st.grad.abs().sum().item()
+
+    check("hard clamp kills gradient where the decoder saturates", hard_grad == 0.0)
+    check("straight-through preserves it", st_grad > 0.0, f"{st_grad:.3f}")
+
+    inside = torch.zeros(1, 1, 8, 8)
+    a = decode_for_clip(vae, inside)
+    b = decode_for_clip(vae, inside, straight_through=True)
+    check("forward value is unchanged inside the clamp range", torch.equal(a, b))
+
+    over = torch.full((1, 1, 8, 8), 3.0)
+    check(
+        "forward value is still clamped outside it",
+        torch.equal(
+            decode_for_clip(vae, over),
+            decode_for_clip(vae, over, straight_through=True),
+        ),
+    )
+
+
+def test_normalize_grad():
+    print("\n--- chain RL: gradient normalizer ---")
+    x = torch.randn(3, 4, 8, 8, requires_grad=True)
+    upstream = torch.randn(3, 4, 8, 8) * torch.tensor([1e-6, 1.0, 1e6]).view(3, 1, 1, 1)
+
+    normalize_grad(x, 1.0).backward(upstream)
+    rms = x.grad.pow(2).flatten(1).mean(1).sqrt()
+
+    check(
+        "per-sample gradient RMS is driven to the target",
+        torch.allclose(rms, torch.ones(3), atol=1e-4),
+        f"rms={[round(v, 4) for v in rms.tolist()]}",
+    )
+
+    cos = torch.nn.functional.cosine_similarity(
+        x.grad.flatten(1), upstream.flatten(1), dim=1
+    )
+    check(
+        "direction is preserved (magnitude only)",
+        torch.allclose(cos, torch.ones(3), atol=1e-5),
+    )
+
+    y = torch.randn(2, 4, 8, 8, requires_grad=True)
+    up = torch.randn(2, 4, 8, 8)
+    normalize_grad(y, 0.0).backward(up)
+    check("target_rms=0 disables the normalizer", torch.equal(y.grad, up))
+
+
+def test_chain_lora_keys():
+    print("\n--- chain RL: adapter key rewrite ---")
+    named = [
+        ("down_blocks.0.attentions.0.attn1.to_q.lora_A.early.weight", torch.zeros(2)),
+        ("down_blocks.0.attentions.0.attn1.to_q.lora_B.early.weight", torch.zeros(2)),
+        ("down_blocks.0.attentions.0.attn1.to_q.lora_A.late.weight", torch.zeros(2)),
+        ("down_blocks.0.attentions.0.attn1.to_q.base_layer.weight", torch.zeros(2)),
+    ]
+    unet = SimpleNamespace(named_parameters=lambda: iter(named))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        count = save_chain_lora(unet, tmp, "early")
+        from safetensors.torch import load_file
+
+        keys = set(load_file(os.path.join(tmp, "early.safetensors")))
+
+    check("only the requested adapter is written", count == 2, f"{count} tensors")
+    check(
+        "keys match the flat layout app.py loads",
+        keys
+        == {
+            "unet.down_blocks.0.attentions.0.attn1.to_q.lora_A.weight",
+            "unet.down_blocks.0.attentions.0.attn1.to_q.lora_B.weight",
+        },
+        str(sorted(keys)[0]),
+    )
+
+
 def main() -> int:
     torch.manual_seed(0)
     random.seed(0)
@@ -528,6 +626,9 @@ def main() -> int:
     test_group_advantage()
     test_sampler_parity()
     test_eval_metrics()
+    test_straight_through_clamp()
+    test_normalize_grad()
+    test_chain_lora_keys()
 
     print()
     if _failures:
