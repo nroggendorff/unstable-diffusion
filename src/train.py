@@ -1,5 +1,6 @@
 import argparse
 import copy
+import gc
 import random
 
 import torch
@@ -118,7 +119,7 @@ def train_segment(
     optimizer = bnb.optim.AdamW8bit(unet.parameters(), lr=cfg.lr)
     scaler = torch.amp.GradScaler("cuda")
 
-    capture = CrossAttentionCapture(unet)
+    capture = CrossAttentionCapture(unet, gain=cfg.mask_gain)
 
     for step in (pbar := tqdm(range(cfg.train_steps))):
         optimizer.zero_grad(set_to_none=True)
@@ -177,7 +178,9 @@ def train_segment(
                 del denoised_latents
 
                 gate = (t < DISCREPANCY_MAX_T).float().view(-1, 1, 1, 1)
-                mask = blend_masks(attn_mask, raw_diff, spatial_size, alpha * gate)
+                mask = blend_masks(
+                    attn_mask, raw_diff, spatial_size, alpha * gate, gain=cfg.mask_gain
+                )
                 del attn_mask, raw_diff
 
             blur_sigma = mask_builder.blur_sigma_for_step(step, cfg.train_steps)
@@ -236,12 +239,15 @@ def build_sampler(vae, text_encoder, tokenizer, min_size, seed, cfg):
 
     print(f"Building latent cache (seed={seed})...")
     cached = build_cache(
-        get_samples(cfg.cache_size, seed=seed),
+        get_samples(cfg.cache_size, seed=seed, shuffle_buffer=cfg.shuffle_buffer),
         vae,
         text_encoder,
         tokenizer,
         DEVICE,
         total=cfg.cache_size,
+        subset_prob=cfg.caption_subset_prob,
+        subset_min=cfg.caption_subset_min,
+        seed=seed,
     )
 
     empty_emb, _ = encode_prompt("", text_encoder, tokenizer, DEVICE)
@@ -274,11 +280,14 @@ def train(cfg: argparse.Namespace):
     print(
         f"Config: steps={cfg.steps}, mini_batch={cfg.mini_batch_size}, "
         f"grad_accum={cfg.grad_accum_steps}, train_steps={cfg.train_steps}, "
-        f"cache_size={cfg.cache_size}, refresh_per_segment="
+        f"cache_size={cfg.cache_size}, shuffle_buffer={cfg.shuffle_buffer}, "
+        f"refresh_per_segment="
         f"{cfg.refresh_cache_per_segment}, lr={cfg.lr}, lora_rank={cfg.lora_rank}, "
         f"lora_alpha={cfg.lora_alpha}, bg_boost={cfg.noise_bg_boost}, "
         f"lf_levels={cfg.noise_lf_levels}, lf_decay={cfg.noise_lf_decay}, "
         f"snr_gamma={cfg.snr_gamma}, cond_partial={cfg.cond_partial_prob}, "
+        f"mask_gain={cfg.mask_gain}, "
+        f"caption_subset={cfg.caption_subset_prob}/{cfg.caption_subset_min}, "
         f"rl_steps={cfg.rl_steps}, rl_lr={cfg.rl_lr}, rl_refs={cfg.rl_refs}, "
         f"rl_group={cfg.rl_group}, output_dir={cfg.output_dir}"
     )
@@ -306,6 +315,7 @@ def train(cfg: argparse.Namespace):
         blur_sigma_start=cfg.mask_blur_sigma_start,
         blur_sigma_end=cfg.mask_blur_sigma_end,
         min_mask_value=cfg.mask_min_value,
+        gain=cfg.mask_gain,
     )
 
     min_size = cfg.mini_batch_size
@@ -317,6 +327,7 @@ def train(cfg: argparse.Namespace):
     for index, segment_name in enumerate(SEGMENTS):
         if index > 0 and cfg.refresh_cache_per_segment:
             sampler = None
+            gc.collect()
             torch.cuda.empty_cache()
             sampler, empty_emb = build_sampler(
                 vae, text_encoder, tokenizer, min_size, index, cfg
@@ -347,6 +358,7 @@ def train(cfg: argparse.Namespace):
         save_lora(unet, cfg.output_dir, segment_name)
 
         del unet
+        gc.collect()
         torch.cuda.empty_cache()
 
 

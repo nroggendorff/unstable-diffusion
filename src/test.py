@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import string
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -9,7 +10,14 @@ import torch
 
 from .cache import BucketSampler
 from .chainrl import normalize_grad, save_chain_lora
-from .encoding import decode_for_clip
+from .dataset import shuffle_buffer_size
+from .encoder.mask_builder import (
+    _gaussian_blur,
+    normalize_mask,
+    percentile_normalize,
+    relative_normalize,
+)
+from .encoding import decode_for_clip, split_clauses, subset_caption
 from .eval import adherence, angular_spread, radius
 from .loss import compute_diffusion_loss, min_snr_weight
 from .rl import _ddpm_posterior, rollout_segment
@@ -611,6 +619,165 @@ def test_chain_lora_keys():
     )
 
 
+_CAPTION = (
+    "A young woman with long blonde hair, wearing a purple and white dress "
+    "with a red bow, stands on a glowing blue platform. She holds a small "
+    "object near her mouth. The background features a surreal, dreamlike "
+    "landscape with a large, stylized eye floating above her."
+)
+
+
+def test_caption_subsetting():
+    print("\n--- caption subsetting ---")
+
+    clauses = split_clauses(_CAPTION)
+    check("caption splits into clauses", len(clauses) == 7, str(len(clauses)))
+
+    single = "A young woman standing"
+    check(
+        "single-clause captions pass through",
+        subset_caption(single, random.Random(0)) == single,
+    )
+    check(
+        "min_keep=1.0 keeps the whole caption",
+        subset_caption(_CAPTION, random.Random(0), min_keep=1.0) == _CAPTION,
+    )
+    check(
+        "subsetting is deterministic per seeded rng",
+        subset_caption(_CAPTION, random.Random(7))
+        == subset_caption(_CAPTION, random.Random(7)),
+    )
+
+    rng = random.Random(0)
+    draws = [subset_caption(_CAPTION, rng) for _ in range(200)]
+    full_words = _CAPTION.split()
+
+    check("no draw is empty", all(d.strip() for d in draws))
+    check(
+        "no draw is longer than the caption",
+        all(len(d.split()) <= len(full_words) for d in draws),
+    )
+
+    prefix_ok = True
+    for draw in draws:
+        for index, word in enumerate(draw.split()):
+            if word.strip(string.punctuation) != full_words[index].strip(
+                string.punctuation
+            ):
+                prefix_ok = False
+    check("every draw is a word-prefix of the caption", prefix_ok)
+
+    lengths = [len(d.split()) for d in draws]
+    mean_length = sum(lengths) / len(lengths)
+    check(
+        "the draw distribution shortens captions",
+        mean_length < 0.75 * len(full_words),
+        f"{mean_length:.1f} of {len(full_words)}",
+    )
+    check(
+        "the draw distribution reaches short prompts",
+        min(lengths) <= 8,
+        f"min {min(lengths)}",
+    )
+    check(
+        "the draw distribution still includes the full caption",
+        max(lengths) == len(full_words),
+        f"max {max(lengths)}",
+    )
+
+
+def test_shuffle_buffer_size():
+    print("\n--- shuffle buffer sizing ---")
+
+    check(
+        "config value caps the buffer on a large cache",
+        shuffle_buffer_size(6000, 1000) == 1000,
+        str(shuffle_buffer_size(6000, 1000)),
+    )
+    check(
+        "smoke-sized runs keep the 256 floor",
+        shuffle_buffer_size(96, 1000) == 256,
+        str(shuffle_buffer_size(96, 1000)),
+    )
+    check(
+        "the buffer never exceeds the cache it feeds, above the floor",
+        shuffle_buffer_size(400, 3000) == 400,
+        str(shuffle_buffer_size(400, 3000)),
+    )
+    check(
+        "peak RAM is bounded by the buffer, not cache_size",
+        shuffle_buffer_size(20000, 1000) == shuffle_buffer_size(6000, 1000),
+    )
+
+
+def test_mask_normalization():
+    print("\n--- mask normalization ---")
+
+    flat = torch.full((4, 1, 16, 16), 0.37)
+    noisy_flat = flat + torch.randn_like(flat) * 1e-6
+
+    stretched = percentile_normalize(noisy_flat)
+    check(
+        "percentile_normalize manufactures full contrast from noise",
+        stretched.flatten(1).std(1).mean() > 0.2,
+        f"std {stretched.flatten(1).std(1).mean():.3f}",
+    )
+
+    relative = relative_normalize(noisy_flat, gain=1.5)
+    check(
+        "relative_normalize leaves a flat map flat",
+        relative.flatten(1).std(1).max() < 1e-3,
+        f"std {relative.flatten(1).std(1).max():.2e}",
+    )
+    check(
+        "a flat map normalizes to the neutral 0.5",
+        (relative - 0.5).abs().max() < 1e-3,
+    )
+
+    pattern = torch.randn(4, 1, 16, 16)
+    pattern = pattern - pattern.flatten(1).median(dim=1).values.view(-1, 1, 1, 1)
+    pattern = pattern / pattern.flatten(1).abs().max(dim=1).values.view(-1, 1, 1, 1)
+
+    weak = relative_normalize(1.0 + 0.05 * pattern, gain=1.5)
+    strong = relative_normalize(1.0 + 0.10 * pattern, gain=1.5)
+
+    weak_std = weak.flatten(1).std(1)
+    strong_std = strong.flatten(1).std(1)
+    ratio = (strong_std / weak_std.clamp(min=1e-8)).mean()
+    check(
+        "mask contrast is proportional to signal contrast",
+        abs(float(ratio) - 2.0) < 0.05,
+        f"ratio {float(ratio):.3f}",
+    )
+
+    scaled = relative_normalize(7.5 * (1.0 + 0.05 * pattern), gain=1.5)
+    check(
+        "normalization is invariant to the map's absolute scale",
+        torch.allclose(weak, scaled, atol=1e-5),
+    )
+    check(
+        "output stays inside [0, 1]",
+        float(strong.min()) >= 0.0 and float(strong.max()) <= 1.0,
+    )
+    check(
+        "gain=0 falls back to the percentile stretch",
+        torch.equal(normalize_mask(noisy_flat, 0.0), percentile_normalize(noisy_flat)),
+    )
+
+    constant = torch.full((2, 1, 32, 48), 0.5)
+    blurred = _gaussian_blur(constant, 43, 7.0)
+    check(
+        "blur preserves shape",
+        blurred.shape == constant.shape,
+        str(tuple(blurred.shape)),
+    )
+    check(
+        "blur does not darken the edges of a constant map",
+        (blurred - 0.5).abs().max() < 1e-5,
+        f"max drift {float((blurred - 0.5).abs().max()):.2e}",
+    )
+
+
 def main() -> int:
     torch.manual_seed(0)
     random.seed(0)
@@ -621,6 +788,9 @@ def main() -> int:
     test_loss_weighting(scheduler)
     test_bucket_sampler()
     test_conditioning_augmentation()
+    test_caption_subsetting()
+    test_shuffle_buffer_size()
+    test_mask_normalization()
     test_x0_reward(scheduler)
     test_rollout(scheduler)
     test_group_advantage()

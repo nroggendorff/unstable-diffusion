@@ -5,8 +5,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from .dataset import prepare_sample
-from .encoding import encode_prompt
-from .encoder.mask_builder import percentile_normalize
+from .encoding import encode_prompt, subset_caption
+from .encoder.mask_builder import normalize_mask
 
 MASK_BLEND_ALPHA_MAX = 0.2
 
@@ -20,6 +20,7 @@ def blend_masks(
     latent_diff: torch.Tensor,
     spatial_size: tuple,
     alpha: float | torch.Tensor,
+    gain: float = 0.0,
 ) -> torch.Tensor:
     if isinstance(alpha, float) and alpha <= 0.0:
         return attn_mask
@@ -27,22 +28,44 @@ def blend_masks(
     diff_resized = F.interpolate(
         latent_diff, size=spatial_size, mode="bilinear", align_corners=False
     )
-    return (1.0 - alpha) * attn_mask + alpha * percentile_normalize(diff_resized)
+    return (1.0 - alpha) * attn_mask + alpha * normalize_mask(diff_resized, gain)
 
 
-def build_cache(samples, vae, text_encoder, tokenizer, device, total=None):
+def build_cache(
+    samples,
+    vae,
+    text_encoder,
+    tokenizer,
+    device,
+    total=None,
+    subset_prob=0.0,
+    subset_min=0.15,
+    seed=0,
+):
     cached = []
     content_cache: dict = {}
+    rng = random.Random(seed)
+    subset_count = 0
+    words_before = 0
+    words_after = 0
 
     for sample in tqdm(samples, desc="Caching", total=total):
         image, prompt, bucket = prepare_sample(sample, device)
-        if image is None:
+        if image is None or prompt is None:
             continue
+
+        conditioning = prompt
+        if subset_prob > 0.0 and rng.random() < subset_prob:
+            conditioning = subset_caption(prompt, rng, subset_min)
+            subset_count += int(conditioning != prompt)
+
+        words_before += len(prompt.split())
+        words_after += len(conditioning.split())
 
         with torch.no_grad():
             latents = vae.encode(image).latent_dist.sample() * vae.config.scaling_factor
             text_emb, content = encode_prompt(
-                prompt, text_encoder, tokenizer, device, content_cache
+                conditioning, text_encoder, tokenizer, device, content_cache
             )
 
         cached.append(
@@ -52,6 +75,13 @@ def build_cache(samples, vae, text_encoder, tokenizer, device, total=None):
                 "token_content_mask": content.cpu(),
                 "bucket": bucket,
             }
+        )
+
+    if subset_prob > 0.0 and cached:
+        print(
+            f"Caption subsetting: {subset_count}/{len(cached)} truncated, "
+            f"mean words {words_before / len(cached):.1f} -> "
+            f"{words_after / len(cached):.1f}"
         )
 
     return cached

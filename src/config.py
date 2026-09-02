@@ -39,6 +39,7 @@ def get_config() -> argparse.Namespace:
     add("mini_batch_size", int, 2)
     add("grad_accum_steps", int, 4)
     add("cache_size", int, 4000)
+    add("shuffle_buffer", int, 1000)
     add("lr", float, 1e-4)
     add("lora_rank", int, 32)
     add("lora_alpha", int, 32)
@@ -47,6 +48,7 @@ def get_config() -> argparse.Namespace:
     add("mask_blur_sigma_start", float, 7.0)
     add("mask_blur_sigma_end", float, 1.0)
     add("mask_min_value", float, 0.0)
+    add("mask_gain", float, 1.5)
 
     add("noise_bg_boost", float, 1.5)
     add("noise_t_ramp", float, 0.3)
@@ -60,6 +62,8 @@ def get_config() -> argparse.Namespace:
     add("cond_partial_prob", float, 0.1)
     add("cond_partial_max", float, 0.6)
     add("embed_jitter_max", float, 0.3)
+    add("caption_subset_prob", float, 0.5)
+    add("caption_subset_min", float, 0.15)
 
     add("refresh_cache_per_segment", _bool, True)
 

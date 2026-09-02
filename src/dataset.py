@@ -7,7 +7,7 @@ from PIL import Image
 from datasets import load_dataset
 
 DATASET_ID = "none-yet/processed-anime"
-SHUFFLE_BUFFER = 3000
+SHUFFLE_BUFFER = 1000
 
 BUCKETS = [
     (512, 512),
@@ -45,9 +45,15 @@ def _cover_resize(image: Image.Image, bucket: tuple[int, int]) -> Image.Image:
     return image.resize(resized, Image.Resampling.LANCZOS)
 
 
-def get_samples(n=100, seed=0):
+def shuffle_buffer_size(n: int, shuffle_buffer: int = SHUFFLE_BUFFER) -> int:
+    return min(shuffle_buffer, max(n, 256))
+
+
+def get_samples(n=100, seed=0, shuffle_buffer=SHUFFLE_BUFFER):
     dataset = load_dataset(DATASET_ID, split="train", streaming=True)
-    dataset = dataset.shuffle(seed=seed, buffer_size=min(SHUFFLE_BUFFER, max(n, 256)))
+    dataset = dataset.shuffle(
+        seed=seed, buffer_size=shuffle_buffer_size(n, shuffle_buffer)
+    )
 
     iterator = iter(dataset)
     try:

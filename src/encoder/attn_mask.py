@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from .mask_builder import percentile_normalize
+from .mask_builder import normalize_mask
 
 
 def _unwrap_unet(module):
@@ -81,8 +81,9 @@ class _CapturingProcessor:
 
 
 class CrossAttentionCapture:
-    def __init__(self, unet):
+    def __init__(self, unet, gain: float = 0.0):
         self.unet = unet
+        self.gain = gain
         self._target = _unwrap_unet(unet)
         self._original = {}
         self.store = []
@@ -144,7 +145,7 @@ class CrossAttentionCapture:
         if self._original:
             self._target.set_attn_processor(self._original)
 
-    def build_mask(self, spatial_size: tuple[int, int]) -> torch.Tensor:
+    def raw_mask(self, spatial_size: tuple[int, int]) -> torch.Tensor:
         if not self.store:
             raise RuntimeError(
                 "No cross-attention weights were captured. "
@@ -167,4 +168,7 @@ class CrossAttentionCapture:
 
         averaged = (stack * layer_weights.view(1, n, 1, 1)).sum(dim=1)
 
-        return percentile_normalize(averaged.unsqueeze(1))
+        return averaged.unsqueeze(1)
+
+    def build_mask(self, spatial_size: tuple[int, int]) -> torch.Tensor:
+        return normalize_mask(self.raw_mask(spatial_size), self.gain)

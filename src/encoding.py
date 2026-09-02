@@ -1,3 +1,5 @@
+import random
+import re
 import string
 
 import torch
@@ -106,6 +108,37 @@ _STOPWORDS = {
     "against",
     "between",
 }
+
+
+_CLAUSE_BOUNDARY = re.compile(r"(?<=[.,;:!?])\s+")
+
+
+def split_clauses(caption: str) -> list[str]:
+    parts = [part.strip() for part in _CLAUSE_BOUNDARY.split(caption.strip())]
+    return [part for part in parts if part]
+
+
+def _trim_dangling(text: str) -> str:
+    words = text.split()
+    while words:
+        bare = words[-1].strip(string.punctuation).lower()
+        if bare and bare not in _STOPWORDS:
+            break
+        words.pop()
+    return " ".join(words).strip(string.punctuation + " ")
+
+
+def subset_caption(caption: str, rng: random.Random, min_keep: float = 0.15) -> str:
+    clauses = split_clauses(caption)
+    if len(clauses) < 2:
+        return caption
+
+    keep = max(1, round(rng.uniform(min_keep, 1.0) * len(clauses)))
+    if keep >= len(clauses):
+        return caption
+
+    trimmed = _trim_dangling(" ".join(clauses[:keep]))
+    return trimmed if trimmed else caption
 
 
 def clip_normalization(device, dtype=torch.float32):
