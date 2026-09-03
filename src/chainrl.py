@@ -201,7 +201,7 @@ def get_args():
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--refs", type=int, default=2)
-    parser.add_argument("--cache_size", type=int, default=512)
+    parser.add_argument("--cache_size", type=int, default=2048)
     parser.add_argument("--cache_seed", type=int, default=0)
     parser.add_argument("--grad_window", type=int, default=0)
     parser.add_argument("--grad_target_rms", type=float, default=1.0)

@@ -19,11 +19,12 @@ def get_config() -> argparse.Namespace:
     def add(name: str, type_, default):
         parser.add_argument(f"--{name}", type=type_, default=default)
 
-    add("steps", int, 15000)
-    add("mini_batch_size", int, 2)
-    add("grad_accum_steps", int, 4)
-    add("cache_size", int, 4000)
-    add("shuffle_buffer", int, 768)
+    add("steps", int, 4096)
+    add("mini_batch_size", int, 8)
+    add("grad_accum_steps", int, 1)
+    add("cache_size", int, 4096)
+    add("shuffle_buffer", int, 1024)
+    add("cache_workers", int, 6)
     add("lr", float, 1e-4)
     add("lora_rank", int, 32)
     add("lora_alpha", int, 32)
@@ -53,10 +54,10 @@ def get_config() -> argparse.Namespace:
 
     add("rl_steps", int, 0)
     add("rl_lr", float, 3e-6)
-    add("rl_grounding_weight", float, 0.0)
-    add("rl_refs", int, 1)
-    add("rl_group", int, 2)
-    add("rl_logprob_subsample", int, 1)
+    add("rl_grounding_weight", float, 0.4)
+    add("rl_refs", int, 2)
+    add("rl_group", int, 4)
+    add("rl_logprob_subsample", int, 2)
 
     parser.add_argument("--output_dir", type=str, default=default_output_dir())
 

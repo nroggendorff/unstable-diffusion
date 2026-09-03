@@ -4,9 +4,10 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from .dataset import prepare_sample
+from .dataset import CACHE_WORKERS, prepared_samples
 from .encoding import encode_prompt, subset_caption
 from .encoder.mask_builder import normalize_mask
+from .model import X0_CLAMP
 
 MASK_BLEND_ALPHA_MAX = 0.2
 
@@ -37,6 +38,47 @@ def stack_added_cond(items: list, device, dtype=torch.float16) -> tuple:
     return pooled, time_ids
 
 
+class LatentStats:
+    def __init__(self):
+        self.sum_sq: torch.Tensor | None = None
+        self.over: torch.Tensor | None = None
+        self.max_abs: torch.Tensor | None = None
+        self.count = 0
+
+    def absorb(self, latents: torch.Tensor) -> None:
+        values = latents.detach().float()
+        absolute = values.abs()
+
+        sum_sq = values.pow(2).sum().double()
+        over = (absolute > X0_CLAMP).sum().double()
+        max_abs = absolute.max()
+
+        if self.sum_sq is None or self.over is None or self.max_abs is None:
+            self.sum_sq, self.over, self.max_abs = sum_sq, over, max_abs
+        else:
+            self.sum_sq = self.sum_sq + sum_sq
+            self.over = self.over + over
+            self.max_abs = torch.maximum(self.max_abs, max_abs)
+
+        self.count += values.numel()
+
+    def report(self) -> None:
+        if (
+            self.sum_sq is None
+            or self.over is None
+            or self.max_abs is None
+            or not self.count
+        ):
+            return
+
+        rms = (self.sum_sq / self.count).sqrt().item()
+        print(
+            f"Latent stats: rms {rms:.3f}, max|x| {self.max_abs.item():.2f}, "
+            f"|x| over X0_CLAMP={X0_CLAMP} on "
+            f"{self.over.item() / self.count:.4%} of elements"
+        )
+
+
 def build_cache(
     samples,
     vae,
@@ -47,6 +89,7 @@ def build_cache(
     subset_prob=0.0,
     subset_min=0.15,
     seed=0,
+    workers=CACHE_WORKERS,
 ):
     cached = []
     content_cache: dict = {}
@@ -54,9 +97,10 @@ def build_cache(
     subset_count = 0
     words_before = 0
     words_after = 0
+    stats = LatentStats()
 
-    for sample in tqdm(samples, desc="Caching", total=total):
-        image, prompt, bucket, time_ids = prepare_sample(sample, device)
+    prepared = prepared_samples(samples, workers)
+    for image, prompt, bucket, time_ids in tqdm(prepared, desc="Caching", total=total):
         if image is None or prompt is None:
             continue
 
@@ -69,11 +113,15 @@ def build_cache(
         words_after += len(conditioning.split())
 
         with torch.no_grad():
-            latents = vae.encode(image).latent_dist.sample() * vae.config.scaling_factor
+            latents = (
+                vae.encode(image.to(device)).latent_dist.sample()
+                * vae.config.scaling_factor
+            )
             text_emb, pooled, content = encode_prompt(
                 conditioning, text_encoders, tokenizers, device, content_cache
             )
 
+        stats.absorb(latents)
         cached.append(
             {
                 "latents": latents.cpu().half(),
@@ -84,6 +132,8 @@ def build_cache(
                 "bucket": bucket,
             }
         )
+
+    stats.report()
 
     if subset_prob > 0.0 and cached:
         print(

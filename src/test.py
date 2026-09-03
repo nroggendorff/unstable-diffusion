@@ -1,5 +1,7 @@
 import argparse
+import ast
 import os
+import pathlib
 import random
 import string
 import sys
@@ -19,19 +21,25 @@ from .encoder.mask_builder import (
     relative_normalize,
 )
 from .encoding import (
+    CHUNK_TOKENS,
     HIDDEN_SPLIT,
+    MAX_CHUNKS,
+    POOLED_DIM,
     decode_for_clip,
     encode_prompt,
     rms_scaled_noise,
     split_clauses,
     subset_caption,
 )
+from .model import EARLY_SEG, MID_SEG, NUM_INFERENCE_STEPS
 from .eval import adherence, angular_spread, radius
 from .loss import compute_diffusion_loss, min_snr_weight
 from .rl import _ddpm_posterior, rollout_segment
 from .sampler import (
     LATENT_LF_DECAY,
     LATENT_LF_LEVELS,
+    _BLEND_HALF,
+    _MAX_RAW_GUIDANCE,
     adapter_weights,
     pyramid_latents,
 )
@@ -88,8 +96,12 @@ class _DummyTokenizer:
         self._words: dict = {}
 
     def __call__(
-        self, text, add_special_tokens=False, truncation=True, max_length=150
-    ):  # noqa: ARG002
+        self,
+        text,
+        add_special_tokens=False,  # noqa: ARG002
+        truncation=True,  # noqa: ARG002
+        max_length=150,  # noqa: ARG002
+    ):
         ids = []
         for word in text.lower().split():
             if word not in self._ids:
@@ -1062,6 +1074,66 @@ def test_size_conditioning():
     )
 
 
+_APP_PATH = pathlib.Path(__file__).resolve().parent.parent / "app.py"
+
+_APP_MIRRORED_CONSTANTS = {
+    "EARLY_SEG": EARLY_SEG,
+    "MID_SEG": MID_SEG,
+    "NUM_INFERENCE_STEPS": NUM_INFERENCE_STEPS,
+    "_BLEND_HALF": _BLEND_HALF,
+    "_MAX_RAW_GUIDANCE": _MAX_RAW_GUIDANCE,
+    "CHUNK_TOKENS": CHUNK_TOKENS,
+    "MAX_CHUNKS": MAX_CHUNKS,
+    "HIDDEN_SPLIT": HIDDEN_SPLIT,
+    "POOLED_DIM": POOLED_DIM,
+    "LATENT_LF_LEVELS": LATENT_LF_LEVELS,
+    "LATENT_LF_DECAY": LATENT_LF_DECAY,
+}
+
+
+def _module_constants(path: pathlib.Path) -> dict:
+    found = {}
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        try:
+            found[target.id] = ast.literal_eval(node.value)
+        except ValueError:
+            continue
+    return found
+
+
+def test_app_constant_parity():
+    print("\n--- app.py constant parity ---")
+
+    if not _APP_PATH.exists():
+        check(
+            "app.py is absent, so there is nothing to diff (expected in the image)",
+            True,
+            str(_APP_PATH),
+        )
+        return
+
+    found = _module_constants(_APP_PATH)
+
+    for name, expected in _APP_MIRRORED_CONSTANTS.items():
+        present = name in found
+        check(
+            f"app.py defines {name}",
+            present,
+            "" if present else "not found as a module-level literal",
+        )
+        if present:
+            check(
+                f"app.py {name} matches src",
+                found[name] == expected,
+                f"app={found[name]!r} src={expected!r}",
+            )
+
+
 def main() -> int:
     torch.manual_seed(0)
     random.seed(0)
@@ -1083,6 +1155,7 @@ def main() -> int:
     test_rollout(scheduler)
     test_group_advantage()
     test_sampler_parity()
+    test_app_constant_parity()
     test_eval_metrics()
     test_straight_through_clamp()
     test_normalize_grad()

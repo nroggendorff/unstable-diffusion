@@ -17,6 +17,8 @@ EARLY_SEG = 10
 MID_SEG = 10
 LATE_SEG = 10
 
+X0_CLAMP = 4.0
+
 LR = 1e-4
 LORA_RANK = 32
 LORA_ALPHA = 32
@@ -40,7 +42,9 @@ def get_lora_config(rank: int = LORA_RANK, alpha: int = LORA_ALPHA):
 
 def load_vae(device=DEVICE):
     # pyrefly: ignore [missing-attribute]
-    return AutoencoderKL.from_pretrained(VAE_ID, torch_dtype=torch.float16).to(device)
+    vae = AutoencoderKL.from_pretrained(VAE_ID, torch_dtype=torch.float16).to(device)
+    vae.enable_slicing()
+    return vae
 
 
 def load_unet():

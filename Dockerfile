@@ -10,6 +10,8 @@ RUN pip install --no-cache-dir --break-system-packages \
     transformers \
     safetensors
 
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 WORKDIR /app/
 
 COPY src /app/src/

@@ -266,6 +266,7 @@ def build_sampler(
         subset_prob=cfg.caption_subset_prob,
         subset_min=cfg.caption_subset_min,
         seed=seed,
+        workers=cfg.cache_workers,
     )
 
     empty_emb, empty_pooled, _ = encode_prompt("", text_encoders, tokenizers, DEVICE)

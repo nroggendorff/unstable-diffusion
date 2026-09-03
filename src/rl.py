@@ -7,11 +7,10 @@ from tqdm import tqdm
 from .encoder import CLIPVisionEncoder, compute_perceptual_discrepancy
 from .encoding import decode_for_clip
 from .cache import stack_added_cond
-from .model import DEVICE
+from .model import DEVICE, X0_CLAMP
+from .scheduler import pyramid_noise
 
 _CLIP_MODEL = "openai/clip-vit-base-patch32"
-
-X0_CLAMP = 4.0
 
 
 def _ddpm_posterior(
@@ -224,9 +223,10 @@ def rl_segment(
         t_start = timesteps[t_start_idx].unsqueeze(0).expand(rollout_batch).to(DEVICE)
 
         with torch.no_grad():
-            noisy_start = scheduler.add_noise(
-                ref_repeated, torch.randn_like(ref_repeated), t_start
+            start_noise = pyramid_noise(
+                ref_repeated, levels=cfg.noise_lf_levels, decay=cfg.noise_lf_decay
             )
+            noisy_start = scheduler.add_noise(ref_repeated, start_noise, t_start)
 
         if 0 < subsample < len(eligible):
             grad_indices = set(random.sample(eligible, subsample))

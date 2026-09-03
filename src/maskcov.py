@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from .config import default_output_dir
 from .model import load_model, DEVICE, SEGMENT_TIMESTEP_RANGES
-from .dataset import get_samples, prepare_sample
+from .dataset import get_samples, prepared_samples
 from .encoding import encode_prompt, subset_caption, CHUNK_TOKENS, MAX_CHUNKS
 from .encoder import compute_perceptual_discrepancy, SubjectMaskBuilder
 from .encoder import CrossAttentionCapture
@@ -23,9 +23,10 @@ CONDITIONS = ["full", "subset", "shuffled"]
 
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cache_size", type=int, default=256)
-    parser.add_argument("--batches", type=int, default=32)
-    parser.add_argument("--mini_batch_size", type=int, default=2)
+    parser.add_argument("--cache_size", type=int, default=1024)
+    parser.add_argument("--batches", type=int, default=48)
+    parser.add_argument("--mini_batch_size", type=int, default=8)
+    parser.add_argument("--cache_workers", type=int, default=6)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--subset_min", type=float, default=0.15)
     parser.add_argument("--mask_blur_sigma_start", type=float, default=7.0)
@@ -66,16 +67,22 @@ def build_probe_cache(args, vae, text_encoders, tokenizers) -> list:
     content_cache: dict = {}
     cached = []
 
-    stream = get_samples(args.cache_size, seed=args.seed)
-    for sample in tqdm(stream, desc="Caching", total=args.cache_size):
-        image, prompt, bucket, time_ids = prepare_sample(sample, DEVICE)
+    stream = prepared_samples(
+        get_samples(args.cache_size, seed=args.seed), args.cache_workers
+    )
+    for image, prompt, bucket, time_ids in tqdm(
+        stream, desc="Caching", total=args.cache_size
+    ):
         if image is None or prompt is None:
             continue
 
         subset = subset_caption(prompt, rng, args.subset_min)
 
         with torch.no_grad():
-            latents = vae.encode(image).latent_dist.sample() * vae.config.scaling_factor
+            latents = (
+                vae.encode(image.to(DEVICE)).latent_dist.sample()
+                * vae.config.scaling_factor
+            )
             full_emb, full_pooled, full_content = encode_prompt(
                 prompt, text_encoders, tokenizers, DEVICE, content_cache
             )

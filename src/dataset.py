@@ -1,4 +1,6 @@
 import itertools
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from torchvision import transforms
@@ -7,7 +9,8 @@ from PIL import Image
 from datasets import load_dataset
 
 DATASET_ID = "none-yet/processed-anime"
-SHUFFLE_BUFFER = 1000
+SHUFFLE_BUFFER = 1024
+CACHE_WORKERS = 6
 
 BUCKETS = [
     (1024, 1024),
@@ -99,3 +102,22 @@ def prepare_sample(sample, device):
     tensor = _NORMALIZE(image).unsqueeze(0).to(device, dtype=torch.float16)
     time_ids = build_time_ids(original_size, (top, left), (bucket_h, bucket_w))
     return tensor, prompt, bucket, time_ids
+
+
+def prepared_samples(samples, workers: int = CACHE_WORKERS):
+    if workers <= 1:
+        for sample in samples:
+            yield prepare_sample(sample, "cpu")
+        return
+
+    iterator = iter(samples)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = deque(
+            pool.submit(prepare_sample, sample, "cpu")
+            for sample in itertools.islice(iterator, workers * 2)
+        )
+        for sample in iterator:
+            yield pending.popleft().result()
+            pending.append(pool.submit(prepare_sample, sample, "cpu"))
+        while pending:
+            yield pending.popleft().result()
