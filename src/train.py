@@ -1,5 +1,4 @@
 import argparse
-import copy
 import gc
 import random
 
@@ -12,6 +11,7 @@ from peft import get_peft_model
 from .config import get_config
 from .model import (
     load_model,
+    load_unet,
     get_lora_config,
     DEVICE,
     NUM_INFERENCE_STEPS,
@@ -25,7 +25,7 @@ from .encoder import (
     SubjectMaskBuilder,
     CrossAttentionCapture,
 )
-from .encoding import encode_prompt, rms_scaled_noise
+from .encoding import encode_prompt, rms_scaled_noise, HIDDEN_SPLIT
 from .scheduler import (
     SpatiallyVaryingDDPMScheduler,
     compute_spatial_noise_scale,
@@ -36,6 +36,7 @@ from .cache import (
     build_cache,
     blend_alpha,
     blend_masks,
+    stack_added_cond,
     BucketSampler,
 )
 from .rl import rl_segment
@@ -60,13 +61,15 @@ def _make_inputs_require_grad(module, input, output):  # noqa: ARG001
 
 def apply_conditioning_augmentation(
     text_emb: torch.Tensor,
+    pooled: torch.Tensor,
     token_content: torch.Tensor,
     empty_emb: torch.Tensor,
+    empty_pooled: torch.Tensor,
     cfg: argparse.Namespace,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch = text_emb.shape[0]
     if cfg.cond_dropout_prob <= 0.0 and cfg.cond_partial_prob <= 0.0:
-        return text_emb, token_content
+        return text_emb, pooled, token_content
 
     roll = torch.rand(batch, device=text_emb.device)
     drop = roll < cfg.cond_dropout_prob
@@ -75,7 +78,7 @@ def apply_conditioning_augmentation(
     )
 
     if not bool((drop | partial).any()):
-        return text_emb, token_content
+        return text_emb, pooled, token_content
 
     scale = torch.ones(batch, device=text_emb.device)
     scale = torch.where(drop, torch.zeros_like(scale), scale)
@@ -88,26 +91,31 @@ def apply_conditioning_augmentation(
     empty = empty_emb.expand(batch, -1, -1).to(text_emb.dtype)
     blended = torch.lerp(empty.float(), text_emb.float(), scale.view(-1, 1, 1))
 
-    return blended.to(text_emb.dtype), token_content * scale.view(-1, 1)
+    empty_p = empty_pooled.expand(batch, -1).to(pooled.dtype)
+    blended_pooled = torch.lerp(empty_p.float(), pooled.float(), scale.view(-1, 1))
+
+    return (
+        blended.to(text_emb.dtype),
+        blended_pooled.to(pooled.dtype),
+        token_content * scale.view(-1, 1),
+    )
 
 
 def train_segment(
     segment_name,
-    base_unet,
     scheduler,
     mask_builder,
     sampler,
     empty_emb,
+    empty_pooled,
     cfg: argparse.Namespace,
 ):
     print(f"\nTraining segment: {segment_name}")
     t_low, t_high = SEGMENT_TIMESTEP_RANGES[segment_name]
 
-    base_unet.to(DEVICE)
-    unet = get_peft_model(
-        copy.deepcopy(base_unet), get_lora_config(cfg.lora_rank, cfg.lora_alpha)
-    )
-    base_unet.to("cpu")
+    # pyrefly: ignore [bad-argument-type]
+    unet = get_peft_model(load_unet(), get_lora_config(cfg.lora_rank, cfg.lora_alpha))
+    unet.to(DEVICE)
     torch.cuda.empty_cache()
 
     unet.base_model.model.conv_in.register_forward_hook(_make_inputs_require_grad)
@@ -137,18 +145,23 @@ def train_segment(
             token_content = torch.cat([x["token_content_mask"] for x in items]).to(
                 DEVICE
             )
+            pooled, time_ids = stack_added_cond(items, DEVICE)
 
             batch = latents.shape[0]
             spatial_size = (latents.shape[2], latents.shape[3])
 
-            text_emb, token_content = apply_conditioning_augmentation(
-                text_emb, token_content, empty_emb, cfg
+            text_emb, pooled, token_content = apply_conditioning_augmentation(
+                text_emb, pooled, token_content, empty_emb, empty_pooled, cfg
             )
 
             if cfg.embed_jitter_max > 0.0:
+                jitter = random.uniform(0.0, cfg.embed_jitter_max)
                 text_emb = text_emb + rms_scaled_noise(
-                    text_emb, random.uniform(0.0, cfg.embed_jitter_max)
+                    text_emb, jitter, split=HIDDEN_SPLIT
                 )
+                pooled = pooled + rms_scaled_noise(pooled, jitter)
+
+            added_cond_kwargs = {"text_embeds": pooled, "time_ids": time_ids}
 
             noise = pyramid_noise(
                 latents, levels=cfg.noise_lf_levels, decay=cfg.noise_lf_decay
@@ -167,6 +180,7 @@ def train_segment(
                             uniform_noisy.to(dtype=torch.float16),
                             t,
                             encoder_hidden_states=text_emb,
+                            added_cond_kwargs=added_cond_kwargs,
                         ).sample.float()
 
                     attn_mask = capture.build_mask(spatial_size)
@@ -202,6 +216,7 @@ def train_segment(
                 t,
                 text_emb,
                 noise,
+                added_cond_kwargs=added_cond_kwargs,
                 noise_scale=noise_scale,
                 mask=mask,
                 bg_weight=cfg.loss_bg_weight,
@@ -234,15 +249,18 @@ def train_segment(
     return unet
 
 
-def build_sampler(vae, text_encoder, tokenizer, min_size, seed, cfg):
-    text_encoder.to(DEVICE)
+def build_sampler(
+    vae, text_encoders, tokenizers, min_size, seed, cfg, zero_uncond=True
+):
+    for encoder in text_encoders:
+        encoder.to(DEVICE)
 
     print(f"Building latent cache (seed={seed})...")
     cached = build_cache(
         get_samples(cfg.cache_size, seed=seed, shuffle_buffer=cfg.shuffle_buffer),
         vae,
-        text_encoder,
-        tokenizer,
+        text_encoders,
+        tokenizers,
         DEVICE,
         total=cfg.cache_size,
         subset_prob=cfg.caption_subset_prob,
@@ -250,10 +268,16 @@ def build_sampler(vae, text_encoder, tokenizer, min_size, seed, cfg):
         seed=seed,
     )
 
-    empty_emb, _ = encode_prompt("", text_encoder, tokenizer, DEVICE)
+    empty_emb, empty_pooled, _ = encode_prompt("", text_encoders, tokenizers, DEVICE)
     empty_emb = empty_emb.detach().to(dtype=torch.float16)
+    empty_pooled = empty_pooled.detach().to(dtype=torch.float16)
 
-    text_encoder.to("cpu")
+    if zero_uncond:
+        empty_emb = torch.zeros_like(empty_emb)
+        empty_pooled = torch.zeros_like(empty_pooled)
+
+    for encoder in text_encoders:
+        encoder.to("cpu")
     torch.cuda.empty_cache()
 
     sampler = BucketSampler(cached, min_size)
@@ -268,9 +292,9 @@ def build_sampler(vae, text_encoder, tokenizer, min_size, seed, cfg):
         f"across {len(sampler.buckets)} buckets:"
     )
     for bucket, idxs in sorted(sampler.groups.items(), key=lambda kv: -len(kv[1])):
-        print(f"  {bucket[0]:>3}x{bucket[1]:<3}  {len(idxs)}")
+        print(f"  {bucket[0]:>4}x{bucket[1]:<4}  {len(idxs)}")
 
-    return sampler, empty_emb
+    return sampler, empty_emb, empty_pooled
 
 
 def train(cfg: argparse.Namespace):
@@ -294,15 +318,8 @@ def train(cfg: argparse.Namespace):
 
     models = load_model()
     vae = models["vae"]
-    text_encoder = models["text_encoder"]
-    tokenizer = models["tokenizer"]
-
-    # pyrefly: ignore [missing-attribute]
-    base_unet = models["pipe"].unet.eval()
-    for param in base_unet.parameters():
-        param.requires_grad_(False)
-    base_unet.to("cpu")
-    torch.cuda.empty_cache()
+    text_encoders = models["text_encoders"]
+    tokenizers = models["tokenizers"]
 
     scheduler = SpatiallyVaryingDDPMScheduler.from_config(
         # pyrefly: ignore [missing-attribute]
@@ -310,6 +327,19 @@ def train(cfg: argparse.Namespace):
     )
     scheduler.set_timesteps(NUM_INFERENCE_STEPS)
     timesteps = scheduler.timesteps.to(DEVICE)
+
+    needs_base = cfg.rl_steps > 0 and cfg.rl_grounding_weight > 0.0
+    base_unet = None
+    if needs_base:
+        # pyrefly: ignore [missing-attribute]
+        base_unet = models["pipe"].unet.eval()
+        for param in base_unet.parameters():
+            param.requires_grad_(False)
+        base_unet.to("cpu")
+    else:
+        # pyrefly: ignore [missing-attribute]
+        models["pipe"].unet = None
+    torch.cuda.empty_cache()
 
     mask_builder = SubjectMaskBuilder(
         blur_sigma_start=cfg.mask_blur_sigma_start,
@@ -322,24 +352,32 @@ def train(cfg: argparse.Namespace):
     if cfg.rl_steps > 0:
         min_size = max(min_size, cfg.rl_refs)
 
-    sampler, empty_emb = build_sampler(vae, text_encoder, tokenizer, min_size, 0, cfg)
+    sampler, empty_emb, empty_pooled = build_sampler(
+        vae, text_encoders, tokenizers, min_size, 0, cfg, models["zero_uncond"]
+    )
 
     for index, segment_name in enumerate(SEGMENTS):
         if index > 0 and cfg.refresh_cache_per_segment:
             sampler = None
             gc.collect()
             torch.cuda.empty_cache()
-            sampler, empty_emb = build_sampler(
-                vae, text_encoder, tokenizer, min_size, index, cfg
+            sampler, empty_emb, empty_pooled = build_sampler(
+                vae,
+                text_encoders,
+                tokenizers,
+                min_size,
+                index,
+                cfg,
+                models["zero_uncond"],
             )
 
         unet = train_segment(
             segment_name=segment_name,
-            base_unet=base_unet,
             scheduler=scheduler,
             mask_builder=mask_builder,
             sampler=sampler,
             empty_emb=empty_emb,
+            empty_pooled=empty_pooled,
             cfg=cfg,
         )
 

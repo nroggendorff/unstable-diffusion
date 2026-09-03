@@ -9,6 +9,9 @@ CHUNK_TOKENS = 75
 MAX_CHUNKS = 2
 SEQUENCE_LENGTH = MAX_CHUNKS * (CHUNK_TOKENS + 2)
 
+HIDDEN_SPLIT = 768
+POOLED_DIM = 1280
+
 _CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 _CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
@@ -147,15 +150,32 @@ def clip_normalization(device, dtype=torch.float32):
     return mean, std
 
 
-def rms_scaled_noise(reference: torch.Tensor, sigma: float, generator=None):
+def rms_scaled_noise(
+    reference: torch.Tensor,
+    sigma: float,
+    generator=None,
+    split: int | None = None,
+):
     noise = torch.randn(
         reference.shape,
         generator=generator,
         device=reference.device,
         dtype=torch.float32,
     )
-    rms = reference[0].float().norm() / (reference[0].numel() ** 0.5)
-    return (noise * sigma * rms).to(reference.dtype)
+    ref = reference[0].float()
+
+    def block_rms(block: torch.Tensor) -> float:
+        return block.norm().item() / (block.numel() ** 0.5)
+
+    if split is None or not 0 < split < reference.shape[-1]:
+        return (noise * sigma * block_rms(ref)).to(reference.dtype)
+
+    scale = torch.empty(
+        reference.shape[-1], device=reference.device, dtype=torch.float32
+    )
+    scale[:split] = block_rms(ref[..., :split])
+    scale[split:] = block_rms(ref[..., split:])
+    return (noise * sigma * scale).to(reference.dtype)
 
 
 def _token_text(tokenizer, token_id: int) -> str:
@@ -176,21 +196,28 @@ def _is_content(tokenizer, token_id: int, cache: dict) -> bool:
     return cache[token_id]
 
 
-def encode_prompt(prompts, text_encoder, tokenizer, device, content_cache=None):
+def _as_list(value) -> list:
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def encode_prompt(prompts, text_encoders, tokenizers, device, content_cache=None):
     if isinstance(prompts, str):
         prompts = [prompts]
     if content_cache is None:
         content_cache = {}
 
-    bos = tokenizer.bos_token_id
-    eos = tokenizer.eos_token_id
-    pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
+    text_encoders = _as_list(text_encoders)
+    tokenizers = _as_list(tokenizers)
 
-    batch_ids = []
+    primary = tokenizers[0]
+    bos = primary.bos_token_id
+    eos = primary.eos_token_id
+
+    windows = []
     batch_content = []
 
     for prompt in prompts:
-        ids = tokenizer(
+        ids = primary(
             prompt,
             add_special_tokens=False,
             truncation=True,
@@ -199,26 +226,41 @@ def encode_prompt(prompts, text_encoder, tokenizer, device, content_cache=None):
 
         for chunk in range(MAX_CHUNKS):
             window = ids[chunk * CHUNK_TOKENS : (chunk + 1) * CHUNK_TOKENS]
-            padding = [pad] * (CHUNK_TOKENS - len(window))
-
-            batch_ids.append([bos] + window + padding + [eos])
+            windows.append(window)
             batch_content.append(
                 [0]
-                + [int(_is_content(tokenizer, t, content_cache)) for t in window]
-                + [0] * len(padding)
+                + [int(_is_content(primary, t, content_cache)) for t in window]
+                + [0] * (CHUNK_TOKENS - len(window))
                 + [0]
             )
 
-    input_ids = torch.tensor(batch_ids, dtype=torch.long, device=device)
-    hidden = text_encoder(input_ids=input_ids).last_hidden_state
+    hidden = []
+    pooled = None
+
+    for encoder, tokenizer in zip(text_encoders, tokenizers):
+        pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
+        input_ids = torch.tensor(
+            [[bos] + w + [pad] * (CHUNK_TOKENS - len(w)) + [eos] for w in windows],
+            dtype=torch.long,
+            device=device,
+        )
+        output = encoder(input_ids=input_ids, output_hidden_states=True)
+        hidden.append(output.hidden_states[-2])
+        if getattr(output, "text_embeds", None) is not None:
+            pooled = output.text_embeds
 
     batch = len(prompts)
-    embeddings = hidden.reshape(batch, SEQUENCE_LENGTH, hidden.shape[-1])
+    embeddings = torch.cat(hidden, dim=-1).reshape(batch, SEQUENCE_LENGTH, -1)
     content = torch.tensor(batch_content, dtype=torch.float32, device=device).reshape(
         batch, SEQUENCE_LENGTH
     )
 
-    return embeddings, content
+    if pooled is None:
+        pooled = embeddings.new_zeros((batch, POOLED_DIM))
+    else:
+        pooled = pooled.reshape(batch, MAX_CHUNKS, -1)[:, 0]
+
+    return embeddings, pooled, content
 
 
 def decode_for_clip(

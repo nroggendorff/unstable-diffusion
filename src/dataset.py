@@ -10,15 +10,15 @@ DATASET_ID = "none-yet/processed-anime"
 SHUFFLE_BUFFER = 1000
 
 BUCKETS = [
-    (512, 512),
-    (512, 448),
-    (448, 512),
-    (512, 384),
-    (384, 512),
-    (512, 320),
-    (320, 512),
-    (512, 256),
-    (256, 512),
+    (1024, 1024),
+    (1152, 896),
+    (896, 1152),
+    (1216, 832),
+    (832, 1216),
+    (1344, 768),
+    (768, 1344),
+    (1536, 640),
+    (640, 1536),
 ]
 
 _NORMALIZE = transforms.Compose(
@@ -64,14 +64,30 @@ def get_samples(n=100, seed=0, shuffle_buffer=SHUFFLE_BUFFER):
             close()
 
 
+def build_time_ids(
+    original_size: tuple[int, int],
+    crop_top_left: tuple[int, int],
+    target_size: tuple[int, int],
+) -> tuple[float, ...]:
+    return (
+        float(original_size[0]),
+        float(original_size[1]),
+        float(crop_top_left[0]),
+        float(crop_top_left[1]),
+        float(target_size[0]),
+        float(target_size[1]),
+    )
+
+
 def prepare_sample(sample, device):
     image = sample.get("image", None)
     prompt = sample.get("text", "anime")
 
     if image is None or not isinstance(image, Image.Image):
-        return None, None, None
+        return None, None, None, None
 
     image = image.convert("RGB")
+    original_size = (image.height, image.width)
     bucket = assign_bucket(*image.size)
 
     image = _cover_resize(image, bucket)
@@ -81,4 +97,5 @@ def prepare_sample(sample, device):
     image = image.crop((left, top, left + bucket_w, top + bucket_h))
 
     tensor = _NORMALIZE(image).unsqueeze(0).to(device, dtype=torch.float16)
-    return tensor, prompt, bucket
+    time_ids = build_time_ids(original_size, (top, left), (bucket_h, bucket_w))
+    return tensor, prompt, bucket, time_ids

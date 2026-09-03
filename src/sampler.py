@@ -3,7 +3,7 @@ import contextlib
 import torch
 import torch.nn.functional as F
 
-from .encoding import rms_scaled_noise
+from .encoding import rms_scaled_noise, HIDDEN_SPLIT
 from .model import EARLY_SEG, MID_SEG, NUM_INFERENCE_STEPS
 
 ALL_SEGMENTS = ["early", "mid", "late"]
@@ -12,8 +12,8 @@ _BOUNDARIES = [EARLY_SEG, EARLY_SEG + MID_SEG]
 _BLEND_HALF = 2
 _MAX_RAW_GUIDANCE = 30.0
 
-LATENT_LF_LEVELS = 6
-LATENT_LF_DECAY = 0.6
+LATENT_LF_LEVELS = 8
+LATENT_LF_DECAY = 0.66
 
 
 def pyramid_latents(
@@ -126,13 +126,15 @@ def lie_about_noise(pipe, offset: float, gamma: float):
 def anchor_generate(
     pipe,
     positive: torch.Tensor,
+    positive_pooled: torch.Tensor,
     negative: torch.Tensor,
+    negative_pooled: torch.Tensor,
     seeds: list[int],
     use_lora: bool = True,
     strength: float = 0.8,
     guidance: float = 7.0,
-    width: int = 384,
-    height: int = 512,
+    width: int = 832,
+    height: int = 1216,
     num_inference_steps: int = NUM_INFERENCE_STEPS,
     alpha: float = 0.4,
     sigma: float = 0.2,
@@ -147,6 +149,8 @@ def anchor_generate(
 
     positive = positive.expand(batch, -1, -1)
     negative = negative.expand(batch, -1, -1)
+    positive_pooled = positive_pooled.expand(batch, -1)
+    negative_pooled = negative_pooled.expand(batch, -1)
 
     def raw_guidance(step_index):
         if alpha == 0.0 or progress(step_index, num_inference_steps) <= cutover:
@@ -159,19 +163,24 @@ def anchor_generate(
     else:
         pipe.disable_lora()
 
-    embed_noise = rms_scaled_noise(
-        positive,
-        sigma,
-        torch.Generator(device=positive.device).manual_seed(seeds[0] ^ 0x5EED),
+    jitter_generator = torch.Generator(device=positive.device).manual_seed(
+        seeds[0] ^ 0x5EED
     )
+    embed_noise = rms_scaled_noise(
+        positive, sigma, jitter_generator, split=HIDDEN_SPLIT
+    )
+    pooled_noise = rms_scaled_noise(positive_pooled, sigma, jitter_generator)
 
     def anchor_at(step_index):
-        if progress(step_index, num_inference_steps) <= cutover:
-            return negative
+        step_progress = progress(step_index, num_inference_steps)
+        if step_progress <= cutover:
+            return negative, negative_pooled
+
         anchor = torch.lerp(negative, positive, alpha)
-        if progress(step_index, num_inference_steps) > sigma_cutover:
-            return anchor + embed_noise
-        return anchor
+        anchor_pooled = torch.lerp(negative_pooled, positive_pooled, alpha)
+        if step_progress > sigma_cutover:
+            return anchor + embed_noise, anchor_pooled + pooled_noise
+        return anchor, anchor_pooled
 
     def callback(p, step_index, timestep, callback_kwargs):  # noqa: ARG001
         if use_lora:
@@ -182,8 +191,9 @@ def anchor_generate(
 
         p._guidance_scale = raw_guidance(min(step_index + 1, last_step))
 
-        anchor = anchor_at(min(step_index + 1, last_step))
+        anchor, anchor_pooled = anchor_at(min(step_index + 1, last_step))
         callback_kwargs["prompt_embeds"] = torch.cat([anchor, positive])
+        callback_kwargs["add_text_embeds"] = torch.cat([anchor_pooled, positive_pooled])
         return callback_kwargs
 
     generators = [torch.Generator(device="cuda").manual_seed(s) for s in seeds]
@@ -196,11 +206,15 @@ def anchor_generate(
         lf=latent_lf,
     )
 
+    start_anchor, start_anchor_pooled = anchor_at(0)
+
     try:
         with lie_about_noise(pipe, offset, gamma):
             result = pipe(
                 prompt_embeds=positive,
-                negative_prompt_embeds=anchor_at(0),
+                pooled_prompt_embeds=positive_pooled,
+                negative_prompt_embeds=start_anchor,
+                negative_pooled_prompt_embeds=start_anchor_pooled,
                 width=width,
                 height=height,
                 num_inference_steps=num_inference_steps,
@@ -208,7 +222,11 @@ def anchor_generate(
                 generator=generators,
                 latents=latents,
                 callback_on_step_end=callback,
-                callback_on_step_end_tensor_inputs=["latents", "prompt_embeds"],
+                callback_on_step_end_tensor_inputs=[
+                    "latents",
+                    "prompt_embeds",
+                    "add_text_embeds",
+                ],
             )
         return result.images
     finally:

@@ -56,8 +56,8 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--guidance", type=float, default=7.0)
     parser.add_argument("--basin_guidance", type=float, default=1.5)
     parser.add_argument("--strength", type=float, default=0.8)
-    parser.add_argument("--width", type=int, default=384)
-    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--width", type=int, default=832)
+    parser.add_argument("--height", type=int, default=1216)
     parser.add_argument("--alpha", type=float, default=0.4)
     parser.add_argument("--sigma", type=float, default=0.2)
     parser.add_argument("--cutover", type=float, default=0.8)
@@ -149,15 +149,23 @@ def main():
     clip = CLIPModel.from_pretrained(CLIP_ID).to(device).eval()
     processor = CLIPProcessor.from_pretrained(CLIP_ID)
 
+    encoders = [pipe.text_encoder, pipe.text_encoder_2]
+    tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
+
+    negative, negative_pooled, _ = encode_prompt(
+        NEGATIVE_PROMPT, encoders, tokenizers, device
+    )
+
     encoded = {}
     for prompt in prompts:
-        positive, _ = encode_prompt(prompt, pipe.text_encoder, pipe.tokenizer, device)
-        negative, _ = encode_prompt(
-            NEGATIVE_PROMPT, pipe.text_encoder, pipe.tokenizer, device
+        positive, positive_pooled, _ = encode_prompt(
+            prompt, encoders, tokenizers, device
         )
         encoded[prompt] = (
             positive.to(dtype=torch.float16),
+            positive_pooled.to(dtype=torch.float16),
             negative.to(dtype=torch.float16),
+            negative_pooled.to(dtype=torch.float16),
         )
 
     shared = dict(
@@ -172,11 +180,13 @@ def main():
     print(f"Basin pass ({args.basin_seeds} seeds x {len(prompts)} prompts)...")
     basin_features = []
     for index, prompt in enumerate(tqdm(prompts, desc="basin")):
-        positive, negative = encoded[prompt]
+        positive, positive_pooled, negative, negative_pooled = encoded[prompt]
         images = anchor_generate(
             pipe,
             positive,
+            positive_pooled,
             negative,
+            negative_pooled,
             seeds=[args.seed_base + index * 100 + s for s in range(args.basin_seeds)],
             use_lora=False,
             guidance=args.basin_guidance,
@@ -202,11 +212,13 @@ def main():
         per_prompt = []
 
         for index, prompt in enumerate(tqdm(prompts, desc=label)):
-            positive, negative = encoded[prompt]
+            positive, positive_pooled, negative, negative_pooled = encoded[prompt]
             images = anchor_generate(
                 pipe,
                 positive,
+                positive_pooled,
                 negative,
+                negative_pooled,
                 seeds=[args.seed_base + index * 100 + s for s in range(args.seeds)],
                 use_lora=use_lora,
                 guidance=args.guidance,

@@ -12,7 +12,7 @@ from .cache import BucketSampler, build_cache
 from .config import default_output_dir
 from .dataset import get_samples
 from .encoder import CLIPVisionEncoder, compute_perceptual_discrepancy
-from .encoding import decode_for_clip, encode_prompt
+from .encoding import decode_for_clip, encode_prompt, rms_scaled_noise, HIDDEN_SPLIT
 from .eval import NEGATIVE_PROMPT
 from .inference import ADAPTER_BASE_PATH, load_pipe
 from .model import DEVICE, NUM_INFERENCE_STEPS
@@ -67,8 +67,20 @@ def save_chain_lora(unet, path: str, segment: str) -> int:
     return len(out)
 
 
-def _unet_eps(pipe, x, timestep, embeds, sigma, guidance, weights, use_lora, use_ckpt):
-    def run(sample, prompt_embeds):
+def _unet_eps(
+    pipe,
+    x,
+    timestep,
+    embeds,
+    pooled,
+    time_ids,
+    sigma,
+    guidance,
+    weights,
+    use_lora,
+    use_ckpt,
+):
+    def run(sample, prompt_embeds, add_text_embeds):
         if use_lora:
             pipe.enable_lora()
             pipe.set_adapters(ALL_SEGMENTS, weights)
@@ -81,14 +93,20 @@ def _unet_eps(pipe, x, timestep, embeds, sigma, guidance, weights, use_lora, use
                 model_in.to(dtype=torch.float16),
                 timestep,
                 encoder_hidden_states=prompt_embeds,
+                added_cond_kwargs={
+                    "text_embeds": add_text_embeds,
+                    "time_ids": time_ids,
+                },
             ).sample
 
         uncond, cond = out.float().chunk(2)
         return uncond + guidance * (cond - uncond)
 
     if use_ckpt:
-        return torch.utils.checkpoint.checkpoint(run, x, embeds, use_reentrant=False)
-    return run(x, embeds)
+        return torch.utils.checkpoint.checkpoint(
+            run, x, embeds, pooled, use_reentrant=False
+        )
+    return run(x, embeds, pooled)
 
 
 def rollout_chain(
@@ -98,6 +116,8 @@ def rollout_chain(
     timesteps: torch.Tensor,
     latents: torch.Tensor,
     positive: torch.Tensor,
+    positive_pooled: torch.Tensor,
+    time_ids: torch.Tensor,
     anchor_at,
     raw_guidance,
     strength: float,
@@ -112,7 +132,9 @@ def rollout_chain(
     for index in range(steps):
         needs_grad = use_lora and index in grad_steps
         weights = [0.0, 0.0, 0.0] if index == last else adapter_weights(index, strength)
-        embeds = torch.cat([anchor_at(index), positive])
+        anchor, anchor_pooled = anchor_at(index)
+        embeds = torch.cat([anchor, positive])
+        pooled = torch.cat([anchor_pooled, positive_pooled])
 
         sigma = sigmas[index].item()
         delta = (sigmas[index + 1] - sigmas[index]).item()
@@ -124,6 +146,8 @@ def rollout_chain(
                 x_in,
                 timesteps[index],
                 embeds,
+                pooled,
+                time_ids,
                 sigma,
                 raw_guidance(index),
                 weights,
@@ -232,19 +256,23 @@ def main():
     steps = timesteps.shape[0]
 
     print("Building latent cache...")
+    encoders = [pipe.text_encoder, pipe.text_encoder_2]
+    tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
+
     cached = build_cache(
         get_samples(args.cache_size, seed=args.cache_seed),
         vae,
-        pipe.text_encoder,
-        pipe.tokenizer,
+        encoders,
+        tokenizers,
         DEVICE,
         total=args.cache_size,
     )
 
-    negative, _ = encode_prompt(
-        NEGATIVE_PROMPT, pipe.text_encoder, pipe.tokenizer, DEVICE
+    negative, negative_pooled, _ = encode_prompt(
+        NEGATIVE_PROMPT, encoders, tokenizers, DEVICE
     )
     negative = negative.detach().to(dtype=torch.float16)
+    negative_pooled = negative_pooled.detach().to(dtype=torch.float16)
 
     sampler = BucketSampler(cached, args.refs)
     if not sampler:
@@ -265,7 +293,19 @@ def main():
         positive = torch.cat([x["text_emb"] for x in items]).to(
             DEVICE, dtype=torch.float16
         )
+        positive_pooled = torch.cat([x["pooled"] for x in items]).to(
+            DEVICE, dtype=torch.float16
+        )
         batch = ref_latents.shape[0]
+
+        scale = pipe.vae_scale_factor
+        gen_h = ref_latents.shape[2] * scale
+        gen_w = ref_latents.shape[3] * scale
+        time_ids = torch.tensor(
+            [[gen_h, gen_w, 0, 0, gen_h, gen_w]] * (2 * batch),
+            device=DEVICE,
+            dtype=torch.float16,
+        )
 
         with torch.no_grad():
             ref_feats = [
@@ -276,17 +316,27 @@ def main():
             ]
 
         neg_batch = negative.expand(batch, -1, -1)
+        neg_pooled_batch = negative_pooled.expand(batch, -1)
         anchor_base = torch.lerp(neg_batch.float(), positive.float(), args.alpha).to(
             torch.float16
         )
-
-        rms = positive[0].float().norm() / (positive[0].numel() ** 0.5)
-        anchor_jittered = (
-            anchor_base.float()
-            + torch.randn_like(anchor_base.float()) * args.sigma * rms
+        anchor_pooled_base = torch.lerp(
+            neg_pooled_batch.float(), positive_pooled.float(), args.alpha
         ).to(torch.float16)
 
-        def anchor_at(index, _n=neg_batch, _a=anchor_base, _j=anchor_jittered):
+        anchor_jittered = (
+            anchor_base + rms_scaled_noise(positive, args.sigma, split=HIDDEN_SPLIT)
+        ).to(torch.float16)
+        anchor_pooled_jittered = (
+            anchor_pooled_base + rms_scaled_noise(positive_pooled, args.sigma)
+        ).to(torch.float16)
+
+        def anchor_at(
+            index,
+            _n=(neg_batch, neg_pooled_batch),
+            _a=(anchor_base, anchor_pooled_base),
+            _j=(anchor_jittered, anchor_pooled_jittered),
+        ):
             if progress(index, steps) <= args.cutover:
                 return _n
             if progress(index, steps) > args.sigma_cutover:
@@ -329,6 +379,8 @@ def main():
             timesteps,
             latents,
             positive,
+            positive_pooled,
+            time_ids,
             anchor_at,
             raw_guidance,
             args.strength,
@@ -347,6 +399,8 @@ def main():
                     timesteps,
                     latents,
                     positive,
+                    positive_pooled,
+                    time_ids,
                     anchor_at,
                     raw_guidance,
                     args.strength,

@@ -1,19 +1,16 @@
-FROM public.ecr.aws/deep-learning-containers/pytorch-training:2.10.0-gpu-py313-cu130-ubuntu22.04-sagemaker
+FROM pytorch/pytorch:2.14.0-cuda13.0-cudnn9-runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 \
-    python3.11-dev \
-    python3-pip \
-    build-essential \
-    libsndfile1 \
-    lilypond \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir \
+    "diffusers>=0.40" \
+    peft \
+    bitsandbytes \
+    tqdm \
+    pillow \
+    datasets \
+    transformers \
+    safetensors
 
 WORKDIR /app/
-
-COPY requirements.txt .
-RUN pip install -r requirements.txt
 
 COPY src /app/src/
 

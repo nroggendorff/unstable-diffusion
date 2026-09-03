@@ -1,21 +1,10 @@
 import argparse
-import json
-import os
 
-_SM_HP_PATH = "/opt/ml/input/config/hyperparameters.json"
-_SM_MODEL_DIR = "/opt/ml/model"
-_LOCAL_MODEL_DIR = "./creative-lora"
-
-
-def _sm_defaults() -> dict:
-    if not os.path.exists(_SM_HP_PATH):
-        return {}
-    with open(_SM_HP_PATH) as f:
-        return json.load(f)
+_DEFAULT_OUTPUT_DIR = "./creative-lora"
 
 
 def default_output_dir() -> str:
-    return _SM_MODEL_DIR if os.path.isdir(_SM_MODEL_DIR) else _LOCAL_MODEL_DIR
+    return _DEFAULT_OUTPUT_DIR
 
 
 def _bool(value) -> bool:
@@ -25,21 +14,16 @@ def _bool(value) -> bool:
 
 
 def get_config() -> argparse.Namespace:
-    sm = _sm_defaults()
-
     parser = argparse.ArgumentParser()
 
     def add(name: str, type_, default):
-        val = sm.get(name)
-        parser.add_argument(
-            f"--{name}", type=type_, default=type_(val) if val is not None else default
-        )
+        parser.add_argument(f"--{name}", type=type_, default=default)
 
     add("steps", int, 15000)
     add("mini_batch_size", int, 2)
     add("grad_accum_steps", int, 4)
     add("cache_size", int, 4000)
-    add("shuffle_buffer", int, 1000)
+    add("shuffle_buffer", int, 768)
     add("lr", float, 1e-4)
     add("lora_rank", int, 32)
     add("lora_alpha", int, 32)
@@ -52,8 +36,8 @@ def get_config() -> argparse.Namespace:
 
     add("noise_bg_boost", float, 1.5)
     add("noise_t_ramp", float, 0.3)
-    add("noise_lf_levels", int, 6)
-    add("noise_lf_decay", float, 0.6)
+    add("noise_lf_levels", int, 8)
+    add("noise_lf_decay", float, 0.66)
 
     add("loss_bg_weight", float, 0.25)
     add("snr_gamma", float, 5.0)
@@ -67,20 +51,14 @@ def get_config() -> argparse.Namespace:
 
     add("refresh_cache_per_segment", _bool, True)
 
-    add("rl_steps", int, 300)
+    add("rl_steps", int, 0)
     add("rl_lr", float, 3e-6)
     add("rl_grounding_weight", float, 0.0)
     add("rl_refs", int, 1)
     add("rl_group", int, 2)
     add("rl_logprob_subsample", int, 1)
 
-    sm_default_output = default_output_dir()
-    sm_output_val = sm.get("output_dir")
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=sm_output_val if sm_output_val is not None else sm_default_output,
-    )
+    parser.add_argument("--output_dir", type=str, default=default_output_dir())
 
     cfg = parser.parse_args()
 

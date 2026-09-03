@@ -6,6 +6,7 @@ from tqdm import tqdm
 
 from .encoder import CLIPVisionEncoder, compute_perceptual_discrepancy
 from .encoding import decode_for_clip
+from .cache import stack_added_cond
 from .model import DEVICE
 
 _CLIP_MODEL = "openai/clip-vit-base-patch32"
@@ -91,6 +92,7 @@ def rollout_segment(
     t_indices: list[int],
     timesteps: torch.Tensor,
     text_emb: torch.Tensor,
+    added_cond_kwargs: dict,
     run_base: bool,
     grad_indices: set,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
@@ -119,6 +121,7 @@ def rollout_segment(
                     x_t.to(dtype=torch.float16),
                     t,
                     encoder_hidden_states=text_emb,
+                    added_cond_kwargs=added_cond_kwargs,
                 ).sample.float()
 
             mu, variance = _ddpm_posterior(x_t, t, t_prev, noise_pred, scheduler)
@@ -143,6 +146,7 @@ def rollout_segment(
                         base_x_t.to(dtype=torch.float16),
                         t,
                         encoder_hidden_states=text_emb,
+                        added_cond_kwargs=added_cond_kwargs,
                     ).sample.float()
 
                 base_mu, base_var = _ddpm_posterior(
@@ -172,7 +176,7 @@ def rl_segment(
 
     print(f"\nRL phase: {segment_name}")
 
-    run_base = cfg.rl_grounding_weight > 0.0
+    run_base = cfg.rl_grounding_weight > 0.0 and base_unet is not None
     if run_base:
         base_unet.to(DEVICE)
 
@@ -199,6 +203,7 @@ def rl_segment(
         text_emb = torch.cat([x["text_emb"] for x in items]).to(
             DEVICE, dtype=torch.float16
         )
+        pooled, time_ids = stack_added_cond(items, DEVICE)
 
         with torch.no_grad():
             ref_feats = [
@@ -210,6 +215,10 @@ def rl_segment(
 
         ref_repeated = ref_latents.repeat_interleave(group, dim=0)
         emb_repeated = text_emb.repeat_interleave(group, dim=0)
+        added_cond_kwargs = {
+            "text_embeds": pooled.repeat_interleave(group, dim=0),
+            "time_ids": time_ids.repeat_interleave(group, dim=0),
+        }
         rollout_batch = ref_repeated.shape[0]
 
         t_start = timesteps[t_start_idx].unsqueeze(0).expand(rollout_batch).to(DEVICE)
@@ -234,6 +243,7 @@ def rl_segment(
             t_indices=t_indices_asc,
             timesteps=timesteps,
             text_emb=emb_repeated,
+            added_cond_kwargs=added_cond_kwargs,
             run_base=run_base,
             grad_indices=grad_indices,
         )

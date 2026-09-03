@@ -7,21 +7,34 @@ import tempfile
 from types import SimpleNamespace
 
 import torch
+from PIL import Image
 
 from .cache import BucketSampler
 from .chainrl import normalize_grad, save_chain_lora
-from .dataset import shuffle_buffer_size
+from .dataset import build_time_ids, prepare_sample, shuffle_buffer_size
 from .encoder.mask_builder import (
     _gaussian_blur,
     normalize_mask,
     percentile_normalize,
     relative_normalize,
 )
-from .encoding import decode_for_clip, split_clauses, subset_caption
+from .encoding import (
+    HIDDEN_SPLIT,
+    decode_for_clip,
+    encode_prompt,
+    rms_scaled_noise,
+    split_clauses,
+    subset_caption,
+)
 from .eval import adherence, angular_spread, radius
 from .loss import compute_diffusion_loss, min_snr_weight
 from .rl import _ddpm_posterior, rollout_segment
-from .sampler import adapter_weights, pyramid_latents
+from .sampler import (
+    LATENT_LF_DECAY,
+    LATENT_LF_LEVELS,
+    adapter_weights,
+    pyramid_latents,
+)
 from .scheduler import (
     SpatiallyVaryingDDPMScheduler,
     compute_spatial_noise_scale,
@@ -58,15 +71,59 @@ class _DummyUNet(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.conv = torch.nn.Conv2d(4, 4, 3, padding=1)
+        self.seen_added_cond = "unset"
 
     def forward(self, sample, t, encoder_hidden_states=None, **kwargs):  # noqa: ARG002
+        self.seen_added_cond = kwargs.get("added_cond_kwargs", "missing")
         return SimpleNamespace(sample=self.conv(sample.float()))
+
+
+class _DummyTokenizer:
+    bos_token_id = 49406
+    eos_token_id = 49407
+
+    def __init__(self, pad_token_id=49407):
+        self.pad_token_id = pad_token_id
+        self._ids: dict = {}
+        self._words: dict = {}
+
+    def __call__(
+        self, text, add_special_tokens=False, truncation=True, max_length=150
+    ):  # noqa: ARG002
+        ids = []
+        for word in text.lower().split():
+            if word not in self._ids:
+                self._ids[word] = len(self._ids) + 1
+                self._words[self._ids[word]] = word
+            ids.append(self._ids[word])
+        return {"input_ids": ids[:max_length]}
+
+    def convert_ids_to_tokens(self, token_id):
+        return self._words.get(int(token_id), "")
+
+
+class _DummyTextEncoder(torch.nn.Module):
+    def __init__(self, hidden, projection=None):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(49408, hidden)
+        self.projection = (
+            None if projection is None else torch.nn.Linear(hidden, projection)
+        )
+
+    def forward(self, input_ids, output_hidden_states=False):  # noqa: ARG002
+        hidden = self.embedding(input_ids)
+        output = SimpleNamespace(
+            hidden_states=[hidden, hidden, hidden], last_hidden_state=hidden
+        )
+        if self.projection is not None:
+            output.text_embeds = self.projection(hidden.mean(1))
+        return output
 
 
 def test_pyramid_noise():
     print("\n--- pyramid_noise ---")
-    latents = torch.zeros(6, 4, 64, 48)
-    noise = pyramid_noise(latents, levels=6, decay=0.6)
+    latents = torch.zeros(6, 4, 128, 128)
+    noise = pyramid_noise(latents, levels=LATENT_LF_LEVELS, decay=LATENT_LF_DECAY)
 
     check("shape preserved", noise.shape == latents.shape, str(tuple(noise.shape)))
     check("dtype preserved", noise.dtype == latents.dtype)
@@ -78,9 +135,14 @@ def test_pyramid_noise():
         f"rms={[round(v, 5) for v in rms.tolist()[:3]]}",
     )
 
-    bulk = torch.zeros(3000, 4, 64, 48)
+    bulk = torch.zeros(600, 4, 128, 128)
     dc_plain = pyramid_noise(bulk, levels=1).mean(dim=(2, 3)).var().item()
-    dc_pyramid = pyramid_noise(bulk, levels=6, decay=0.6).mean(dim=(2, 3)).var().item()
+    dc_pyramid = (
+        pyramid_noise(bulk, levels=LATENT_LF_LEVELS, decay=LATENT_LF_DECAY)
+        .mean(dim=(2, 3))
+        .var()
+        .item()
+    )
 
     check(
         "defaults bring DC noise to parity with the terminal-SNR leak",
@@ -90,12 +152,18 @@ def test_pyramid_noise():
     )
     check(
         "levels=1 reduces to plain randn",
-        abs(dc_plain - 1.0 / (64 * 48)) < 2e-5,
-        f"dc={dc_plain:.6f} expected={1 / 3072:.6f}",
+        abs(dc_plain - 1.0 / (128 * 128)) < 1e-5,
+        f"dc={dc_plain:.6f} expected={1 / 16384:.6f}",
+    )
+    check(
+        "the pyramid reaches the 1x1 floor at the SDXL latent size",
+        LATENT_LF_LEVELS >= 8 and 128 // 2 ** (LATENT_LF_LEVELS - 1) == 1,
+        f"levels={LATENT_LF_LEVELS}",
     )
     check(
         "survives latents too small for every level",
-        pyramid_noise(torch.zeros(2, 4, 8, 6), levels=6).shape == (2, 4, 8, 6),
+        pyramid_noise(torch.zeros(2, 4, 8, 6), levels=LATENT_LF_LEVELS).shape
+        == (2, 4, 8, 6),
     )
 
 
@@ -130,7 +198,8 @@ def test_loss_weighting(scheduler):
     unet = _DummyUNet()
     noisy = torch.randn(4, 4, 16, 16)
     noise = torch.randn(4, 4, 16, 16)
-    embeddings = torch.randn(4, 154, 768)
+    embeddings = torch.randn(4, 154, 2048)
+    added_cond = {"text_embeds": torch.randn(4, 1280), "time_ids": torch.zeros(4, 6)}
     t = torch.full((4,), 300, dtype=torch.long)
 
     def loss_for(mask_value):
@@ -141,11 +210,17 @@ def test_loss_weighting(scheduler):
             t,
             embeddings,
             noise,
+            added_cond_kwargs=added_cond,
             mask=torch.full((4, 1, 16, 16), mask_value),
             bg_weight=0.25,
         ).item()
 
     sparse, dense = loss_for(0.05), loss_for(0.95)
+    check(
+        "added_cond_kwargs reaches the UNet",
+        unet.seen_added_cond is added_cond,
+        str(unet.seen_added_cond if isinstance(unet.seen_added_cond, str) else "dict"),
+    )
     check(
         "loss scale no longer tracks mask coverage",
         abs(sparse - dense) < 1e-5,
@@ -192,10 +267,10 @@ def test_loss_weighting(scheduler):
 
 def test_bucket_sampler():
     print("\n--- BucketSampler ---")
-    cached = [{"bucket": (512, 384) if i < 100 else (384, 512)} for i in range(140)]
+    cached = [{"bucket": (1216, 832) if i < 100 else (832, 1216)} for i in range(140)]
     sampler = BucketSampler(cached, 2)
 
-    check("buckets grouped", set(sampler.groups) == {(512, 384), (384, 512)})
+    check("buckets grouped", set(sampler.groups) == {(1216, 832), (832, 1216)})
     check("usable count", sampler.usable == 140)
 
     seen: dict[int, int] = {}
@@ -220,26 +295,36 @@ def test_bucket_sampler():
 
 def test_conditioning_augmentation():
     print("\n--- conditioning augmentation ---")
-    embeddings = torch.randn(8, 154, 768)
+    embeddings = torch.randn(8, 154, 2048)
+    pooled = torch.randn(8, 1280)
     content = torch.ones(8, 154)
-    empty = torch.zeros(1, 154, 768)
+    empty = torch.zeros(1, 154, 2048)
+    empty_pooled = torch.zeros(1, 1280)
 
-    dropped, dropped_content = apply_conditioning_augmentation(
+    dropped, dropped_pooled, dropped_content = apply_conditioning_augmentation(
         embeddings,
+        pooled,
         content,
         empty,
+        empty_pooled,
         argparse.Namespace(
             cond_dropout_prob=1.0, cond_partial_prob=0.0, cond_partial_max=0.6
         ),
     )
     check("full dropout gives the empty embedding", dropped.abs().max() < 1e-6)
+    check(
+        "full dropout also empties the pooled embedding",
+        dropped_pooled.abs().max() < 1e-6,
+    )
     check("full dropout zeroes the content mask", dropped_content.abs().max() < 1e-6)
 
     torch.manual_seed(3)
-    partial, partial_content = apply_conditioning_augmentation(
+    partial, partial_pooled, partial_content = apply_conditioning_augmentation(
         embeddings,
+        pooled,
         content,
         empty,
+        empty_pooled,
         argparse.Namespace(
             cond_dropout_prob=0.0, cond_partial_prob=1.0, cond_partial_max=0.6
         ),
@@ -254,18 +339,26 @@ def test_conditioning_augmentation():
         "content mask scaled by the same factor",
         torch.allclose(partial_content[:, 0], scales, atol=1e-3),
     )
+    check(
+        "pooled embedding is lerped by the same factor",
+        torch.allclose((partial_pooled / pooled).flatten(1).mean(1), scales, atol=1e-2),
+    )
 
-    same, same_content = apply_conditioning_augmentation(
+    same, same_pooled, same_content = apply_conditioning_augmentation(
         embeddings,
+        pooled,
         content,
         empty,
+        empty_pooled,
         argparse.Namespace(
             cond_dropout_prob=0.0, cond_partial_prob=0.0, cond_partial_max=0.6
         ),
     )
     check(
         "both disabled is a no-op",
-        torch.equal(same, embeddings) and torch.equal(same_content, content),
+        torch.equal(same, embeddings)
+        and torch.equal(same_pooled, pooled)
+        and torch.equal(same_content, content),
     )
 
 
@@ -293,12 +386,22 @@ def test_rollout(scheduler):
     grid = scheduler.timesteps
     policy, base = _DummyUNet(), _DummyUNet()
     start = torch.randn(8, 4, 16, 16)
-    embeddings = torch.randn(8, 154, 768)
+    embeddings = torch.randn(8, 154, 2048)
+    added_cond = {"text_embeds": torch.randn(8, 1280), "time_ids": torch.zeros(8, 6)}
     indices = list(range(10))
 
     torch.manual_seed(7)
     generated, base_generated, log_prob = rollout_segment(
-        policy, base, scheduler, start, indices, grid, embeddings, True, set(indices)
+        policy,
+        base,
+        scheduler,
+        start,
+        indices,
+        grid,
+        embeddings,
+        added_cond,
+        True,
+        set(indices),
     )
     check("x0 prediction shape", generated.shape == start.shape)
     check(
@@ -319,18 +422,45 @@ def test_rollout(scheduler):
 
     policy.zero_grad()
     _, _, subsampled = rollout_segment(
-        policy, None, scheduler, start, indices, grid, embeddings, False, {3, 7}
+        policy,
+        None,
+        scheduler,
+        start,
+        indices,
+        grid,
+        embeddings,
+        added_cond,
+        False,
+        {3, 7},
     )
     check("subsampled rollout is per-sample", subsampled.shape == (8,))
     check("subsampled rollout carries grad", subsampled.requires_grad)
 
     torch.manual_seed(11)
     first = rollout_segment(
-        policy, base, scheduler, start, indices, grid, embeddings, True, set(indices)
+        policy,
+        base,
+        scheduler,
+        start,
+        indices,
+        grid,
+        embeddings,
+        added_cond,
+        True,
+        set(indices),
     )
     torch.manual_seed(11)
     second = rollout_segment(
-        policy, base, scheduler, start, indices, grid, embeddings, True, set(indices)
+        policy,
+        base,
+        scheduler,
+        start,
+        indices,
+        grid,
+        embeddings,
+        added_cond,
+        True,
+        set(indices),
     )
     check(
         "rollout is deterministic given the seed (shared-noise wiring intact)",
@@ -348,6 +478,7 @@ def test_rollout(scheduler):
         list(range(20, 30)),
         grid,
         embeddings,
+        added_cond,
         False,
         {i for i in range(20, 30) if i < 29},
     )
@@ -415,7 +546,7 @@ def test_sampler_parity():
     )
 
     def app_pyramid_latents(shape, generators, device, dtype, lf=1.0, eps=1e-8):
-        levels, decay = 6, 0.6
+        levels, decay = 8, 0.66
         batch, channels, height, width = shape
         samples = []
         for index in range(batch):
@@ -778,12 +909,169 @@ def test_mask_normalization():
     )
 
 
+def test_noise_prior_match():
+    print("\n--- noise prior: trainer and sampler agree ---")
+    shape = (128, 4, 128, 128)
+
+    inference = pyramid_latents(
+        shape,
+        [torch.Generator().manual_seed(100 + i) for i in range(shape[0])],
+        "cpu",
+        torch.float32,
+        lf=1.0,
+    )
+    training = pyramid_noise(
+        torch.zeros(shape), levels=LATENT_LF_LEVELS, decay=LATENT_LF_DECAY
+    )
+
+    dc_inference = inference.mean(dim=(2, 3)).var().item()
+    dc_training = training.mean(dim=(2, 3)).var().item()
+
+    check(
+        "inference latents carry the same DC energy the trainer taught",
+        0.75 < dc_inference / dc_training < 1.35,
+        f"inference {dc_inference:.5f} vs training {dc_training:.5f} "
+        f"({dc_inference / dc_training:.2f}x)",
+    )
+
+
+def test_dual_encoder_encoding():
+    print("\n--- SDXL prompt encoding ---")
+    torch.manual_seed(0)
+    tokenizers = [_DummyTokenizer(49407), _DummyTokenizer(0)]
+    encoders = [_DummyTextEncoder(768), _DummyTextEncoder(1280, projection=1280)]
+
+    prompts = ["a girl with long pink hair", "a quiet room"]
+    embeddings, pooled, content = encode_prompt(prompts, encoders, tokenizers, "cpu")
+
+    check(
+        "both encoders concatenate to cross_attention_dim 2048",
+        tuple(embeddings.shape) == (2, 154, 2048),
+        str(tuple(embeddings.shape)),
+    )
+    check(
+        "the split point separates the two encoders",
+        HIDDEN_SPLIT == 768 and embeddings.shape[-1] - HIDDEN_SPLIT == 1280,
+    )
+    check(
+        "pooled embedding is one 1280-vector per prompt",
+        tuple(pooled.shape) == (2, 1280),
+        str(tuple(pooled.shape)),
+    )
+    check(
+        "content mask still indexes the 154-token sequence",
+        tuple(content.shape) == (2, 154),
+        str(tuple(content.shape)),
+    )
+
+    check(
+        "BOS and EOS are excluded from the content mask",
+        content[0, 0] == 0 and content[0, 76] == 0 and content[0, 77] == 0,
+    )
+    check(
+        "stopwords are excluded and content words are kept",
+        content[0, 1:7].tolist() == [0.0, 1.0, 0.0, 1.0, 1.0, 1.0],
+        str(content[0, 1:7].tolist()),
+    )
+    check(
+        "padding and the unused second chunk contribute nothing",
+        content[0, 7:76].sum() == 0 and content[0, 77:].sum() == 0,
+    )
+
+    words = [f"word{i}" for i in range(75)]
+    short = " ".join(words)
+    long = " ".join(words + ["extra"] * 5)
+    _, pooled_short, _ = encode_prompt([short], encoders, tokenizers, "cpu")
+    _, pooled_long, _ = encode_prompt([long], encoders, tokenizers, "cpu")
+    check(
+        "pooled comes from the first chunk only",
+        torch.allclose(pooled_short, pooled_long, atol=1e-5),
+    )
+
+
+def test_rms_split():
+    print("\n--- embedding jitter across two encoder blocks ---")
+    reference = torch.cat(
+        [torch.full((1, 154, 768), 0.1), torch.full((1, 154, 1280), 10.0)], dim=-1
+    )
+
+    torch.manual_seed(0)
+    split_noise = rms_scaled_noise(reference, 1.0, split=HIDDEN_SPLIT)
+    head = split_noise[..., :HIDDEN_SPLIT].float().std().item()
+    tail = split_noise[..., HIDDEN_SPLIT:].float().std().item()
+
+    check(
+        "each encoder block is jittered by its own RMS",
+        abs(head / 0.1 - 1.0) < 0.05 and abs(tail / 10.0 - 1.0) < 0.05,
+        f"head={head:.4f} (want 0.1) tail={tail:.3f} (want 10.0)",
+    )
+
+    global_noise = rms_scaled_noise(reference, 1.0)
+    global_head = global_noise[..., :HIDDEN_SPLIT].float().std().item()
+    check(
+        "a single global RMS would swamp the smaller block",
+        global_head > 10.0 * head,
+        f"{global_head:.3f} vs {head:.4f}",
+    )
+    check(
+        "split=None keeps the original single-RMS behaviour",
+        abs(global_head / (10.0 * (1280 / 2048) ** 0.5) - 1.0) < 0.1,
+        f"{global_head:.3f}",
+    )
+
+
+def test_size_conditioning():
+    print("\n--- SDXL size micro-conditioning ---")
+
+    ids = build_time_ids((512, 384), (12, 0), (1216, 832))
+    check(
+        "time ids are original, crop, target in that order",
+        ids == (512.0, 384.0, 12.0, 0.0, 1216.0, 832.0),
+        str(ids),
+    )
+    check("six values feed the 6 x 256 time embedding", len(ids) == 6)
+
+    tensor, _, bucket, sample_ids = prepare_sample(
+        {"image": Image.new("RGB", (400, 300)), "text": "a girl"}, "cpu"
+    )
+    assert tensor is not None and sample_ids is not None
+    check(
+        "a 4:3 source lands in the nearest SDXL bucket",
+        bucket == (1152, 896),
+        str(bucket),
+    )
+    check(
+        "the tensor matches the bucket",
+        tuple(tensor.shape) == (1, 3, 896, 1152),
+        str(tuple(tensor.shape)),
+    )
+    check(
+        "original_size reports the true pre-upscale size, not the bucket",
+        sample_ids[0] == 300.0 and sample_ids[1] == 400.0,
+        str(sample_ids[:2]),
+    )
+    check(
+        "the discarded centre-crop offset is carried through",
+        sample_ids[2] == 0.0 and sample_ids[3] == 21.0,
+        str(sample_ids[2:4]),
+    )
+    check(
+        "target_size is the bucket in (height, width) order",
+        sample_ids[4] == 896.0 and sample_ids[5] == 1152.0,
+        str(sample_ids[4:]),
+    )
+
+
 def main() -> int:
     torch.manual_seed(0)
     random.seed(0)
     scheduler = make_scheduler()
 
     test_pyramid_noise()
+    test_noise_prior_match()
+    test_dual_encoder_encoding()
+    test_rms_split()
+    test_size_conditioning()
     test_min_snr(scheduler)
     test_loss_weighting(scheduler)
     test_bucket_sampler()

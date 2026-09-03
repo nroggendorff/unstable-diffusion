@@ -2,26 +2,20 @@ import argparse
 import torch
 import numpy as np
 
-from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler
+from diffusers import EulerDiscreteScheduler
 from PIL import Image
 
 from .encoding import encode_prompt
+from .model import load_pipeline
 from .sampler import ALL_SEGMENTS, adapter_weights
 
-MODEL_ID = "glides/counterfeit"
 ADAPTER_BASE_PATH = "./creative-lora"
 
 _NEGATIVE_PROMPT = "watermark, text"
 
 
 def load_pipe(adapter_path: str = ADAPTER_BASE_PATH):
-    # pyrefly: ignore [missing-attribute]
-    pipe = StableDiffusionPipeline.from_pretrained(
-        MODEL_ID,
-        dtype=torch.float16,
-        safety_checker=None,
-        requires_safety_checker=False,
-    ).to("cuda")
+    pipe = load_pipeline()
 
     pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
 
@@ -37,13 +31,20 @@ def load_pipe(adapter_path: str = ADAPTER_BASE_PATH):
 
 def _encode_for_pipe(pipe, prompt):
     device = pipe.text_encoder.device
+    encoders = [pipe.text_encoder, pipe.text_encoder_2]
+    tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
 
-    text_emb, _ = encode_prompt(prompt, pipe.text_encoder, pipe.tokenizer, device)
-    neg_emb, _ = encode_prompt(
-        _NEGATIVE_PROMPT, pipe.text_encoder, pipe.tokenizer, device
+    text_emb, text_pooled, _ = encode_prompt(prompt, encoders, tokenizers, device)
+    neg_emb, neg_pooled, _ = encode_prompt(
+        _NEGATIVE_PROMPT, encoders, tokenizers, device
     )
 
-    return text_emb.to(dtype=torch.float16), neg_emb.to(dtype=torch.float16)
+    return (
+        text_emb.to(dtype=torch.float16),
+        text_pooled.to(dtype=torch.float16),
+        neg_emb.to(dtype=torch.float16),
+        neg_pooled.to(dtype=torch.float16),
+    )
 
 
 def make_segment_callback(use_lora, num_inference_steps, strength):
@@ -80,13 +81,15 @@ def infer_batch(
     seed=None,
     batch_size=3,
     strength=1.0,
-    width=512,
-    height=512,
+    width=832,
+    height=1216,
 ):
-    text_emb, neg_emb = _encode_for_pipe(pipe, prompt)
+    text_emb, text_pooled, neg_emb, neg_pooled = _encode_for_pipe(pipe, prompt)
 
     text_emb = text_emb.expand(batch_size, -1, -1)
     neg_emb = neg_emb.expand(batch_size, -1, -1)
+    text_pooled = text_pooled.expand(batch_size, -1)
+    neg_pooled = neg_pooled.expand(batch_size, -1)
 
     if use_lora:
         pipe.enable_lora()
@@ -100,7 +103,9 @@ def infer_batch(
 
     return pipe(
         prompt_embeds=text_emb,
+        pooled_prompt_embeds=text_pooled,
         negative_prompt_embeds=neg_emb,
+        negative_pooled_prompt_embeds=neg_pooled,
         width=width,
         height=height,
         num_inference_steps=num_inference_steps,
@@ -121,10 +126,10 @@ def infer_with_evolution(
     guidance_scale=7.0,
     seed=None,
     strength=1.0,
-    width=512,
-    height=512,
+    width=832,
+    height=1216,
 ):
-    text_emb, neg_emb = _encode_for_pipe(pipe, prompt)
+    text_emb, text_pooled, neg_emb, neg_pooled = _encode_for_pipe(pipe, prompt)
 
     if use_lora:
         pipe.enable_lora()
@@ -146,7 +151,9 @@ def infer_with_evolution(
 
     result = pipe(
         prompt_embeds=text_emb,
+        pooled_prompt_embeds=text_pooled,
         negative_prompt_embeds=neg_emb,
+        negative_pooled_prompt_embeds=neg_pooled,
         width=width,
         height=height,
         num_inference_steps=num_inference_steps,
@@ -204,8 +211,8 @@ def main():
     parser.add_argument("--strength", type=float, default=1.0)
     parser.add_argument("--guidance", "-g", type=float, default=7.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--width", type=int, default=832)
+    parser.add_argument("--height", type=int, default=1216)
     args = parser.parse_args()
 
     print("Loading model...")

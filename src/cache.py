@@ -31,11 +31,17 @@ def blend_masks(
     return (1.0 - alpha) * attn_mask + alpha * normalize_mask(diff_resized, gain)
 
 
+def stack_added_cond(items: list, device, dtype=torch.float16) -> tuple:
+    pooled = torch.cat([x["pooled"] for x in items]).to(device, dtype=dtype)
+    time_ids = torch.stack([x["time_ids"] for x in items]).to(device, dtype=dtype)
+    return pooled, time_ids
+
+
 def build_cache(
     samples,
     vae,
-    text_encoder,
-    tokenizer,
+    text_encoders,
+    tokenizers,
     device,
     total=None,
     subset_prob=0.0,
@@ -50,7 +56,7 @@ def build_cache(
     words_after = 0
 
     for sample in tqdm(samples, desc="Caching", total=total):
-        image, prompt, bucket = prepare_sample(sample, device)
+        image, prompt, bucket, time_ids = prepare_sample(sample, device)
         if image is None or prompt is None:
             continue
 
@@ -64,14 +70,16 @@ def build_cache(
 
         with torch.no_grad():
             latents = vae.encode(image).latent_dist.sample() * vae.config.scaling_factor
-            text_emb, content = encode_prompt(
-                conditioning, text_encoder, tokenizer, device, content_cache
+            text_emb, pooled, content = encode_prompt(
+                conditioning, text_encoders, tokenizers, device, content_cache
             )
 
         cached.append(
             {
                 "latents": latents.cpu().half(),
                 "text_emb": text_emb.cpu().half(),
+                "pooled": pooled.cpu().half(),
+                "time_ids": torch.tensor(time_ids, dtype=torch.float32),
                 "token_content_mask": content.cpu(),
                 "bucket": bucket,
             }

@@ -15,7 +15,7 @@ from .encoder import CrossAttentionCapture
 from .encoder.mask_builder import normalize_mask
 from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scale
 from .scheduler import pyramid_noise
-from .cache import blend_alpha, blend_masks, BucketSampler
+from .cache import blend_alpha, blend_masks, stack_added_cond, BucketSampler
 from .train import DISCREPANCY_MAX_T
 
 CONDITIONS = ["full", "subset", "shuffled"]
@@ -34,8 +34,8 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--mask_gain", type=float, default=1.5)
     parser.add_argument("--noise_bg_boost", type=float, default=1.5)
     parser.add_argument("--noise_t_ramp", type=float, default=0.3)
-    parser.add_argument("--noise_lf_levels", type=int, default=6)
-    parser.add_argument("--noise_lf_decay", type=float, default=0.6)
+    parser.add_argument("--noise_lf_levels", type=int, default=8)
+    parser.add_argument("--noise_lf_decay", type=float, default=0.66)
     parser.add_argument("--loss_bg_weight", type=float, default=0.25)
     parser.add_argument("--output_dir", type=str, default=default_output_dir())
     return parser.parse_args()
@@ -61,14 +61,14 @@ def _corr(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return num / den.clamp(min=1e-8)
 
 
-def build_probe_cache(args, vae, text_encoder, tokenizer) -> list:
+def build_probe_cache(args, vae, text_encoders, tokenizers) -> list:
     rng = random.Random(args.seed)
     content_cache: dict = {}
     cached = []
 
     stream = get_samples(args.cache_size, seed=args.seed)
     for sample in tqdm(stream, desc="Caching", total=args.cache_size):
-        image, prompt, bucket = prepare_sample(sample, DEVICE)
+        image, prompt, bucket, time_ids = prepare_sample(sample, DEVICE)
         if image is None or prompt is None:
             continue
 
@@ -76,22 +76,25 @@ def build_probe_cache(args, vae, text_encoder, tokenizer) -> list:
 
         with torch.no_grad():
             latents = vae.encode(image).latent_dist.sample() * vae.config.scaling_factor
-            full_emb, full_content = encode_prompt(
-                prompt, text_encoder, tokenizer, DEVICE, content_cache
+            full_emb, full_pooled, full_content = encode_prompt(
+                prompt, text_encoders, tokenizers, DEVICE, content_cache
             )
-            sub_emb, sub_content = encode_prompt(
-                subset, text_encoder, tokenizer, DEVICE, content_cache
+            sub_emb, sub_pooled, sub_content = encode_prompt(
+                subset, text_encoders, tokenizers, DEVICE, content_cache
             )
 
         cached.append(
             {
                 "latents": latents.cpu().half(),
                 "text_emb": full_emb.cpu().half(),
+                "pooled": full_pooled.cpu().half(),
+                "time_ids": torch.tensor(time_ids, dtype=torch.float32),
                 "token_content_mask": full_content.cpu(),
                 "subset_text_emb": sub_emb.cpu().half(),
+                "subset_pooled": sub_pooled.cpu().half(),
                 "subset_token_content_mask": sub_content.cpu(),
-                "full_tokens": _token_count(tokenizer, prompt),
-                "subset_tokens": _token_count(tokenizer, subset),
+                "full_tokens": _token_count(tokenizers[0], prompt),
+                "subset_tokens": _token_count(tokenizers[0], subset),
                 "full_words": len(prompt.split()),
                 "subset_words": len(subset.split()),
                 "bucket": bucket,
@@ -110,6 +113,7 @@ def condition_mask(
     noise,
     t,
     text_emb,
+    added_cond_kwargs,
     content,
     alpha,
     blur_sigma,
@@ -126,6 +130,7 @@ def condition_mask(
                     uniform_noisy.to(dtype=torch.float16),
                     t,
                     encoder_hidden_states=text_emb,
+                    added_cond_kwargs=added_cond_kwargs,
                 ).sample.float()
 
             raw = capture.raw_mask(spatial_size)
@@ -144,8 +149,8 @@ def condition_mask(
     return raw, mask
 
 
-def measure(args, unet, vae, text_encoder, tokenizer, scheduler) -> dict:
-    cached = build_probe_cache(args, vae, text_encoder, tokenizer)
+def measure(args, unet, vae, text_encoders, tokenizers, scheduler) -> dict:
+    cached = build_probe_cache(args, vae, text_encoders, tokenizers)
     sampler = BucketSampler(cached, args.mini_batch_size)
     if not sampler:
         raise RuntimeError(
@@ -186,6 +191,12 @@ def measure(args, unet, vae, text_encoder, tokenizer, scheduler) -> dict:
 
             embeds = {}
             contents = {}
+            conds = {}
+
+            pooled, time_ids = stack_added_cond(items, DEVICE)
+            subset_pooled = torch.cat([x["subset_pooled"] for x in items]).to(
+                DEVICE, dtype=torch.float16
+            )
 
             embeds["full"] = torch.cat([x["text_emb"] for x in items]).to(
                 DEVICE, dtype=torch.float16
@@ -200,6 +211,10 @@ def measure(args, unet, vae, text_encoder, tokenizer, scheduler) -> dict:
             contents["subset"] = torch.cat(
                 [x["subset_token_content_mask"] for x in items]
             ).to(DEVICE)
+
+            conds["full"] = {"text_embeds": pooled, "time_ids": time_ids}
+            conds["subset"] = {"text_embeds": subset_pooled, "time_ids": time_ids}
+            conds["shuffled"] = conds["full"]
 
             embeds["shuffled"] = embeds["full"]
             contents["shuffled"] = torch.stack(
@@ -221,6 +236,7 @@ def measure(args, unet, vae, text_encoder, tokenizer, scheduler) -> dict:
                     noise,
                     t,
                     embeds[condition],
+                    conds[condition],
                     contents[condition],
                     alpha,
                     blur_sigma,
@@ -273,7 +289,7 @@ def measure(args, unet, vae, text_encoder, tokenizer, scheduler) -> dict:
             for key, value in pairs.items():
                 acc["pair"].setdefault(key, []).append(value.detach().cpu())
 
-            del latents, noise, masks, embeds, contents
+            del latents, noise, masks, embeds, contents, conds
             if step % 10 == 0:
                 torch.cuda.empty_cache()
 
@@ -346,8 +362,8 @@ def main() -> None:
         args,
         unet,
         models["vae"],
-        models["text_encoder"],
-        models["tokenizer"],
+        models["text_encoders"],
+        models["tokenizers"],
         scheduler,
     )
 

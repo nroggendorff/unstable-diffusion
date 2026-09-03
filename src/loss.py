@@ -16,6 +16,7 @@ def compute_diffusion_loss(
     t,
     text_emb,
     noise,
+    added_cond_kwargs=None,
     noise_scale=None,
     mask=None,
     bg_weight=0.25,
@@ -29,6 +30,7 @@ def compute_diffusion_loss(
             noisy_latents,
             t,
             encoder_hidden_states=text_emb,
+            added_cond_kwargs=added_cond_kwargs,
         ).sample
 
     residual = (pred.float() - target.float()).pow(2)
