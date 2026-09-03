@@ -69,10 +69,10 @@ def get_config() -> argparse.Namespace:
 
     add("rl_steps", int, 300)
     add("rl_lr", float, 3e-6)
-    add("rl_grounding_weight", float, 0.4)
-    add("rl_refs", int, 2)
-    add("rl_group", int, 4)
-    add("rl_logprob_subsample", int, 2)
+    add("rl_grounding_weight", float, 0.0)
+    add("rl_refs", int, 1)
+    add("rl_group", int, 2)
+    add("rl_logprob_subsample", int, 1)
 
     sm_default_output = default_output_dir()
     sm_output_val = sm.get("output_dir")
