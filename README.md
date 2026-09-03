@@ -21,8 +21,11 @@ Radius and angle are independent, and both can fail on their own. Several images
 
 - Create images that are unique and deliberate, rather than the average of the dataset that doesn't exist at any point in the dataset--if the dataset is a ring of points in image space, a normal trainer would encourage the model to predict somewhere in the center of the ring, not somewhere on the ring (hence orbiting).
 - High seed variance should be a biproduct of a well-trained model accompanied by a well-tuned sampler, not a specialized reward term.
+- There should be sufficient insentive to share positions in latent space between images for unclipping.
 
 The spokes are already in the model. Denoising is trained on a likelihood bound, which is mode-covering: it is punished for assigning near-zero density to a real training image. This is why a small-scope style LoRA, or a very specific prompt work at all, and it means the spokes survive training.
+
+A perfect model would have no seed variance, because it is deliberately told that the input is completely random. However, to stay useful, seeds should be where the model puts the many different interpretations for an input prompt. Any prompt has infinitely many interpretations, and the seed is where those interpretations should be stored.
 
 ## Mental model
 
