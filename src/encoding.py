@@ -240,7 +240,7 @@ def encode_prompt(prompts, text_encoders, tokenizers, device, content_cache=None
     for encoder, tokenizer in zip(text_encoders, tokenizers):
         pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
         input_ids = torch.tensor(
-            [[bos] + w + [pad] * (CHUNK_TOKENS - len(w)) + [eos] for w in windows],
+            [[bos] + w + [eos] + [pad] * (CHUNK_TOKENS - len(w)) for w in windows],
             dtype=torch.long,
             device=device,
         )

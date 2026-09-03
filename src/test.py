@@ -123,6 +123,7 @@ class _DummyTextEncoder(torch.nn.Module):
         )
 
     def forward(self, input_ids, output_hidden_states=False):  # noqa: ARG002
+        self.seen_input_ids = input_ids
         hidden = self.embedding(input_ids)
         output = SimpleNamespace(
             hidden_states=[hidden, hidden, hidden], last_hidden_state=hidden
@@ -988,6 +989,21 @@ def test_dual_encoder_encoding():
     check(
         "padding and the unused second chunk contribute nothing",
         content[0, 7:76].sum() == 0 and content[0, 77:].sum() == 0,
+    )
+
+    ids = encoders[1].seen_input_ids
+    check(
+        "EOS closes the content, before the padding",
+        ids[0, 0] == 49406
+        and ids[0, 7] == 49407
+        and (ids[0, 1:7] != 49407).all()
+        and (ids[0, 8:] == 0).all(),
+        str(ids[0, :10].tolist()),
+    )
+    check(
+        "an empty chunk is BOS, EOS, then padding only",
+        ids[1, 0] == 49406 and ids[1, 1] == 49407 and (ids[1, 2:] == 0).all(),
+        str(ids[1, :4].tolist()),
     )
 
     words = [f"word{i}" for i in range(75)]

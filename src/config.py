@@ -19,10 +19,10 @@ def get_config() -> argparse.Namespace:
     def add(name: str, type_, default):
         parser.add_argument(f"--{name}", type=type_, default=default)
 
-    add("steps", int, 4096)
+    add("steps", int, 2048)
     add("mini_batch_size", int, 8)
     add("grad_accum_steps", int, 1)
-    add("cache_size", int, 4096)
+    add("cache_size", int, 2048)
     add("shuffle_buffer", int, 1024)
     add("cache_workers", int, 6)
     add("lr", float, 1e-4)
