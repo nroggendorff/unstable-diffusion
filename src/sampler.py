@@ -8,6 +8,12 @@ from .scheduler import LATENT_MEAN, NOISE_LF_STRENGTH, TERMINAL_LEAK, lowfreq_fi
 
 ALL_SEGMENTS = ["early", "mid", "late"]
 
+NEGATIVE_PROMPT = (
+    "nsfw, explicit, questionable, sensitive, suggestive, underwear, panties, "
+    "lingerie, cleavage, nude, ugly, low quality, lowres, worst quality, "
+    "text, watermark, comic"
+)
+
 _BOUNDARIES = [EARLY_SEG, EARLY_SEG + MID_SEG]
 _BLEND_HALF = 2
 _MAX_RAW_GUIDANCE = 30.0

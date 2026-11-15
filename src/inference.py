@@ -7,11 +7,9 @@ from PIL import Image
 
 from .encoding import encode_for_sampling
 from .model import load_pipeline
-from .sampler import ALL_SEGMENTS, adapter_weights, prior_latents
+from .sampler import ALL_SEGMENTS, NEGATIVE_PROMPT, adapter_weights, prior_latents
 
 ADAPTER_BASE_PATH = "./creative-lora"
-
-_NEGATIVE_PROMPT = "watermark, text"
 
 
 def load_pipe(adapter_path: str = ADAPTER_BASE_PATH):
@@ -32,7 +30,7 @@ def load_pipe(adapter_path: str = ADAPTER_BASE_PATH):
 def _encode_for_pipe(pipe, prompt):
     return encode_for_sampling(
         prompt,
-        _NEGATIVE_PROMPT,
+        NEGATIVE_PROMPT,
         [pipe.text_encoder, pipe.text_encoder_2],
         [pipe.tokenizer, pipe.tokenizer_2],
         pipe.text_encoder.device,

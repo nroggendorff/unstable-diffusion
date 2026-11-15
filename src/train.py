@@ -15,8 +15,6 @@ from .model import (
     get_lora_config,
     DEVICE,
     NUM_INFERENCE_STEPS,
-    EARLY_SEG,
-    MID_SEG,
     SEGMENT_TIMESTEP_RANGES,
 )
 from .dataset import get_samples
@@ -41,18 +39,9 @@ from .cache import (
     stack_text,
     BucketSampler,
 )
-from .rl import rl_segment
 from .io import save_lora
 
-LATE_START = EARLY_SEG + MID_SEG
-
 SEGMENTS = ["early", "mid", "late"]
-
-SEGMENT_INDICES = {
-    "early": range(0, EARLY_SEG),
-    "mid": range(EARLY_SEG, LATE_START),
-    "late": range(LATE_START, NUM_INFERENCE_STEPS),
-}
 
 DISCREPANCY_MAX_T = 600
 
@@ -285,7 +274,7 @@ def build_sampler(
     if not sampler:
         raise RuntimeError(
             f"No aspect bucket holds at least {min_size} samples. "
-            f"Raise --cache_size, or lower --mini_batch_size / --rl_refs."
+            f"Raise --cache_size, or lower --mini_batch_size."
         )
 
     print(
@@ -313,8 +302,7 @@ def train(cfg: argparse.Namespace):
         f"snr_gamma={cfg.snr_gamma}, cond_partial={cfg.cond_partial_prob}, "
         f"mask_gain={cfg.mask_gain}, "
         f"caption_subset={cfg.caption_subset_prob}/{cfg.caption_subset_min}, "
-        f"rl_steps={cfg.rl_steps}, rl_lr={cfg.rl_lr}, rl_refs={cfg.rl_refs}, "
-        f"rl_group={cfg.rl_group}, output_dir={cfg.output_dir}"
+        f"output_dir={cfg.output_dir}"
     )
 
     models = load_model()
@@ -327,19 +315,9 @@ def train(cfg: argparse.Namespace):
         models["pipe"].scheduler.config
     )
     scheduler.set_timesteps(NUM_INFERENCE_STEPS)
-    timesteps = scheduler.timesteps.to(DEVICE)
 
-    needs_base = cfg.rl_steps > 0 and cfg.rl_grounding_weight > 0.0
-    base_unet = None
-    if needs_base:
-        # pyrefly: ignore [missing-attribute]
-        base_unet = models["pipe"].unet.eval()
-        for param in base_unet.parameters():
-            param.requires_grad_(False)
-        base_unet.to("cpu")
-    else:
-        # pyrefly: ignore [missing-attribute]
-        models["pipe"].unet = None
+    # pyrefly: ignore [missing-attribute]
+    models["pipe"].unet = None
     torch.cuda.empty_cache()
 
     mask_builder = SubjectMaskBuilder(
@@ -350,8 +328,6 @@ def train(cfg: argparse.Namespace):
     )
 
     min_size = cfg.mini_batch_size
-    if cfg.rl_steps > 0:
-        min_size = max(min_size, cfg.rl_refs)
 
     sampler, empty_emb, empty_pooled = build_sampler(
         vae, text_encoders, tokenizers, min_size, 0, cfg, models["zero_uncond"]
@@ -379,18 +355,6 @@ def train(cfg: argparse.Namespace):
             sampler=sampler,
             empty_emb=empty_emb,
             empty_pooled=empty_pooled,
-            cfg=cfg,
-        )
-
-        unet = rl_segment(
-            segment_name=segment_name,
-            unet=unet,
-            base_unet=base_unet,
-            t_indices=SEGMENT_INDICES[segment_name],
-            timesteps=timesteps,
-            scheduler=scheduler,
-            vae=vae,
-            sampler=sampler,
             cfg=cfg,
         )
 

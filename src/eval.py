@@ -11,11 +11,9 @@ from .config import default_output_dir
 from .encoding import encode_for_sampling
 from .inference import ADAPTER_BASE_PATH, load_pipe, make_two_row_grid
 from .model import NUM_INFERENCE_STEPS
-from .sampler import anchor_generate
+from .sampler import NEGATIVE_PROMPT, anchor_generate
 
 CLIP_ID = "openai/clip-vit-base-patch32"
-
-NEGATIVE_PROMPT = "ugly, low quality"
 
 PROMPTS = [
     "a girl",

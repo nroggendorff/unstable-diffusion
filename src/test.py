@@ -12,7 +12,7 @@ import torch
 from PIL import Image
 
 from .cache import BucketSampler
-from .chainrl import normalize_grad, rollout_chain, save_chain_lora
+from .chain import normalize_grad, rollout_chain, save_chain_lora
 from .dataset import build_time_ids, prepare_sample, shuffle_buffer_size
 from .encoder.mask_builder import (
     _gaussian_blur,
@@ -28,7 +28,6 @@ from .encoding import (
     MAX_CHUNKS,
     POOLED_DIM,
     active_chunks,
-    decode_for_clip,
     encode_prompt,
     pack_chunks,
     rms_scaled_noise,
@@ -38,11 +37,11 @@ from .encoding import (
 from .model import EARLY_SEG, MID_SEG, NUM_INFERENCE_STEPS
 from .eval import PROMPTS, adherence, angular_spread, radius
 from .loss import compute_diffusion_loss, min_snr_weight
-from .qualityrl import composed_prompt, floor_penalty, scaled_bucket
-from .rl import _ddpm_posterior, rollout_segment
+from .rl import composed_prompt, decode_pixels, floor_penalty, scaled_bucket
 from .sampler import (
     _BLEND_HALF,
     _MAX_RAW_GUIDANCE,
+    NEGATIVE_PROMPT,
     adapter_weights,
     lied_timestep,
     prior_deviation,
@@ -447,8 +446,8 @@ def test_conditioning_augmentation():
     )
 
 
-def test_x0_reward(scheduler):
-    print("\n--- RL: x0 reward vs the noisy latent it replaced ---")
+def test_predict_x0(scheduler):
+    print("\n--- scheduler: predict_x0 inverts add_noise ---")
     grid = scheduler.timesteps
     reference = torch.randn(3, 4, 16, 16)
     noise = torch.randn(3, 4, 16, 16)
@@ -463,147 +462,6 @@ def test_x0_reward(scheduler):
         "predict_x0 recovers the reference where raw x_t does not",
         error_x0 < 1e-8 < error_xt,
         f"err(x0_pred)={error_x0:.2e} err(x_t)={error_xt:.3f} t={int(t_end[0])}",
-    )
-
-
-def test_rollout(scheduler):
-    print("\n--- RL: rollout shapes, grads, determinism ---")
-    grid = scheduler.timesteps
-    policy, base = _DummyUNet(), _DummyUNet()
-    start = torch.randn(8, 4, 16, 16)
-    embeddings = torch.randn(8, 154, 2048)
-    added_cond = {"text_embeds": torch.randn(8, 1280), "time_ids": torch.zeros(8, 6)}
-    indices = list(range(10))
-
-    torch.manual_seed(7)
-    generated, base_generated, log_prob = rollout_segment(
-        policy,
-        base,
-        scheduler,
-        start,
-        indices,
-        grid,
-        embeddings,
-        added_cond,
-        True,
-        set(indices),
-    )
-    check("x0 prediction shape", generated.shape == start.shape)
-    check(
-        "base x0 prediction shape",
-        base_generated is not None and base_generated.shape == start.shape,
-    )
-    check("log_prob is per-sample", log_prob.shape == (8,), str(tuple(log_prob.shape)))
-    check("log_prob carries grad", log_prob.requires_grad)
-    check(
-        "an unmasked rollout passes no encoder mask",
-        policy.seen_mask is None and base.seen_mask is None,
-    )
-
-    (-(torch.randn(8) * log_prob).mean()).backward()
-    policy_grad = policy.conv.weight.grad
-    check(
-        "policy grads flow, base stays untouched",
-        policy_grad is not None
-        and policy_grad.abs().sum() > 0
-        and base.conv.weight.grad is None,
-    )
-
-    policy.zero_grad()
-    _, _, subsampled = rollout_segment(
-        policy,
-        None,
-        scheduler,
-        start,
-        indices,
-        grid,
-        embeddings,
-        added_cond,
-        False,
-        {3, 7},
-    )
-    check("subsampled rollout is per-sample", subsampled.shape == (8,))
-    check("subsampled rollout carries grad", subsampled.requires_grad)
-
-    torch.manual_seed(11)
-    first = rollout_segment(
-        policy,
-        base,
-        scheduler,
-        start,
-        indices,
-        grid,
-        embeddings,
-        added_cond,
-        True,
-        set(indices),
-    )
-    torch.manual_seed(11)
-    second = rollout_segment(
-        policy,
-        base,
-        scheduler,
-        start,
-        indices,
-        grid,
-        embeddings,
-        added_cond,
-        True,
-        set(indices),
-    )
-    check(
-        "rollout is deterministic given the seed (shared-noise wiring intact)",
-        torch.allclose(first[0], second[0])
-        and first[1] is not None
-        and second[1] is not None
-        and torch.allclose(first[1], second[1]),
-    )
-
-    late = rollout_segment(
-        policy,
-        None,
-        scheduler,
-        start,
-        list(range(20, 30)),
-        grid,
-        embeddings,
-        added_cond,
-        False,
-        {i for i in range(20, 30) if i < 29},
-    )
-    check("late segment runs (index 29 has no t_prev)", late[0].shape == start.shape)
-
-    mu, variance = _ddpm_posterior(
-        torch.randn(2, 4, 8, 8),
-        torch.tensor([1, 1]),
-        torch.tensor([-1, -1]),
-        torch.randn(2, 4, 8, 8),
-        scheduler,
-    )
-    check(
-        "terminal t_prev=-1 handled",
-        bool(torch.isfinite(mu).all()) and bool((variance > 0).all()),
-    )
-
-
-def test_group_advantage():
-    print("\n--- RL: group-relative advantage ---")
-    reward = torch.tensor([1.0, 2.0, 3.0, 4.0, 100.0, 101.0, 102.0, 103.0])
-    grouped = reward.view(2, 4)
-    advantage = (
-        (grouped - grouped.mean(dim=1, keepdim=True))
-        / (grouped.std(dim=1, keepdim=True) + 1e-6)
-    ).flatten()
-
-    check(
-        "reference difficulty cancels inside the group",
-        torch.allclose(advantage[:4], advantage[4:], atol=1e-4),
-        f"easy={[round(v, 3) for v in advantage[:4].tolist()]} "
-        f"hard={[round(v, 3) for v in advantage[4:].tolist()]}",
-    )
-    check(
-        "advantage is zero-mean per group",
-        abs(advantage.view(2, 4).mean().item()) < 1e-6,
     )
 
 
@@ -779,37 +637,30 @@ class _DummyVAE:
 
 
 def test_straight_through_clamp():
-    print("\n--- chain RL: straight-through clamp on decode_for_clip ---")
+    print("\n--- RL: straight-through clamp in decode_pixels ---")
     vae = _DummyVAE()
 
     saturated = torch.full((1, 1, 8, 8), 3.0, requires_grad=True)
-    decode_for_clip(vae, saturated).sum().backward()
+    saturated.clamp(-1.0, 1.0).sum().backward()
     hard_grad = saturated.grad.abs().sum().item()
 
     saturated_st = torch.full((1, 1, 8, 8), 3.0, requires_grad=True)
-    decode_for_clip(vae, saturated_st, straight_through=True).sum().backward()
+    decode_pixels(vae, saturated_st).sum().backward()
     st_grad = saturated_st.grad.abs().sum().item()
 
     check("hard clamp kills gradient where the decoder saturates", hard_grad == 0.0)
     check("straight-through preserves it", st_grad > 0.0, f"{st_grad:.3f}")
 
-    inside = torch.zeros(1, 1, 8, 8)
-    a = decode_for_clip(vae, inside)
-    b = decode_for_clip(vae, inside, straight_through=True)
-    check("forward value is unchanged inside the clamp range", torch.equal(a, b))
-
-    over = torch.full((1, 1, 8, 8), 3.0)
+    values = torch.linspace(-3.0, 3.0, 64).view(1, 1, 8, 8)
+    expected = values.expand(-1, 3, -1, -1).clamp(-1.0, 1.0)
     check(
-        "forward value is still clamped outside it",
-        torch.equal(
-            decode_for_clip(vae, over),
-            decode_for_clip(vae, over, straight_through=True),
-        ),
+        "forward value equals the hard clamp",
+        torch.equal(decode_pixels(vae, values), expected),
     )
 
 
 def test_normalize_grad():
-    print("\n--- chain RL: gradient normalizer ---")
+    print("\n--- chain: gradient normalizer ---")
     x = torch.randn(3, 4, 8, 8, requires_grad=True)
     upstream = torch.randn(3, 4, 8, 8) * torch.tensor([1e-6, 1.0, 1e6]).view(3, 1, 1, 1)
 
@@ -837,7 +688,7 @@ def test_normalize_grad():
 
 
 def test_chain_lora_keys():
-    print("\n--- chain RL: adapter key rewrite ---")
+    print("\n--- chain: adapter key rewrite ---")
     named = [
         ("down_blocks.0.attentions.0.attn1.to_q.lora_A.early.weight", torch.zeros(2)),
         ("down_blocks.0.attentions.0.attn1.to_q.lora_B.early.weight", torch.zeros(2)),
@@ -1199,7 +1050,7 @@ def test_capture_mask():
 
 
 def test_chain_window():
-    print("\n--- chain RL: a grad window anywhere in the chain reaches the LoRA ---")
+    print("\n--- chain: a grad window anywhere in the chain reaches the LoRA ---")
     steps = 8
     sigmas = torch.linspace(10.0, 0.0, steps + 1)
     timesteps = torch.linspace(900.0, 20.0, steps)
@@ -1248,8 +1099,8 @@ def test_chain_window():
     check("an empty window produces none", run(set()) == 0.0)
 
 
-def test_quality_rl_reward():
-    print("\n--- quality RL: floor reward and sampling helpers ---")
+def test_rl_reward():
+    print("\n--- RL: floor reward and sampling helpers ---")
     floor, temperature = 5.0, 0.25
     values = torch.tensor([3.0, 4.5, 5.0, 6.0, 8.0], requires_grad=True)
     penalty = floor_penalty(values, floor, temperature)
@@ -1403,6 +1254,7 @@ _APP_MIRRORED_CONSTANTS = {
     "PRIOR_DC": PRIOR_DC,
     "TERMINAL_LEAK": TERMINAL_LEAK,
     "NOISE_LF_STRENGTH": NOISE_LF_STRENGTH,
+    "NEGATIVE_PROMPT": NEGATIVE_PROMPT,
 }
 
 
@@ -1467,9 +1319,7 @@ def main() -> int:
     test_caption_subsetting()
     test_shuffle_buffer_size()
     test_mask_normalization()
-    test_x0_reward(scheduler)
-    test_rollout(scheduler)
-    test_group_advantage()
+    test_predict_x0(scheduler)
     test_sampler_parity()
     test_app_constant_parity()
     test_eval_metrics()
@@ -1477,7 +1327,7 @@ def main() -> int:
     test_normalize_grad()
     test_chain_lora_keys()
     test_chain_window()
-    test_quality_rl_reward()
+    test_rl_reward()
 
     print()
     if _failures:

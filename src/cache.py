@@ -7,7 +7,6 @@ from tqdm import tqdm
 from .dataset import CACHE_WORKERS, prepared_samples
 from .encoding import active_chunks, encode_prompt, pack_chunks, subset_caption
 from .encoder.mask_builder import normalize_mask
-from .model import X0_CLAMP
 from .scheduler import LATENT_DC_STD, LATENT_MEAN
 
 MASK_BLEND_ALPHA_MAX = 0.2
@@ -54,7 +53,6 @@ def pack_text(text_emb, valid, content) -> tuple:
 class LatentStats:
     def __init__(self):
         self.sum_sq: torch.Tensor | None = None
-        self.over: torch.Tensor | None = None
         self.max_abs: torch.Tensor | None = None
         self.dc_sum: torch.Tensor | None = None
         self.dc_sq: torch.Tensor | None = None
@@ -63,25 +61,21 @@ class LatentStats:
 
     def absorb(self, latents: torch.Tensor) -> None:
         values = latents.detach().float()
-        absolute = values.abs()
 
         sum_sq = values.pow(2).sum().double()
-        over = (absolute > X0_CLAMP).sum().double()
-        max_abs = absolute.max()
+        max_abs = values.abs().max()
         dc = values.mean(dim=(2, 3)).double()
 
         if (
             self.sum_sq is None
-            or self.over is None
             or self.max_abs is None
             or self.dc_sum is None
             or self.dc_sq is None
         ):
-            self.sum_sq, self.over, self.max_abs = sum_sq, over, max_abs
+            self.sum_sq, self.max_abs = sum_sq, max_abs
             self.dc_sum, self.dc_sq = dc.sum(0), dc.pow(2).sum(0)
         else:
             self.sum_sq = self.sum_sq + sum_sq
-            self.over = self.over + over
             self.max_abs = torch.maximum(self.max_abs, max_abs)
             self.dc_sum = self.dc_sum + dc.sum(0)
             self.dc_sq = self.dc_sq + dc.pow(2).sum(0)
@@ -92,7 +86,6 @@ class LatentStats:
     def report(self) -> None:
         if (
             self.sum_sq is None
-            or self.over is None
             or self.max_abs is None
             or self.dc_sum is None
             or self.dc_sq is None
@@ -105,8 +98,6 @@ class LatentStats:
         std = (self.dc_sq / self.images - mean.pow(2)).clamp(min=0).sqrt()
         print(
             f"Latent stats: rms {rms:.3f}, max|x| {self.max_abs.item():.2f}, "
-            f"|x| over X0_CLAMP={X0_CLAMP} on "
-            f"{self.over.item() / self.count:.4%} of elements, "
             f"channel mean {[round(v, 3) for v in mean.tolist()]} "
             f"(LATENT_MEAN {list(LATENT_MEAN)}), "
             f"DC std {[round(v, 3) for v in std.tolist()]} "

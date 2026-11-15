@@ -3,7 +3,6 @@ import re
 import string
 
 import torch
-import torch.nn.functional as F
 
 CHUNK_TOKENS = 75
 MAX_CHUNKS = 2
@@ -306,21 +305,3 @@ def encode_for_sampling(prompts, negative_prompt, text_encoders, tokenizers, dev
         trim_chunks(negative, chunks).to(torch.float16),
         negative_pooled.to(torch.float16),
     )
-
-
-def decode_for_clip(
-    vae, latents: torch.Tensor, straight_through: bool = False
-) -> torch.Tensor:
-    decoded = vae.decode(latents.to(dtype=vae.dtype) / vae.config.scaling_factor).sample
-
-    decoded = decoded.float()
-    clamped = decoded.clamp(-1, 1)
-    if straight_through:
-        clamped = decoded + (clamped - decoded).detach()
-    decoded = (clamped + 1) / 2
-    decoded = F.interpolate(
-        decoded, size=(224, 224), mode="bilinear", align_corners=False
-    )
-
-    mean, std = clip_normalization(decoded.device, decoded.dtype)
-    return (decoded - mean) / std

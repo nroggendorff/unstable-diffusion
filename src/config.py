@@ -53,21 +53,9 @@ def get_config() -> argparse.Namespace:
 
     add("refresh_cache_per_segment", _bool, True)
 
-    add("rl_steps", int, 0)
-    add("rl_lr", float, 3e-6)
-    add("rl_grounding_weight", float, 0.4)
-    add("rl_refs", int, 2)
-    add("rl_group", int, 4)
-    add("rl_logprob_subsample", int, 2)
-
     parser.add_argument("--output_dir", type=str, default=default_output_dir())
 
     cfg = parser.parse_args()
-
-    if cfg.rl_steps > 0 and cfg.rl_group < 2:
-        parser.error(
-            "--rl_group must be at least 2; group-relative advantages need a spread."
-        )
 
     cfg.effective_batch_size = cfg.mini_batch_size * cfg.grad_accum_steps
     cfg.train_steps = cfg.steps // cfg.effective_batch_size
