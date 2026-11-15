@@ -1,10 +1,10 @@
 import contextlib
 
 import torch
-import torch.nn.functional as F
 
 from .encoding import rms_scaled_noise, HIDDEN_SPLIT
 from .model import EARLY_SEG, MID_SEG, NUM_INFERENCE_STEPS
+from .scheduler import LATENT_MEAN, NOISE_LF_STRENGTH, TERMINAL_LEAK, lowfreq_field
 
 ALL_SEGMENTS = ["early", "mid", "late"]
 
@@ -12,23 +12,26 @@ _BOUNDARIES = [EARLY_SEG, EARLY_SEG + MID_SEG]
 _BLEND_HALF = 2
 _MAX_RAW_GUIDANCE = 30.0
 
-LATENT_LF_LEVELS = 8
-LATENT_LF_DECAY = 0.66
+
+def prior_deviation(init_sigma: float, strength: float = NOISE_LF_STRENGTH) -> float:
+    sigma = max(init_sigma**2 - 1.0, 0.0) ** 0.5
+    return (1.0 + strength * (TERMINAL_LEAK * sigma) ** 2) ** 0.5
 
 
-def pyramid_latents(
+def prior_latents(
     shape: tuple[int, int, int, int],
     generators: list[torch.Generator],
     device,
     dtype,
+    init_sigma: float,
     lf: float = 1.0,
-    levels: int = LATENT_LF_LEVELS,
-    decay: float = LATENT_LF_DECAY,
-    eps: float = 1e-8,
+    strength: float = NOISE_LF_STRENGTH,
 ) -> torch.Tensor:
     batch, channels, height, width = shape
-    samples = []
+    deviation = prior_deviation(init_sigma, strength)
+    mean = torch.tensor(LATENT_MEAN[:channels], device=device).view(1, channels, 1, 1)
 
+    samples = []
     for index in range(batch):
         generator = generators[index]
         noise = torch.randn(
@@ -37,26 +40,10 @@ def pyramid_latents(
             device=device,
             dtype=torch.float32,
         )
-
         if lf > 0.0:
-            for level in range(1, max(levels, 1)):
-                stride = 2**level
-                low_h, low_w = height // stride, width // stride
-                if low_h < 1 or low_w < 1:
-                    break
-
-                low = torch.randn(
-                    (1, channels, low_h, low_w),
-                    generator=generator,
-                    device=device,
-                    dtype=torch.float32,
-                )
-                noise = noise + F.interpolate(
-                    low, size=(height, width), mode="bilinear", align_corners=False
-                ) * (decay**level * lf)
-
-        rms = noise.pow(2).flatten(1).mean(1).sqrt().view(-1, 1, 1, 1)
-        samples.append(noise / (rms + eps))
+            field = lowfreq_field((1, channels, height, width), generator, device)
+            noise = noise + lf * (mean + deviation * field) / init_sigma
+        samples.append(noise)
 
     return torch.cat(samples).to(dtype)
 
@@ -85,6 +72,20 @@ def progress(step_index: int, num_inference_steps: int) -> float:
     return 1.0 - step_index / max(num_inference_steps - 1, 1)
 
 
+def lied_timestep(
+    schedule: torch.Tensor, step_index: int, offset: float, gamma: float
+) -> torch.Tensor:
+    last = len(schedule) - 1
+    told = min(1.0, max(0.0, (1.0 - step_index / max(last, 1)) ** gamma + offset))
+    position = (1.0 - told) * last
+    low = int(position)
+    return torch.lerp(
+        schedule[low].float(),
+        schedule[min(low + 1, last)].float(),
+        position % 1.0,
+    )
+
+
 @contextlib.contextmanager
 def lie_about_noise(pipe, offset: float, gamma: float):
     if offset == 0.0 and gamma == 1.0:
@@ -95,23 +96,12 @@ def lie_about_noise(pipe, offset: float, gamma: float):
 
     def forward(sample, timestep, *args, **kwargs):
         schedule = pipe.scheduler.timesteps
-        last = len(schedule) - 1
-        told = min(
-            1.0,
-            max(
-                0.0,
-                (1.0 - (schedule - timestep).abs().argmin().item() / max(last, 1))
-                ** gamma
-                + offset,
-            ),
-        )
+        index = int((schedule - timestep).abs().argmin().item())
         return original(
             sample,
-            torch.lerp(
-                schedule[int((1.0 - told) * last)].float(),
-                schedule[min(int((1.0 - told) * last) + 1, last)].float(),
-                (1.0 - told) * last % 1.0,
-            ).to(timestep.dtype if torch.is_tensor(timestep) else torch.float32),
+            lied_timestep(schedule, index, offset, gamma).to(
+                timestep.dtype if torch.is_tensor(timestep) else torch.float32
+            ),
             *args,
             **kwargs,
         )
@@ -121,6 +111,40 @@ def lie_about_noise(pipe, offset: float, gamma: float):
         yield
     finally:
         pipe.unet.forward = original
+
+
+def anchor_plan(
+    positive: torch.Tensor,
+    positive_pooled: torch.Tensor,
+    negative: torch.Tensor,
+    negative_pooled: torch.Tensor,
+    num_inference_steps: int,
+    guidance: float,
+    alpha: float,
+    sigma: float,
+    cutover: float,
+    sigma_cutover: float,
+    generator: torch.Generator | None = None,
+):
+    embed_noise = rms_scaled_noise(positive, sigma, generator, split=HIDDEN_SPLIT)
+    pooled_noise = rms_scaled_noise(positive_pooled, sigma, generator)
+    anchor = torch.lerp(negative, positive, alpha)
+    anchor_pooled = torch.lerp(negative_pooled, positive_pooled, alpha)
+
+    def raw_guidance(step_index: int) -> float:
+        if alpha == 0.0 or progress(step_index, num_inference_steps) <= cutover:
+            return guidance
+        return max(1.01, min(_MAX_RAW_GUIDANCE, (guidance - alpha) / (1.0 - alpha)))
+
+    def anchor_at(step_index: int):
+        step_progress = progress(step_index, num_inference_steps)
+        if step_progress <= cutover:
+            return negative, negative_pooled
+        if step_progress > sigma_cutover:
+            return anchor + embed_noise, anchor_pooled + pooled_noise
+        return anchor, anchor_pooled
+
+    return anchor_at, raw_guidance
 
 
 def anchor_generate(
@@ -152,11 +176,6 @@ def anchor_generate(
     positive_pooled = positive_pooled.expand(batch, -1)
     negative_pooled = negative_pooled.expand(batch, -1)
 
-    def raw_guidance(step_index):
-        if alpha == 0.0 or progress(step_index, num_inference_steps) <= cutover:
-            return guidance
-        return max(1.01, min(_MAX_RAW_GUIDANCE, (guidance - alpha) / (1.0 - alpha)))
-
     if use_lora:
         pipe.enable_lora()
         pipe.set_adapters(ALL_SEGMENTS, adapter_weights(0, strength))
@@ -166,21 +185,19 @@ def anchor_generate(
     jitter_generator = torch.Generator(device=positive.device).manual_seed(
         seeds[0] ^ 0x5EED
     )
-    embed_noise = rms_scaled_noise(
-        positive, sigma, jitter_generator, split=HIDDEN_SPLIT
+    anchor_at, raw_guidance = anchor_plan(
+        positive,
+        positive_pooled,
+        negative,
+        negative_pooled,
+        num_inference_steps,
+        guidance,
+        alpha,
+        sigma,
+        cutover,
+        sigma_cutover,
+        jitter_generator,
     )
-    pooled_noise = rms_scaled_noise(positive_pooled, sigma, jitter_generator)
-
-    def anchor_at(step_index):
-        step_progress = progress(step_index, num_inference_steps)
-        if step_progress <= cutover:
-            return negative, negative_pooled
-
-        anchor = torch.lerp(negative, positive, alpha)
-        anchor_pooled = torch.lerp(negative_pooled, positive_pooled, alpha)
-        if step_progress > sigma_cutover:
-            return anchor + embed_noise, anchor_pooled + pooled_noise
-        return anchor, anchor_pooled
 
     def callback(p, step_index, timestep, callback_kwargs):  # noqa: ARG001
         if use_lora:
@@ -196,13 +213,15 @@ def anchor_generate(
         callback_kwargs["add_text_embeds"] = torch.cat([anchor_pooled, positive_pooled])
         return callback_kwargs
 
+    pipe.scheduler.set_timesteps(num_inference_steps, device=pipe.unet.device)
     generators = [torch.Generator(device="cuda").manual_seed(s) for s in seeds]
     scale = pipe.vae_scale_factor
-    latents = pyramid_latents(
+    latents = prior_latents(
         (batch, pipe.unet.config.in_channels, height // scale, width // scale),
         generators,
         pipe.unet.device,
         pipe.unet.dtype,
+        init_sigma=float(pipe.scheduler.init_noise_sigma),
         lf=latent_lf,
     )
 

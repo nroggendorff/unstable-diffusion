@@ -7,7 +7,8 @@ import torch.nn.functional as F
 
 CHUNK_TOKENS = 75
 MAX_CHUNKS = 2
-SEQUENCE_LENGTH = MAX_CHUNKS * (CHUNK_TOKENS + 2)
+CHUNK_LENGTH = CHUNK_TOKENS + 2
+SEQUENCE_LENGTH = MAX_CHUNKS * CHUNK_LENGTH
 
 HIDDEN_SPLIT = 768
 POOLED_DIM = 1280
@@ -215,6 +216,7 @@ def encode_prompt(prompts, text_encoders, tokenizers, device, content_cache=None
 
     windows = []
     batch_content = []
+    batch_valid = []
 
     for prompt in prompts:
         ids = primary(
@@ -233,6 +235,7 @@ def encode_prompt(prompts, text_encoders, tokenizers, device, content_cache=None
                 + [0] * (CHUNK_TOKENS - len(window))
                 + [0]
             )
+            batch_valid.append([int(chunk == 0 or len(window) > 0)] * CHUNK_LENGTH)
 
     hidden = []
     pooled = None
@@ -254,13 +257,55 @@ def encode_prompt(prompts, text_encoders, tokenizers, device, content_cache=None
     content = torch.tensor(batch_content, dtype=torch.float32, device=device).reshape(
         batch, SEQUENCE_LENGTH
     )
+    valid = torch.tensor(batch_valid, dtype=torch.bool, device=device).reshape(
+        batch, SEQUENCE_LENGTH
+    )
 
     if pooled is None:
         pooled = embeddings.new_zeros((batch, POOLED_DIM))
     else:
         pooled = pooled.reshape(batch, MAX_CHUNKS, -1)[:, 0]
 
-    return embeddings, pooled, content
+    return embeddings, pooled, content, valid
+
+
+def active_chunks(valid: torch.Tensor) -> int:
+    per_chunk = valid.reshape(valid.shape[0], -1, CHUNK_LENGTH).any(-1).any(0)
+    return max(1, int(per_chunk.sum().item()))
+
+
+def trim_chunks(tensor: torch.Tensor, chunks: int) -> torch.Tensor:
+    return tensor[:, : chunks * CHUNK_LENGTH]
+
+
+def pack_chunks(
+    embeddings: torch.Tensor, valid: torch.Tensor, *aligned: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
+    chunks = active_chunks(valid)
+    valid = trim_chunks(valid, chunks)
+    mask = None if bool(valid.all()) else valid.to(embeddings.dtype)
+    return (
+        trim_chunks(embeddings, chunks),
+        mask,
+        [trim_chunks(tensor, chunks) for tensor in aligned],
+    )
+
+
+@torch.no_grad()
+def encode_for_sampling(prompts, negative_prompt, text_encoders, tokenizers, device):
+    positive, pooled, _, valid = encode_prompt(
+        prompts, text_encoders, tokenizers, device
+    )
+    negative, negative_pooled, _, negative_valid = encode_prompt(
+        negative_prompt, text_encoders, tokenizers, device
+    )
+    chunks = max(active_chunks(valid), active_chunks(negative_valid))
+    return (
+        trim_chunks(positive, chunks).to(torch.float16),
+        pooled.to(torch.float16),
+        trim_chunks(negative, chunks).to(torch.float16),
+        negative_pooled.to(torch.float16),
+    )
 
 
 def decode_for_clip(

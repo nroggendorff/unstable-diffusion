@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn.functional as F
 from diffusers import DDPMScheduler
@@ -39,29 +41,51 @@ class SpatiallyVaryingDDPMScheduler(DDPMScheduler):
         return (x_t - b * noise_pred) / a
 
 
-def pyramid_noise(
+LATENT_MEAN = (0.672, 0.108, 0.111, -0.230)
+LATENT_DC_STD = (0.786, 0.392, 0.399, 0.319)
+PRIOR_LEVELS = ((8, 1.15), (16, 1.05), (32, 0.85), (64, 0.2))
+PRIOR_DC = 0.97
+TERMINAL_LEAK = 0.0684
+NOISE_LF_STRENGTH = 1.0
+
+
+def lowfreq_field(
+    shape: tuple[int, int, int, int],
+    generator: torch.Generator | None = None,
+    device="cpu",
+) -> torch.Tensor:
+    batch, channels, height, width = shape
+    field = PRIOR_DC * torch.randn(
+        (batch, channels, 1, 1), generator=generator, device=device
+    )
+    field = field.expand(batch, channels, height, width)
+
+    for stride, amplitude in PRIOR_LEVELS:
+        low = torch.randn(
+            (batch, channels, math.ceil(height / stride), math.ceil(width / stride)),
+            generator=generator,
+            device=device,
+        )
+        field = field + amplitude * F.interpolate(
+            low, size=(height, width), mode="bilinear", align_corners=False
+        )
+
+    std = torch.tensor(LATENT_DC_STD[:channels], device=device)
+    return field * std.view(1, channels, 1, 1)
+
+
+def lowfreq_noise(
     latents: torch.Tensor,
-    levels: int = 4,
-    decay: float = 0.35,
+    strength: float = NOISE_LF_STRENGTH,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     noise = torch.randn(latents.shape, device=latents.device, dtype=torch.float32)
 
-    batch, channels, height, width = latents.shape
-    for level in range(1, max(levels, 1)):
-        stride = 2**level
-        low_h, low_w = height // stride, width // stride
-        if low_h < 1 or low_w < 1:
-            break
-
-        low = torch.randn(
-            (batch, channels, low_h, low_w),
-            device=latents.device,
-            dtype=torch.float32,
+    if strength > 0.0:
+        batch, channels, height, width = latents.shape
+        noise = noise + TERMINAL_LEAK * strength**0.5 * lowfreq_field(
+            (batch, channels, height, width), device=latents.device
         )
-        noise = noise + F.interpolate(
-            low, size=(height, width), mode="bilinear", align_corners=False
-        ) * (decay**level)
 
     rms = noise.pow(2).flatten(1).mean(1).sqrt().view(-1, 1, 1, 1)
     return (noise / (rms + eps)).to(latents.dtype)

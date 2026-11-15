@@ -14,8 +14,8 @@ from .encoder import compute_perceptual_discrepancy, SubjectMaskBuilder
 from .encoder import CrossAttentionCapture
 from .encoder.mask_builder import normalize_mask
 from .scheduler import SpatiallyVaryingDDPMScheduler, compute_spatial_noise_scale
-from .scheduler import pyramid_noise
-from .cache import blend_alpha, blend_masks, stack_added_cond, BucketSampler
+from .scheduler import NOISE_LF_STRENGTH, lowfreq_noise
+from .cache import blend_alpha, blend_masks, pack_text, stack_added_cond, BucketSampler
 from .train import DISCREPANCY_MAX_T
 
 CONDITIONS = ["full", "subset", "shuffled"]
@@ -35,8 +35,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--mask_gain", type=float, default=1.5)
     parser.add_argument("--noise_bg_boost", type=float, default=1.5)
     parser.add_argument("--noise_t_ramp", type=float, default=0.3)
-    parser.add_argument("--noise_lf_levels", type=int, default=8)
-    parser.add_argument("--noise_lf_decay", type=float, default=0.66)
+    parser.add_argument("--noise_lf_strength", type=float, default=NOISE_LF_STRENGTH)
     parser.add_argument("--loss_bg_weight", type=float, default=0.25)
     parser.add_argument("--output_dir", type=str, default=default_output_dir())
     return parser.parse_args()
@@ -62,6 +61,19 @@ def _corr(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return num / den.clamp(min=1e-8)
 
 
+def shuffle_within(content: torch.Tensor, valid: torch.Tensor | None) -> torch.Tensor:
+    shuffled = content.clone()
+    for row in range(content.shape[0]):
+        positions = (
+            torch.arange(content.shape[1], device=content.device)
+            if valid is None
+            else valid[row].nonzero().squeeze(-1)
+        )
+        order = positions[torch.randperm(positions.shape[0], device=content.device)]
+        shuffled[row, positions] = content[row, order]
+    return shuffled
+
+
 def build_probe_cache(args, vae, text_encoders, tokenizers) -> list:
     rng = random.Random(args.seed)
     content_cache: dict = {}
@@ -83,10 +95,10 @@ def build_probe_cache(args, vae, text_encoders, tokenizers) -> list:
                 vae.encode(image.to(DEVICE)).latent_dist.sample()
                 * vae.config.scaling_factor
             )
-            full_emb, full_pooled, full_content = encode_prompt(
+            full_emb, full_pooled, full_content, full_valid = encode_prompt(
                 prompt, text_encoders, tokenizers, DEVICE, content_cache
             )
-            sub_emb, sub_pooled, sub_content = encode_prompt(
+            sub_emb, sub_pooled, sub_content, sub_valid = encode_prompt(
                 subset, text_encoders, tokenizers, DEVICE, content_cache
             )
 
@@ -97,9 +109,11 @@ def build_probe_cache(args, vae, text_encoders, tokenizers) -> list:
                 "pooled": full_pooled.cpu().half(),
                 "time_ids": torch.tensor(time_ids, dtype=torch.float32),
                 "token_content_mask": full_content.cpu(),
+                "token_valid": full_valid.cpu(),
                 "subset_text_emb": sub_emb.cpu().half(),
                 "subset_pooled": sub_pooled.cpu().half(),
                 "subset_token_content_mask": sub_content.cpu(),
+                "subset_token_valid": sub_valid.cpu(),
                 "full_tokens": _token_count(tokenizers[0], prompt),
                 "subset_tokens": _token_count(tokenizers[0], subset),
                 "full_words": len(prompt.split()),
@@ -124,6 +138,7 @@ def condition_mask(
     content,
     alpha,
     blur_sigma,
+    encoder_mask=None,
 ):
     spatial_size = (latents.shape[2], latents.shape[3])
 
@@ -138,6 +153,7 @@ def condition_mask(
                     t,
                     encoder_hidden_states=text_emb,
                     added_cond_kwargs=added_cond_kwargs,
+                    encoder_attention_mask=encoder_mask,
                 ).sample.float()
 
             raw = capture.raw_mask(spatial_size)
@@ -186,9 +202,7 @@ def measure(args, unet, vae, text_encoders, tokenizers, scheduler) -> dict:
             latents = torch.cat([x["latents"] for x in items]).float().to(DEVICE)
             batch = latents.shape[0]
 
-            noise = pyramid_noise(
-                latents, levels=args.noise_lf_levels, decay=args.noise_lf_decay
-            )
+            noise = lowfreq_noise(latents, args.noise_lf_strength)
             t = torch.randint(
                 t_low, t_high + 1, (batch,), device=DEVICE, dtype=torch.long
             )
@@ -199,36 +213,36 @@ def measure(args, unet, vae, text_encoders, tokenizers, scheduler) -> dict:
             embeds = {}
             contents = {}
             conds = {}
+            encoder_masks = {}
 
             pooled, time_ids = stack_added_cond(items, DEVICE)
             subset_pooled = torch.cat([x["subset_pooled"] for x in items]).to(
                 DEVICE, dtype=torch.float16
             )
 
-            embeds["full"] = torch.cat([x["text_emb"] for x in items]).to(
-                DEVICE, dtype=torch.float16
-            )
-            contents["full"] = torch.cat([x["token_content_mask"] for x in items]).to(
-                DEVICE
-            )
-
-            embeds["subset"] = torch.cat([x["subset_text_emb"] for x in items]).to(
-                DEVICE, dtype=torch.float16
-            )
-            contents["subset"] = torch.cat(
-                [x["subset_token_content_mask"] for x in items]
-            ).to(DEVICE)
+            for condition, prefix in (("full", ""), ("subset", "subset_")):
+                embeds[condition], encoder_masks[condition], contents[condition] = (
+                    pack_text(
+                        torch.cat([x[f"{prefix}text_emb"] for x in items]).to(
+                            DEVICE, dtype=torch.float16
+                        ),
+                        torch.cat([x[f"{prefix}token_valid"] for x in items]).to(
+                            DEVICE
+                        ),
+                        torch.cat([x[f"{prefix}token_content_mask"] for x in items]).to(
+                            DEVICE
+                        ),
+                    )
+                )
 
             conds["full"] = {"text_embeds": pooled, "time_ids": time_ids}
             conds["subset"] = {"text_embeds": subset_pooled, "time_ids": time_ids}
             conds["shuffled"] = conds["full"]
 
             embeds["shuffled"] = embeds["full"]
-            contents["shuffled"] = torch.stack(
-                [
-                    row[torch.randperm(row.shape[0], device=DEVICE)]
-                    for row in contents["full"]
-                ]
+            encoder_masks["shuffled"] = encoder_masks["full"]
+            contents["shuffled"] = shuffle_within(
+                contents["full"], encoder_masks["full"]
             )
 
             masks = {}
@@ -247,6 +261,7 @@ def measure(args, unet, vae, text_encoders, tokenizers, scheduler) -> dict:
                     contents[condition],
                     alpha,
                     blur_sigma,
+                    encoder_masks[condition],
                 )
                 masks[condition] = mask
 

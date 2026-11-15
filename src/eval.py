@@ -8,7 +8,7 @@ from tqdm import tqdm
 from transformers import CLIPModel, CLIPProcessor
 
 from .config import default_output_dir
-from .encoding import encode_prompt
+from .encoding import encode_for_sampling
 from .inference import ADAPTER_BASE_PATH, load_pipe, make_two_row_grid
 from .model import NUM_INFERENCE_STEPS
 from .sampler import anchor_generate
@@ -64,6 +64,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--sigma_cutover", type=float, default=0.8)
     parser.add_argument("--offset", type=float, default=0.0)
     parser.add_argument("--gamma", type=float, default=1.0)
+    parser.add_argument("--latent_lf", type=float, default=1.0)
     parser.add_argument("--prompt_limit", type=int, default=0)
     parser.add_argument("--no_contact_sheets", action="store_true")
     return parser.parse_args()
@@ -152,21 +153,12 @@ def main():
     encoders = [pipe.text_encoder, pipe.text_encoder_2]
     tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
 
-    negative, negative_pooled, _ = encode_prompt(
-        NEGATIVE_PROMPT, encoders, tokenizers, device
-    )
-
-    encoded = {}
-    for prompt in prompts:
-        positive, positive_pooled, _ = encode_prompt(
-            prompt, encoders, tokenizers, device
+    encoded = {
+        prompt: encode_for_sampling(
+            prompt, NEGATIVE_PROMPT, encoders, tokenizers, device
         )
-        encoded[prompt] = (
-            positive.to(dtype=torch.float16),
-            positive_pooled.to(dtype=torch.float16),
-            negative.to(dtype=torch.float16),
-            negative_pooled.to(dtype=torch.float16),
-        )
+        for prompt in prompts
+    }
 
     shared = dict(
         strength=args.strength,
@@ -175,6 +167,7 @@ def main():
         num_inference_steps=args.steps,
         cutover=args.cutover,
         sigma_cutover=args.sigma_cutover,
+        latent_lf=args.latent_lf,
     )
 
     print(f"Basin pass ({args.basin_seeds} seeds x {len(prompts)} prompts)...")

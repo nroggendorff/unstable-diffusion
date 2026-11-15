@@ -5,9 +5,9 @@ import numpy as np
 from diffusers import EulerDiscreteScheduler
 from PIL import Image
 
-from .encoding import encode_prompt
+from .encoding import encode_for_sampling
 from .model import load_pipeline
-from .sampler import ALL_SEGMENTS, adapter_weights
+from .sampler import ALL_SEGMENTS, adapter_weights, prior_latents
 
 ADAPTER_BASE_PATH = "./creative-lora"
 
@@ -30,20 +30,25 @@ def load_pipe(adapter_path: str = ADAPTER_BASE_PATH):
 
 
 def _encode_for_pipe(pipe, prompt):
-    device = pipe.text_encoder.device
-    encoders = [pipe.text_encoder, pipe.text_encoder_2]
-    tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
-
-    text_emb, text_pooled, _ = encode_prompt(prompt, encoders, tokenizers, device)
-    neg_emb, neg_pooled, _ = encode_prompt(
-        _NEGATIVE_PROMPT, encoders, tokenizers, device
+    return encode_for_sampling(
+        prompt,
+        _NEGATIVE_PROMPT,
+        [pipe.text_encoder, pipe.text_encoder_2],
+        [pipe.tokenizer, pipe.tokenizer_2],
+        pipe.text_encoder.device,
     )
 
-    return (
-        text_emb.to(dtype=torch.float16),
-        text_pooled.to(dtype=torch.float16),
-        neg_emb.to(dtype=torch.float16),
-        neg_pooled.to(dtype=torch.float16),
+
+def _prior(pipe, generators, batch, width, height, num_inference_steps, latent_lf):
+    pipe.scheduler.set_timesteps(num_inference_steps, device=pipe.unet.device)
+    scale = pipe.vae_scale_factor
+    return prior_latents(
+        (batch, pipe.unet.config.in_channels, height // scale, width // scale),
+        generators,
+        pipe.unet.device,
+        pipe.unet.dtype,
+        init_sigma=float(pipe.scheduler.init_noise_sigma),
+        lf=latent_lf,
     )
 
 
@@ -83,6 +88,7 @@ def infer_batch(
     strength=1.0,
     width=832,
     height=1216,
+    latent_lf=1.0,
 ):
     text_emb, text_pooled, neg_emb, neg_pooled = _encode_for_pipe(pipe, prompt)
 
@@ -100,6 +106,9 @@ def infer_batch(
     # pyrefly: ignore [unsupported-operation]
     seeds = [seed + i for i in range(batch_size)]
     generators = [torch.Generator(device="cuda").manual_seed(s) for s in seeds]
+    latents = _prior(
+        pipe, generators, batch_size, width, height, num_inference_steps, latent_lf
+    )
 
     return pipe(
         prompt_embeds=text_emb,
@@ -111,6 +120,7 @@ def infer_batch(
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         generator=generators,
+        latents=latents,
         callback_on_step_end=make_segment_callback(
             use_lora, num_inference_steps, strength
         ),
@@ -128,6 +138,7 @@ def infer_with_evolution(
     strength=1.0,
     width=832,
     height=1216,
+    latent_lf=1.0,
 ):
     text_emb, text_pooled, neg_emb, neg_pooled = _encode_for_pipe(pipe, prompt)
 
@@ -148,6 +159,9 @@ def infer_with_evolution(
 
     # pyrefly: ignore [bad-argument-type]
     generator = torch.Generator(device="cuda").manual_seed(seed)
+    latents = _prior(
+        pipe, [generator], 1, width, height, num_inference_steps, latent_lf
+    )
 
     result = pipe(
         prompt_embeds=text_emb,
@@ -159,6 +173,7 @@ def infer_with_evolution(
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         generator=generator,
+        latents=latents,
         callback_on_step_end=callback,
         callback_on_step_end_tensor_inputs=["latents"],
     )
@@ -213,6 +228,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--height", type=int, default=1216)
+    parser.add_argument("--latent_lf", type=float, default=1.0)
     args = parser.parse_args()
 
     print("Loading model...")
@@ -225,6 +241,7 @@ def main():
         guidance_scale=args.guidance,
         width=args.width,
         height=args.height,
+        latent_lf=args.latent_lf,
     )
 
     lora_final, lora_frames = infer_with_evolution(

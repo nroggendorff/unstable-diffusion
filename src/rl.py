@@ -6,9 +6,9 @@ from tqdm import tqdm
 
 from .encoder import CLIPVisionEncoder, compute_perceptual_discrepancy
 from .encoding import decode_for_clip
-from .cache import stack_added_cond
+from .cache import pack_text, stack_added_cond, stack_text
 from .model import DEVICE, X0_CLAMP
-from .scheduler import pyramid_noise
+from .scheduler import lowfreq_noise
 
 _CLIP_MODEL = "openai/clip-vit-base-patch32"
 
@@ -94,6 +94,7 @@ def rollout_segment(
     added_cond_kwargs: dict,
     run_base: bool,
     grad_indices: set,
+    encoder_attention_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     x_t = noisy_start.detach().clone()
     log_prob = noisy_start.new_zeros(noisy_start.shape[0])
@@ -121,6 +122,7 @@ def rollout_segment(
                     t,
                     encoder_hidden_states=text_emb,
                     added_cond_kwargs=added_cond_kwargs,
+                    encoder_attention_mask=encoder_attention_mask,
                 ).sample.float()
 
             mu, variance = _ddpm_posterior(x_t, t, t_prev, noise_pred, scheduler)
@@ -146,6 +148,7 @@ def rollout_segment(
                         t,
                         encoder_hidden_states=text_emb,
                         added_cond_kwargs=added_cond_kwargs,
+                        encoder_attention_mask=encoder_attention_mask,
                     ).sample.float()
 
                 base_mu, base_var = _ddpm_posterior(
@@ -199,9 +202,8 @@ def rl_segment(
         items = sampler.draw(cfg.rl_refs)
 
         ref_latents = torch.cat([x["latents"] for x in items]).float().to(DEVICE)
-        text_emb = torch.cat([x["text_emb"] for x in items]).to(
-            DEVICE, dtype=torch.float16
-        )
+        text_emb, content, valid = stack_text(items, DEVICE)
+        text_emb, encoder_mask, _ = pack_text(text_emb, valid, content)
         pooled, time_ids = stack_added_cond(items, DEVICE)
 
         with torch.no_grad():
@@ -214,6 +216,11 @@ def rl_segment(
 
         ref_repeated = ref_latents.repeat_interleave(group, dim=0)
         emb_repeated = text_emb.repeat_interleave(group, dim=0)
+        mask_repeated = (
+            None
+            if encoder_mask is None
+            else encoder_mask.repeat_interleave(group, dim=0)
+        )
         added_cond_kwargs = {
             "text_embeds": pooled.repeat_interleave(group, dim=0),
             "time_ids": time_ids.repeat_interleave(group, dim=0),
@@ -223,9 +230,7 @@ def rl_segment(
         t_start = timesteps[t_start_idx].unsqueeze(0).expand(rollout_batch).to(DEVICE)
 
         with torch.no_grad():
-            start_noise = pyramid_noise(
-                ref_repeated, levels=cfg.noise_lf_levels, decay=cfg.noise_lf_decay
-            )
+            start_noise = lowfreq_noise(ref_repeated, cfg.noise_lf_strength)
             noisy_start = scheduler.add_noise(ref_repeated, start_noise, t_start)
 
         if 0 < subsample < len(eligible):
@@ -246,6 +251,7 @@ def rl_segment(
             added_cond_kwargs=added_cond_kwargs,
             run_base=run_base,
             grad_indices=grad_indices,
+            encoder_attention_mask=mask_repeated,
         )
 
         reward = compute_reward(

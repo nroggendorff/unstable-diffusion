@@ -5,9 +5,10 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from .dataset import CACHE_WORKERS, prepared_samples
-from .encoding import encode_prompt, subset_caption
+from .encoding import active_chunks, encode_prompt, pack_chunks, subset_caption
 from .encoder.mask_builder import normalize_mask
 from .model import X0_CLAMP
+from .scheduler import LATENT_DC_STD, LATENT_MEAN
 
 MASK_BLEND_ALPHA_MAX = 0.2
 
@@ -38,12 +39,27 @@ def stack_added_cond(items: list, device, dtype=torch.float16) -> tuple:
     return pooled, time_ids
 
 
+def stack_text(items: list, device, dtype=torch.float16) -> tuple:
+    text_emb = torch.cat([x["text_emb"] for x in items]).to(device, dtype=dtype)
+    content = torch.cat([x["token_content_mask"] for x in items]).to(device)
+    valid = torch.cat([x["token_valid"] for x in items]).to(device)
+    return text_emb, content, valid
+
+
+def pack_text(text_emb, valid, content) -> tuple:
+    text_emb, mask, (content,) = pack_chunks(text_emb, valid, content)
+    return text_emb, mask, content
+
+
 class LatentStats:
     def __init__(self):
         self.sum_sq: torch.Tensor | None = None
         self.over: torch.Tensor | None = None
         self.max_abs: torch.Tensor | None = None
+        self.dc_sum: torch.Tensor | None = None
+        self.dc_sq: torch.Tensor | None = None
         self.count = 0
+        self.images = 0
 
     def absorb(self, latents: torch.Tensor) -> None:
         values = latents.detach().float()
@@ -52,30 +68,49 @@ class LatentStats:
         sum_sq = values.pow(2).sum().double()
         over = (absolute > X0_CLAMP).sum().double()
         max_abs = absolute.max()
+        dc = values.mean(dim=(2, 3)).double()
 
-        if self.sum_sq is None or self.over is None or self.max_abs is None:
+        if (
+            self.sum_sq is None
+            or self.over is None
+            or self.max_abs is None
+            or self.dc_sum is None
+            or self.dc_sq is None
+        ):
             self.sum_sq, self.over, self.max_abs = sum_sq, over, max_abs
+            self.dc_sum, self.dc_sq = dc.sum(0), dc.pow(2).sum(0)
         else:
             self.sum_sq = self.sum_sq + sum_sq
             self.over = self.over + over
             self.max_abs = torch.maximum(self.max_abs, max_abs)
+            self.dc_sum = self.dc_sum + dc.sum(0)
+            self.dc_sq = self.dc_sq + dc.pow(2).sum(0)
 
         self.count += values.numel()
+        self.images += values.shape[0]
 
     def report(self) -> None:
         if (
             self.sum_sq is None
             or self.over is None
             or self.max_abs is None
+            or self.dc_sum is None
+            or self.dc_sq is None
             or not self.count
         ):
             return
 
         rms = (self.sum_sq / self.count).sqrt().item()
+        mean = self.dc_sum / self.images
+        std = (self.dc_sq / self.images - mean.pow(2)).clamp(min=0).sqrt()
         print(
             f"Latent stats: rms {rms:.3f}, max|x| {self.max_abs.item():.2f}, "
             f"|x| over X0_CLAMP={X0_CLAMP} on "
-            f"{self.over.item() / self.count:.4%} of elements"
+            f"{self.over.item() / self.count:.4%} of elements, "
+            f"channel mean {[round(v, 3) for v in mean.tolist()]} "
+            f"(LATENT_MEAN {list(LATENT_MEAN)}), "
+            f"DC std {[round(v, 3) for v in std.tolist()]} "
+            f"(LATENT_DC_STD {list(LATENT_DC_STD)})"
         )
 
 
@@ -117,7 +152,7 @@ def build_cache(
                 vae.encode(image.to(device)).latent_dist.sample()
                 * vae.config.scaling_factor
             )
-            text_emb, pooled, content = encode_prompt(
+            text_emb, pooled, content, valid = encode_prompt(
                 conditioning, text_encoders, tokenizers, device, content_cache
             )
 
@@ -129,11 +164,16 @@ def build_cache(
                 "pooled": pooled.cpu().half(),
                 "time_ids": torch.tensor(time_ids, dtype=torch.float32),
                 "token_content_mask": content.cpu(),
+                "token_valid": valid.cpu(),
                 "bucket": bucket,
             }
         )
 
     stats.report()
+
+    if cached:
+        two_chunk = sum(active_chunks(item["token_valid"]) > 1 for item in cached)
+        print(f"Two-chunk captions: {two_chunk}/{len(cached)}")
 
     if subset_prob > 0.0 and cached:
         print(

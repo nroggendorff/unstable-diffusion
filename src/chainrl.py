@@ -12,14 +12,13 @@ from .cache import BucketSampler, build_cache
 from .config import default_output_dir
 from .dataset import get_samples
 from .encoder import CLIPVisionEncoder, compute_perceptual_discrepancy
-from .encoding import decode_for_clip, encode_prompt, rms_scaled_noise, HIDDEN_SPLIT
+from .encoding import active_chunks, decode_for_clip, encode_prompt, trim_chunks
 from .eval import NEGATIVE_PROMPT
 from .inference import ADAPTER_BASE_PATH, load_pipe
 from .model import DEVICE, NUM_INFERENCE_STEPS
-from .sampler import ALL_SEGMENTS, adapter_weights, progress, pyramid_latents
+from .sampler import ALL_SEGMENTS, adapter_weights, anchor_plan, prior_latents
 
 _CLIP_MODEL = "openai/clip-vit-base-patch32"
-_MAX_RAW_GUIDANCE = 30.0
 
 
 class _NormalizeGrad(torch.autograd.Function):
@@ -79,11 +78,12 @@ def _unet_eps(
     weights,
     use_lora,
     use_ckpt,
+    adapters=ALL_SEGMENTS,
 ):
     def run(sample, prompt_embeds, add_text_embeds):
         if use_lora:
             pipe.enable_lora()
-            pipe.set_adapters(ALL_SEGMENTS, weights)
+            pipe.set_adapters(adapters, weights)
         else:
             pipe.disable_lora()
 
@@ -124,6 +124,8 @@ def rollout_chain(
     use_lora: bool,
     grad_steps: set,
     grad_target_rms: float,
+    adapters=ALL_SEGMENTS,
+    timestep_at=None,
 ) -> torch.Tensor:
     steps = timesteps.shape[0]
     last = steps - 1
@@ -139,12 +141,14 @@ def rollout_chain(
         sigma = sigmas[index].item()
         delta = (sigmas[index + 1] - sigmas[index]).item()
 
+        carries = needs_grad or (x.requires_grad and torch.is_grad_enabled())
+
         with torch.set_grad_enabled(needs_grad):
             x_in = normalize_grad(x, grad_target_rms) if needs_grad else x
             eps = _unet_eps(
                 pipe,
                 x_in,
-                timesteps[index],
+                timesteps[index] if timestep_at is None else timestep_at(index),
                 embeds,
                 pooled,
                 time_ids,
@@ -153,10 +157,13 @@ def rollout_chain(
                 weights,
                 use_lora,
                 needs_grad,
+                adapters,
             )
+
+        with torch.set_grad_enabled(carries):
             x_next = x_in + eps * delta
 
-        x = x_next if needs_grad else x_next.detach()
+        x = x_next if carries else x_next.detach()
 
     return x
 
@@ -268,7 +275,7 @@ def main():
         total=args.cache_size,
     )
 
-    negative, negative_pooled, _ = encode_prompt(
+    negative, negative_pooled, _, negative_valid = encode_prompt(
         NEGATIVE_PROMPT, encoders, tokenizers, DEVICE
     )
     negative = negative.detach().to(dtype=torch.float16)
@@ -290,7 +297,9 @@ def main():
 
         items = sampler.draw(args.refs)
         ref_latents = torch.cat([x["latents"] for x in items]).float().to(DEVICE)
-        positive = torch.cat([x["text_emb"] for x in items]).to(
+        positive_valid = torch.cat([x["token_valid"] for x in items])
+        chunks = max(active_chunks(positive_valid), active_chunks(negative_valid))
+        positive = trim_chunks(torch.cat([x["text_emb"] for x in items]), chunks).to(
             DEVICE, dtype=torch.float16
         )
         positive_pooled = torch.cat([x["pooled"] for x in items]).to(
@@ -315,54 +324,29 @@ def main():
                 )
             ]
 
-        neg_batch = negative.expand(batch, -1, -1)
-        neg_pooled_batch = negative_pooled.expand(batch, -1)
-        anchor_base = torch.lerp(neg_batch.float(), positive.float(), args.alpha).to(
-            torch.float16
+        anchor_at, raw_guidance = anchor_plan(
+            positive,
+            positive_pooled,
+            trim_chunks(negative, chunks).expand(batch, -1, -1),
+            negative_pooled.expand(batch, -1),
+            steps,
+            args.guidance,
+            args.alpha,
+            args.sigma,
+            args.cutover,
+            args.sigma_cutover,
         )
-        anchor_pooled_base = torch.lerp(
-            neg_pooled_batch.float(), positive_pooled.float(), args.alpha
-        ).to(torch.float16)
-
-        anchor_jittered = (
-            anchor_base + rms_scaled_noise(positive, args.sigma, split=HIDDEN_SPLIT)
-        ).to(torch.float16)
-        anchor_pooled_jittered = (
-            anchor_pooled_base + rms_scaled_noise(positive_pooled, args.sigma)
-        ).to(torch.float16)
-
-        def anchor_at(
-            index,
-            _n=(neg_batch, neg_pooled_batch),
-            _a=(anchor_base, anchor_pooled_base),
-            _j=(anchor_jittered, anchor_pooled_jittered),
-        ):
-            if progress(index, steps) <= args.cutover:
-                return _n
-            if progress(index, steps) > args.sigma_cutover:
-                return _j
-            return _a
-
-        def raw_guidance(index):
-            if args.alpha == 0.0 or progress(index, steps) <= args.cutover:
-                return args.guidance
-            return max(
-                1.01,
-                min(
-                    _MAX_RAW_GUIDANCE,
-                    (args.guidance - args.alpha) / (1.0 - args.alpha),
-                ),
-            )
 
         generators = [
             torch.Generator(device=DEVICE).manual_seed(random.randrange(1 << 30))
             for _ in range(batch)
         ]
-        latents = pyramid_latents(
+        latents = prior_latents(
             tuple(ref_latents.shape),
             generators,
             DEVICE,
             torch.float32,
+            init_sigma=init_sigma,
             lf=args.latent_lf,
         )
 

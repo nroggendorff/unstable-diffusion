@@ -22,6 +22,7 @@ def compute_diffusion_loss(
     bg_weight=0.25,
     alphas_cumprod=None,
     snr_gamma=0.0,
+    encoder_attention_mask=None,
 ):
     target = noise * noise_scale if noise_scale is not None else noise
 
@@ -31,6 +32,7 @@ def compute_diffusion_loss(
             t,
             encoder_hidden_states=text_emb,
             added_cond_kwargs=added_cond_kwargs,
+            encoder_attention_mask=encoder_attention_mask,
         ).sample
 
     residual = (pred.float() - target.float()).pow(2)

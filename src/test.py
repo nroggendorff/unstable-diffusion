@@ -12,7 +12,7 @@ import torch
 from PIL import Image
 
 from .cache import BucketSampler
-from .chainrl import normalize_grad, save_chain_lora
+from .chainrl import normalize_grad, rollout_chain, save_chain_lora
 from .dataset import build_time_ids, prepare_sample, shuffle_buffer_size
 from .encoder.mask_builder import (
     _gaussian_blur,
@@ -20,37 +20,53 @@ from .encoder.mask_builder import (
     percentile_normalize,
     relative_normalize,
 )
+from .encoder.attn_mask import _CapturingProcessor
 from .encoding import (
+    CHUNK_LENGTH,
     CHUNK_TOKENS,
     HIDDEN_SPLIT,
     MAX_CHUNKS,
     POOLED_DIM,
+    active_chunks,
     decode_for_clip,
     encode_prompt,
+    pack_chunks,
     rms_scaled_noise,
     split_clauses,
     subset_caption,
 )
 from .model import EARLY_SEG, MID_SEG, NUM_INFERENCE_STEPS
-from .eval import adherence, angular_spread, radius
+from .eval import PROMPTS, adherence, angular_spread, radius
 from .loss import compute_diffusion_loss, min_snr_weight
+from .qualityrl import composed_prompt, floor_penalty, scaled_bucket
 from .rl import _ddpm_posterior, rollout_segment
 from .sampler import (
-    LATENT_LF_DECAY,
-    LATENT_LF_LEVELS,
     _BLEND_HALF,
     _MAX_RAW_GUIDANCE,
     adapter_weights,
-    pyramid_latents,
+    lied_timestep,
+    prior_deviation,
+    prior_latents,
 )
 from .scheduler import (
+    LATENT_DC_STD,
+    LATENT_MEAN,
+    NOISE_LF_STRENGTH,
+    PRIOR_DC,
+    PRIOR_LEVELS,
+    TERMINAL_LEAK,
     SpatiallyVaryingDDPMScheduler,
     compute_spatial_noise_scale,
-    pyramid_noise,
+    lowfreq_field,
+    lowfreq_noise,
 )
+from .scorer import square_views
 from .train import apply_conditioning_augmentation
 
-TERMINAL_ALPHA_BAR = 0.004660
+INIT_SIGMA = 11.5203
+
+MEASURED_BLOCK_VARIANCE = {8: 0.5978, 16: 0.5075, 32: 0.3966, 64: 0.2995}
+MEASURED_DC_VARIANCE = 0.2554
 
 _failures: list[str] = []
 
@@ -83,6 +99,7 @@ class _DummyUNet(torch.nn.Module):
 
     def forward(self, sample, t, encoder_hidden_states=None, **kwargs):  # noqa: ARG002
         self.seen_added_cond = kwargs.get("added_cond_kwargs", "missing")
+        self.seen_mask = kwargs.get("encoder_attention_mask", "missing")
         return SimpleNamespace(sample=self.conv(sample.float()))
 
 
@@ -133,10 +150,16 @@ class _DummyTextEncoder(torch.nn.Module):
         return output
 
 
-def test_pyramid_noise():
-    print("\n--- pyramid_noise ---")
+def _block_variance(x: torch.Tensor, stride: int) -> float:
+    if stride >= min(x.shape[-2:]):
+        return x.mean(dim=(2, 3)).pow(2).mean().item()
+    return torch.nn.functional.avg_pool2d(x, stride).pow(2).mean().item()
+
+
+def test_lowfreq_noise(scheduler):
+    print("\n--- low-frequency noise prior ---")
     latents = torch.zeros(6, 4, 128, 128)
-    noise = pyramid_noise(latents, levels=LATENT_LF_LEVELS, decay=LATENT_LF_DECAY)
+    noise = lowfreq_noise(latents)
 
     check("shape preserved", noise.shape == latents.shape, str(tuple(noise.shape)))
     check("dtype preserved", noise.dtype == latents.dtype)
@@ -148,35 +171,72 @@ def test_pyramid_noise():
         f"rms={[round(v, 5) for v in rms.tolist()[:3]]}",
     )
 
-    bulk = torch.zeros(600, 4, 128, 128)
-    dc_plain = pyramid_noise(bulk, levels=1).mean(dim=(2, 3)).var().item()
-    dc_pyramid = (
-        pyramid_noise(bulk, levels=LATENT_LF_LEVELS, decay=LATENT_LF_DECAY)
-        .mean(dim=(2, 3))
-        .var()
-        .item()
+    terminal = scheduler.alphas_cumprod[-1].item()
+    check(
+        "TERMINAL_LEAK is the t=999 signal/noise amplitude ratio",
+        abs(TERMINAL_LEAK - (terminal / (1 - terminal)) ** 0.5) < 5e-4,
+        f"{TERMINAL_LEAK} vs {(terminal / (1 - terminal)) ** 0.5:.5f}",
     )
 
+    torch.manual_seed(0)
+    std = torch.tensor(LATENT_DC_STD).view(1, 4, 1, 1)
+    field = lowfreq_field((400, 4, 128, 128)) / std
+    profile = {s: _block_variance(field, s) for s in (8, 16, 32, 64, 128)}
+    targets = {s: v / MEASURED_DC_VARIANCE for s, v in MEASURED_BLOCK_VARIANCE.items()}
+    targets[128] = 1.0
+    worst = max(abs(profile[s] / targets[s] - 1.0) for s in targets)
     check(
-        "defaults bring DC noise to parity with the terminal-SNR leak",
-        0.5 < TERMINAL_ALPHA_BAR / dc_pyramid < 2.0,
-        f"signal/noise DC {TERMINAL_ALPHA_BAR / dc_plain:.1f}x -> "
-        f"{TERMINAL_ALPHA_BAR / dc_pyramid:.2f}x",
+        "the field reproduces the measured latent spectrum, stride 8 to DC",
+        worst < 0.12,
+        " ".join(f"s{s}:{profile[s]:.2f}/{targets[s]:.2f}" for s in targets),
+    )
+
+    for height, width in ((104, 152), (192, 80)):
+        odd = lowfreq_field((300, 4, height, width)) / std
+        dc = odd.mean(dim=(2, 3)).pow(2).mean().item()
+        check(
+            f"DC variance holds on a {width}x{height} latent",
+            abs(dc - 1.0) < 0.2,
+            f"{dc:.3f}",
+        )
+
+    bulk = torch.zeros(400, 4, 128, 128)
+    torch.manual_seed(1)
+    plain = lowfreq_noise(bulk, strength=0.0)
+    torch.manual_seed(1)
+    prior = lowfreq_noise(bulk)
+    check(
+        "strength=0 reduces to plain randn",
+        abs(plain.mean(dim=(2, 3)).var().item() - 1.0 / (128 * 128)) < 1e-5,
+    )
+
+    leak_dc = terminal * MEASURED_DC_VARIANCE
+    noise_dc = (1 - terminal) * (
+        prior.mean(dim=(2, 3)).pow(2).mean().item()
+        - plain.mean(dim=(2, 3)).pow(2).mean().item()
     )
     check(
-        "levels=1 reduces to plain randn",
-        abs(dc_plain - 1.0 / (128 * 128)) < 1e-5,
-        f"dc={dc_plain:.6f} expected={1 / 16384:.6f}",
+        "strength=1 puts the added DC noise at parity with the terminal-SNR leak",
+        0.7 < noise_dc / leak_dc < 1.4,
+        f"added/leak {noise_dc / leak_dc:.2f}x",
+    )
+
+    leak_mid = terminal * MEASURED_BLOCK_VARIANCE[8]
+    excess_mid = (1 - terminal) * (
+        _block_variance(prior, 8) - _block_variance(plain, 8)
     )
     check(
-        "the pyramid reaches the 1x1 floor at the SDXL latent size",
-        LATENT_LF_LEVELS >= 8 and 128 // 2 ** (LATENT_LF_LEVELS - 1) == 1,
-        f"levels={LATENT_LF_LEVELS}",
+        "mid frequencies stay near the leak too (the old pyramid put 35x)",
+        excess_mid / leak_mid < 2.0,
+        f"added/leak at stride 8 {excess_mid / leak_mid:.2f}x",
     )
     check(
-        "survives latents too small for every level",
-        pyramid_noise(torch.zeros(2, 4, 8, 6), levels=LATENT_LF_LEVELS).shape
-        == (2, 4, 8, 6),
+        "survives latents smaller than every level",
+        lowfreq_noise(torch.zeros(2, 4, 8, 6)).shape == (2, 4, 8, 6),
+    )
+    check(
+        "the measured constants cover every SDXL latent channel",
+        len(LATENT_MEAN) == len(LATENT_DC_STD) == 4,
     )
 
 
@@ -234,6 +294,18 @@ def test_loss_weighting(scheduler):
         unet.seen_added_cond is added_cond,
         str(unet.seen_added_cond if isinstance(unet.seen_added_cond, str) else "dict"),
     )
+
+    chunk_mask = torch.ones(4, 154)
+    compute_diffusion_loss(
+        unet,
+        noisy,
+        t,
+        embeddings,
+        noise,
+        added_cond_kwargs=added_cond,
+        encoder_attention_mask=chunk_mask,
+    )
+    check("encoder_attention_mask reaches the UNet", unet.seen_mask is chunk_mask)
     check(
         "loss scale no longer tracks mask coverage",
         abs(sparse - dense) < 1e-5,
@@ -423,6 +495,10 @@ def test_rollout(scheduler):
     )
     check("log_prob is per-sample", log_prob.shape == (8,), str(tuple(log_prob.shape)))
     check("log_prob carries grad", log_prob.requires_grad)
+    check(
+        "an unmasked rollout passes no encoder mask",
+        policy.seen_mask is None and base.seen_mask is None,
+    )
 
     (-(torch.randn(8) * log_prob).mean()).backward()
     policy_grad = policy.conv.weight.grad
@@ -558,9 +634,31 @@ def test_sampler_parity():
         all(adapter_weights(i, 0.8) == app_weights(i, 0.8) for i in range(30)),
     )
 
-    def app_pyramid_latents(shape, generators, device, dtype, lf=1.0, eps=1e-8):
-        levels, decay = 8, 0.66
+    def app_prior_latents(shape, generators, device, dtype, init_sigma, lf=1.0):
+        def app_field(shape, generator, device):
+            batch, channels, height, width = shape
+            field = PRIOR_DC * torch.randn(
+                (batch, channels, 1, 1), generator=generator, device=device
+            )
+            field = field.expand(batch, channels, height, width)
+            for stride, amplitude in PRIOR_LEVELS:
+                low = torch.randn(
+                    (batch, channels, -(-height // stride), -(-width // stride)),
+                    generator=generator,
+                    device=device,
+                )
+                field = field + amplitude * torch.nn.functional.interpolate(
+                    low, size=(height, width), mode="bilinear", align_corners=False
+                )
+            std = torch.tensor(LATENT_DC_STD[:channels], device=device)
+            return field * std.view(1, channels, 1, 1)
+
         batch, channels, height, width = shape
+        sigma = max(init_sigma**2 - 1.0, 0.0) ** 0.5
+        deviation = (1.0 + NOISE_LF_STRENGTH * (TERMINAL_LEAK * sigma) ** 2) ** 0.5
+        mean = torch.tensor(LATENT_MEAN[:channels], device=device).view(
+            1, channels, 1, 1
+        )
         samples = []
         for index in range(batch):
             generator = generators[index]
@@ -571,73 +669,76 @@ def test_sampler_parity():
                 dtype=torch.float32,
             )
             if lf > 0.0:
-                for level in range(1, max(levels, 1)):
-                    stride = 2**level
-                    low_h, low_w = height // stride, width // stride
-                    if low_h < 1 or low_w < 1:
-                        break
-                    low = torch.randn(
-                        (1, channels, low_h, low_w),
-                        generator=generator,
-                        device=device,
-                        dtype=torch.float32,
-                    )
-                    noise = noise + torch.nn.functional.interpolate(
-                        low, size=(height, width), mode="bilinear", align_corners=False
-                    ) * (decay**level * lf)
-            rms = noise.pow(2).flatten(1).mean(1).sqrt().view(-1, 1, 1, 1)
-            samples.append(noise / (rms + eps))
+                field = app_field((1, channels, height, width), generator, device)
+                noise = noise + lf * (mean + deviation * field) / init_sigma
+            samples.append(noise)
         return torch.cat(samples).to(dtype)
 
     shape = (2, 4, 64, 48)
     matches = True
     for lf in (0.0, 0.5, 1.0):
-        mine = pyramid_latents(
+        mine = prior_latents(
             shape,
             [torch.Generator().manual_seed(7 + i) for i in range(shape[0])],
             "cpu",
             torch.float32,
+            init_sigma=INIT_SIGMA,
             lf=lf,
         )
-        theirs = app_pyramid_latents(
+        theirs = app_prior_latents(
             shape,
             [torch.Generator().manual_seed(7 + i) for i in range(shape[0])],
             "cpu",
             torch.float32,
+            init_sigma=INIT_SIGMA,
             lf=lf,
         )
         matches = matches and bool(torch.equal(mine, theirs))
+    check("sampler.prior_latents matches the app.py copy across lf", matches)
 
-    check("sampler.pyramid_latents matches the app.py copy across lf", matches)
-
-    latents = pyramid_latents(
+    plain = prior_latents(
         shape,
         [torch.Generator().manual_seed(3 + i) for i in range(shape[0])],
         "cpu",
         torch.float32,
-        lf=1.0,
-    )
-    rms = latents.pow(2).flatten(1).mean(1).sqrt()
-    check(
-        "pyramid_latents is unit RMS per sample",
-        bool((rms - 1.0).abs().max().item() < 1e-4),
-        f"max deviation {float((rms - 1.0).abs().max()):.2e}",
-    )
-
-    flat = pyramid_latents(
-        shape,
-        [torch.Generator().manual_seed(11 + i) for i in range(shape[0])],
-        "cpu",
-        torch.float32,
+        init_sigma=INIT_SIGMA,
         lf=0.0,
     )
-    dc_pyramid = latents.mean(dim=(2, 3)).pow(2).mean().item()
-    dc_flat = flat.mean(dim=(2, 3)).pow(2).mean().item()
-    check(
-        "lf=1 carries more DC energy than lf=0",
-        dc_pyramid > 5.0 * dc_flat,
-        f"pyramid {dc_pyramid:.5f} vs flat {dc_flat:.5f}",
+    reference = torch.cat(
+        [
+            torch.randn((1, 4, 64, 48), generator=torch.Generator().manual_seed(3 + i))
+            for i in range(2)
+        ]
     )
+    check("lf=0 is exactly the generator's plain randn", torch.equal(plain, reference))
+
+    def original_lie(schedule, timestep, offset, gamma):
+        last = len(schedule) - 1
+        told = min(
+            1.0,
+            max(
+                0.0,
+                (1.0 - (schedule - timestep).abs().argmin().item() / max(last, 1))
+                ** gamma
+                + offset,
+            ),
+        )
+        return torch.lerp(
+            schedule[int((1.0 - told) * last)].float(),
+            schedule[min(int((1.0 - told) * last) + 1, last)].float(),
+            (1.0 - told) * last % 1.0,
+        )
+
+    schedule = make_scheduler().timesteps.float()
+    same = all(
+        torch.allclose(
+            lied_timestep(schedule, index, offset, gamma),
+            original_lie(schedule, schedule[index], offset, gamma),
+        )
+        for offset, gamma in ((0.0, 0.8), (0.1, 1.0), (-0.2, 1.5))
+        for index in range(len(schedule))
+    )
+    check("lied_timestep reproduces the original lie_about_noise", same)
 
 
 def test_eval_metrics():
@@ -924,27 +1025,38 @@ def test_mask_normalization():
 
 def test_noise_prior_match():
     print("\n--- noise prior: trainer and sampler agree ---")
-    shape = (128, 4, 128, 128)
+    shape = (256, 4, 64, 64)
+    torch.manual_seed(2)
 
-    inference = pyramid_latents(
+    sigma = (INIT_SIGMA**2 - 1.0) ** 0.5
+    data = torch.tensor(LATENT_MEAN).view(1, 4, 1, 1) + lowfreq_field(shape)
+    training = data + sigma * lowfreq_noise(torch.zeros(shape))
+    inference = INIT_SIGMA * prior_latents(
         shape,
-        [torch.Generator().manual_seed(100 + i) for i in range(shape[0])],
+        [torch.Generator().manual_seed(500 + i) for i in range(shape[0])],
         "cpu",
         torch.float32,
-        lf=1.0,
-    )
-    training = pyramid_noise(
-        torch.zeros(shape), levels=LATENT_LF_LEVELS, decay=LATENT_LF_DECAY
+        init_sigma=INIT_SIGMA,
     )
 
-    dc_inference = inference.mean(dim=(2, 3)).var().item()
-    dc_training = training.mean(dim=(2, 3)).var().item()
-
+    dc_train = training.mean(dim=(2, 3))
+    dc_infer = inference.mean(dim=(2, 3))
+    mean_gap = (dc_train.mean(0) - dc_infer.mean(0)).abs().max().item()
+    var_ratio = (dc_infer.var(0) / dc_train.var(0)).tolist()
     check(
-        "inference latents carry the same DC energy the trainer taught",
-        0.75 < dc_inference / dc_training < 1.35,
-        f"inference {dc_inference:.5f} vs training {dc_training:.5f} "
-        f"({dc_inference / dc_training:.2f}x)",
+        "inference x_T has the per-channel DC mean training x_T has",
+        mean_gap < 0.12,
+        f"max gap {mean_gap:.3f}",
+    )
+    check(
+        "inference x_T has the per-channel DC spread training x_T has",
+        all(0.7 < r < 1.4 for r in var_ratio),
+        f"ratios {[round(r, 2) for r in var_ratio]}",
+    )
+    check(
+        "deviation gain at the 30-step start sigma",
+        abs(prior_deviation(INIT_SIGMA) - 1.272) < 0.01,
+        f"{prior_deviation(INIT_SIGMA):.3f}",
     )
 
 
@@ -955,7 +1067,9 @@ def test_dual_encoder_encoding():
     encoders = [_DummyTextEncoder(768), _DummyTextEncoder(1280, projection=1280)]
 
     prompts = ["a girl with long pink hair", "a quiet room"]
-    embeddings, pooled, content = encode_prompt(prompts, encoders, tokenizers, "cpu")
+    embeddings, pooled, content, valid = encode_prompt(
+        prompts, encoders, tokenizers, "cpu"
+    )
 
     check(
         "both encoders concatenate to cross_attention_dim 2048",
@@ -1009,11 +1123,192 @@ def test_dual_encoder_encoding():
     words = [f"word{i}" for i in range(75)]
     short = " ".join(words)
     long = " ".join(words + ["extra"] * 5)
-    _, pooled_short, _ = encode_prompt([short], encoders, tokenizers, "cpu")
-    _, pooled_long, _ = encode_prompt([long], encoders, tokenizers, "cpu")
+    _, pooled_short, _, _ = encode_prompt([short], encoders, tokenizers, "cpu")
+    _, pooled_long, _, _ = encode_prompt([long], encoders, tokenizers, "cpu")
     check(
         "pooled comes from the first chunk only",
         torch.allclose(pooled_short, pooled_long, atol=1e-5),
+    )
+
+    check(
+        "a short prompt marks only its first chunk valid",
+        bool(valid[:, :CHUNK_LENGTH].all()) and not bool(valid[:, CHUNK_LENGTH:].any()),
+    )
+    check("a short batch packs to one chunk", active_chunks(valid) == 1)
+
+    mixed_emb, _, mixed_content, mixed_valid = encode_prompt(
+        [prompts[0], long], encoders, tokenizers, "cpu"
+    )
+    check(
+        "an 80-token prompt spills into the second chunk",
+        active_chunks(mixed_valid[1:]) == 2,
+    )
+
+    packed, mask, (packed_content,) = pack_chunks(embeddings, valid, content)
+    check(
+        "a one-chunk batch trims to 77 tokens and needs no mask",
+        packed.shape[1] == CHUNK_LENGTH and mask is None,
+        str(tuple(packed.shape)),
+    )
+    check(
+        "the content mask is trimmed alongside",
+        packed_content.shape[1] == CHUNK_LENGTH,
+    )
+
+    packed, mask, _ = pack_chunks(mixed_emb, mixed_valid, mixed_content)
+    check(
+        "a mixed batch keeps both chunks and masks the short row's empty one",
+        packed.shape[1] == 2 * CHUNK_LENGTH
+        and mask is not None
+        and float(mask[0, CHUNK_LENGTH:].sum()) == 0.0
+        and float(mask[1].sum()) == 2 * CHUNK_LENGTH,
+    )
+
+
+def test_capture_mask():
+    print("\n--- masked cross-attention equals trimmed cross-attention ---")
+    from diffusers.models.attention_processor import Attention
+
+    torch.manual_seed(4)
+    attn = Attention(query_dim=8, cross_attention_dim=6, heads=2, dim_head=4)
+    hidden = torch.randn(2, 5, 8)
+    context = torch.randn(2, 6, 6)
+    keep = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=torch.float32)
+    bias = ((1 - keep) * -10000.0).unsqueeze(1)
+
+    seen: list = []
+    processor = _CapturingProcessor(SimpleNamespace(absorb=seen.append))
+    with torch.no_grad():
+        masked = processor(
+            attn, hidden, encoder_hidden_states=context, attention_mask=bias
+        )
+        trimmed = processor(attn, hidden[:1], encoder_hidden_states=context[:1, :3])
+        full = processor(attn, hidden[1:], encoder_hidden_states=context[1:])
+    weights = seen[0].view(2, 2, 5, 6)
+
+    check(
+        "masked tokens receive no attention",
+        float(weights[0, :, :, 3:].abs().max()) < 1e-6,
+    )
+    check(
+        "masking the empty chunk is the same as removing it",
+        torch.allclose(masked[:1], trimmed, atol=1e-5),
+        f"max diff {float((masked[:1] - trimmed).abs().max()):.2e}",
+    )
+    check("unmasked rows are untouched", torch.allclose(masked[1:], full, atol=1e-5))
+
+
+def test_chain_window():
+    print("\n--- chain RL: a grad window anywhere in the chain reaches the LoRA ---")
+    steps = 8
+    sigmas = torch.linspace(10.0, 0.0, steps + 1)
+    timesteps = torch.linspace(900.0, 20.0, steps)
+    embeds = torch.randn(2, 5, 16)
+    pooled = torch.randn(2, 12)
+
+    def anchor_at(index):  # noqa: ARG001
+        return embeds, pooled
+
+    def run(window):
+        unet = _DummyUNet()
+        pipe = SimpleNamespace(
+            unet=unet,
+            enable_lora=lambda: None,
+            disable_lora=lambda: None,
+            set_adapters=lambda *args, **kwargs: None,  # noqa: ARG005
+        )
+        out = rollout_chain(
+            pipe,
+            10.05,
+            sigmas,
+            timesteps,
+            torch.randn(2, 4, 8, 8),
+            embeds,
+            pooled,
+            torch.zeros(4, 6),
+            anchor_at,
+            lambda index: 5.0,  # noqa: ARG005
+            1.0,
+            True,
+            window,
+            0.0,
+        )
+        if not out.requires_grad:
+            return 0.0
+        out.pow(2).mean().backward()
+        grad = unet.conv.weight.grad
+        return 0.0 if grad is None else float(grad.abs().sum())
+
+    middle, start, end = run({3, 4}), run({0, 1}), run({6, 7})
+    check(
+        "windows at the start, middle and end all produce gradient",
+        middle > 0 and start > 0 and end > 0,
+        f"start {start:.2e} middle {middle:.2e} end {end:.2e}",
+    )
+    check("an empty window produces none", run(set()) == 0.0)
+
+
+def test_quality_rl_reward():
+    print("\n--- quality RL: floor reward and sampling helpers ---")
+    floor, temperature = 5.0, 0.25
+    values = torch.tensor([3.0, 4.5, 5.0, 6.0, 8.0], requires_grad=True)
+    penalty = floor_penalty(values, floor, temperature)
+    penalty.sum().backward()
+    grad = values.grad
+    assert grad is not None
+
+    check(
+        "far below the floor the penalty is linear (slope -1)",
+        abs(grad[0].item() + 1.0) < 1e-3 and abs(penalty[0].item() - 2.0) < 1e-3,
+        f"grad {grad[0].item():.4f} penalty {penalty[0].item():.4f}",
+    )
+    check(
+        "well above the floor there is effectively no push",
+        abs(grad[4].item()) < 1e-4 and penalty[4].item() < 1e-4,
+        f"grad {grad[4].item():.2e}",
+    )
+    check(
+        "the push fades monotonically across the floor",
+        bool((grad[:-1].abs() >= grad[1:].abs()).all()),
+    )
+
+    check(
+        "scaled buckets stay multiples of 32",
+        all(
+            side % 32 == 0
+            for bucket in ((832, 1216), (1024, 1024), (1344, 768))
+            for scale in (1.0, 0.75, 0.5)
+            for side in scaled_bucket(bucket, scale)
+        ),
+    )
+    check("scale 1 keeps the bucket", scaled_bucket((832, 1216), 1.0) == (832, 1216))
+
+    rng = random.Random(0)
+    composed = {composed_prompt(rng) for _ in range(300)}
+    check(
+        "composed RL prompts never reuse an eval prompt",
+        not composed & set(PROMPTS),
+        f"{len(composed)} distinct",
+    )
+
+    portrait = torch.randn(1, 3, 600, 400, requires_grad=True)
+    views = square_views(portrait, views=3)
+    check(
+        "portrait views are 224 squares",
+        tuple(views.shape) == (1, 3, 3, 224, 224),
+        str(tuple(views.shape)),
+    )
+    views.sum().backward()
+    view_grad = portrait.grad
+    assert view_grad is not None
+    check(
+        "views cover both ends of the long axis",
+        float(view_grad[..., :20, :].abs().sum()) > 0
+        and float(view_grad[..., -20:, :].abs().sum()) > 0,
+    )
+    check(
+        "a square image is a single view",
+        square_views(torch.randn(2, 3, 300, 300)).shape[1] == 1,
     )
 
 
@@ -1102,8 +1397,12 @@ _APP_MIRRORED_CONSTANTS = {
     "MAX_CHUNKS": MAX_CHUNKS,
     "HIDDEN_SPLIT": HIDDEN_SPLIT,
     "POOLED_DIM": POOLED_DIM,
-    "LATENT_LF_LEVELS": LATENT_LF_LEVELS,
-    "LATENT_LF_DECAY": LATENT_LF_DECAY,
+    "LATENT_MEAN": LATENT_MEAN,
+    "LATENT_DC_STD": LATENT_DC_STD,
+    "PRIOR_LEVELS": PRIOR_LEVELS,
+    "PRIOR_DC": PRIOR_DC,
+    "TERMINAL_LEAK": TERMINAL_LEAK,
+    "NOISE_LF_STRENGTH": NOISE_LF_STRENGTH,
 }
 
 
@@ -1155,9 +1454,10 @@ def main() -> int:
     random.seed(0)
     scheduler = make_scheduler()
 
-    test_pyramid_noise()
+    test_lowfreq_noise(scheduler)
     test_noise_prior_match()
     test_dual_encoder_encoding()
+    test_capture_mask()
     test_rms_split()
     test_size_conditioning()
     test_min_snr(scheduler)
@@ -1176,6 +1476,8 @@ def main() -> int:
     test_straight_through_clamp()
     test_normalize_grad()
     test_chain_lora_keys()
+    test_chain_window()
+    test_quality_rl_reward()
 
     print()
     if _failures:

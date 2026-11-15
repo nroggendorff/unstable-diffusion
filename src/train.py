@@ -29,14 +29,16 @@ from .encoding import encode_prompt, rms_scaled_noise, HIDDEN_SPLIT
 from .scheduler import (
     SpatiallyVaryingDDPMScheduler,
     compute_spatial_noise_scale,
-    pyramid_noise,
+    lowfreq_noise,
 )
 from .loss import compute_diffusion_loss
 from .cache import (
     build_cache,
     blend_alpha,
     blend_masks,
+    pack_text,
     stack_added_cond,
+    stack_text,
     BucketSampler,
 )
 from .rl import rl_segment
@@ -139,12 +141,7 @@ def train_segment(
             items = sampler.draw(cfg.mini_batch_size)
 
             latents = torch.cat([x["latents"] for x in items]).float().to(DEVICE)
-            text_emb = torch.cat([x["text_emb"] for x in items]).to(
-                DEVICE, dtype=torch.float16
-            )
-            token_content = torch.cat([x["token_content_mask"] for x in items]).to(
-                DEVICE
-            )
+            text_emb, token_content, token_valid = stack_text(items, DEVICE)
             pooled, time_ids = stack_added_cond(items, DEVICE)
 
             batch = latents.shape[0]
@@ -152,6 +149,9 @@ def train_segment(
 
             text_emb, pooled, token_content = apply_conditioning_augmentation(
                 text_emb, pooled, token_content, empty_emb, empty_pooled, cfg
+            )
+            text_emb, encoder_mask, token_content = pack_text(
+                text_emb, token_valid, token_content
             )
 
             if cfg.embed_jitter_max > 0.0:
@@ -163,9 +163,7 @@ def train_segment(
 
             added_cond_kwargs = {"text_embeds": pooled, "time_ids": time_ids}
 
-            noise = pyramid_noise(
-                latents, levels=cfg.noise_lf_levels, decay=cfg.noise_lf_decay
-            )
+            noise = lowfreq_noise(latents, cfg.noise_lf_strength)
             t = torch.randint(
                 t_low, t_high + 1, (batch,), device=DEVICE, dtype=torch.long
             )
@@ -181,6 +179,7 @@ def train_segment(
                             t,
                             encoder_hidden_states=text_emb,
                             added_cond_kwargs=added_cond_kwargs,
+                            encoder_attention_mask=encoder_mask,
                         ).sample.float()
 
                     attn_mask = capture.build_mask(spatial_size)
@@ -222,6 +221,7 @@ def train_segment(
                 bg_weight=cfg.loss_bg_weight,
                 alphas_cumprod=scheduler.alphas_cumprod,
                 snr_gamma=cfg.snr_gamma,
+                encoder_attention_mask=encoder_mask,
             )
 
             # pyrefly: ignore [missing-attribute]
@@ -269,7 +269,7 @@ def build_sampler(
         workers=cfg.cache_workers,
     )
 
-    empty_emb, empty_pooled, _ = encode_prompt("", text_encoders, tokenizers, DEVICE)
+    empty_emb, empty_pooled, _, _ = encode_prompt("", text_encoders, tokenizers, DEVICE)
     empty_emb = empty_emb.detach().to(dtype=torch.float16)
     empty_pooled = empty_pooled.detach().to(dtype=torch.float16)
 
@@ -309,7 +309,7 @@ def train(cfg: argparse.Namespace):
         f"refresh_per_segment="
         f"{cfg.refresh_cache_per_segment}, lr={cfg.lr}, lora_rank={cfg.lora_rank}, "
         f"lora_alpha={cfg.lora_alpha}, bg_boost={cfg.noise_bg_boost}, "
-        f"lf_levels={cfg.noise_lf_levels}, lf_decay={cfg.noise_lf_decay}, "
+        f"lf_strength={cfg.noise_lf_strength}, "
         f"snr_gamma={cfg.snr_gamma}, cond_partial={cfg.cond_partial_prob}, "
         f"mask_gain={cfg.mask_gain}, "
         f"caption_subset={cfg.caption_subset_prob}/{cfg.caption_subset_min}, "

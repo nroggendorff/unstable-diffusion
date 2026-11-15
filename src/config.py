@@ -1,5 +1,7 @@
 import argparse
 
+from .scheduler.spatial_scheduler import NOISE_LF_STRENGTH
+
 _DEFAULT_OUTPUT_DIR = "./creative-lora"
 
 
@@ -37,8 +39,7 @@ def get_config() -> argparse.Namespace:
 
     add("noise_bg_boost", float, 1.5)
     add("noise_t_ramp", float, 0.3)
-    add("noise_lf_levels", int, 8)
-    add("noise_lf_decay", float, 0.66)
+    add("noise_lf_strength", float, NOISE_LF_STRENGTH)
 
     add("loss_bg_weight", float, 0.25)
     add("snr_gamma", float, 5.0)

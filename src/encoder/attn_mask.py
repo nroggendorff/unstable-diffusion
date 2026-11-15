@@ -60,6 +60,11 @@ class _CapturingProcessor:
         k = attn.to_k(kv)
         v = attn.to_v(kv)
 
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(
+                attention_mask, kv.shape[1], hidden_states.shape[0]
+            )
+
         q = attn.head_to_batch_dim(q)
         k = attn.head_to_batch_dim(k)
         v = attn.head_to_batch_dim(v)
@@ -67,7 +72,7 @@ class _CapturingProcessor:
         scale = q.shape[-1] ** -0.5
         scores = torch.bmm(q, k.transpose(-1, -2)) * scale
         if attention_mask is not None:
-            scores = scores + attention_mask
+            scores = scores + attention_mask.to(scores.dtype)
 
         weights = torch.softmax(scores.float(), dim=-1)
 
