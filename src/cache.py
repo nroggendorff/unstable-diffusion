@@ -1,3 +1,6 @@
+import hashlib
+import json
+import os
 import random
 
 import torch
@@ -174,6 +177,22 @@ def build_cache(
         )
 
     return cached
+
+
+def cache_key(**fields) -> str:
+    blob = json.dumps(fields, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def save_cache(cached: list, path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    partial = path + ".partial"
+    torch.save(cached, partial)
+    os.replace(partial, path)
+
+
+def load_cache(path: str) -> list:
+    return torch.load(path, weights_only=True)
 
 
 def group_by_bucket(cached: list, min_size: int) -> dict:

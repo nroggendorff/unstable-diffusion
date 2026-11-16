@@ -1,5 +1,6 @@
 import argparse
 import gc
+import os
 import random
 
 import torch
@@ -14,16 +15,24 @@ from .model import (
     load_unet,
     get_lora_config,
     DEVICE,
+    MODEL_ID,
     NUM_INFERENCE_STEPS,
     SEGMENT_TIMESTEP_RANGES,
+    VAE_ID,
 )
-from .dataset import get_samples
+from .dataset import BUCKETS, DATASET_ID, get_samples
 from .encoder import (
     compute_perceptual_discrepancy,
     SubjectMaskBuilder,
     CrossAttentionCapture,
 )
-from .encoding import encode_prompt, rms_scaled_noise, HIDDEN_SPLIT
+from .encoding import (
+    CHUNK_TOKENS,
+    HIDDEN_SPLIT,
+    MAX_CHUNKS,
+    encode_prompt,
+    rms_scaled_noise,
+)
 from .scheduler import (
     SpatiallyVaryingDDPMScheduler,
     compute_spatial_noise_scale,
@@ -34,7 +43,10 @@ from .cache import (
     build_cache,
     blend_alpha,
     blend_masks,
+    cache_key,
+    load_cache,
     pack_text,
+    save_cache,
     stack_added_cond,
     stack_text,
     BucketSampler,
@@ -44,6 +56,37 @@ from .io import save_lora
 SEGMENTS = ["early", "mid", "late"]
 
 DISCREPANCY_MAX_T = 600
+
+
+def segment_plan(segments: list[str], refresh: bool) -> list[tuple[int, str, int]]:
+    unknown = [s for s in segments if s not in SEGMENTS]
+    if unknown or not segments:
+        raise ValueError(
+            f"--segments must be a non-empty subset of {SEGMENTS}, got {segments}"
+        )
+    return [
+        (index, name, index if refresh else 0)
+        for index, name in enumerate(SEGMENTS)
+        if name in segments
+    ]
+
+
+def cache_path(cfg: argparse.Namespace, seed: int) -> str:
+    key = cache_key(
+        dataset=DATASET_ID,
+        model=MODEL_ID,
+        vae=VAE_ID,
+        buckets=BUCKETS,
+        chunk_tokens=CHUNK_TOKENS,
+        max_chunks=MAX_CHUNKS,
+        seed=seed,
+        cache_size=cfg.cache_size,
+        shuffle_buffer=cfg.shuffle_buffer,
+        caption_subset_prob=cfg.caption_subset_prob,
+        caption_subset_min=cfg.caption_subset_min,
+    )
+    name = f"latents-seed{seed}-n{cfg.cache_size}-{key}.pt"
+    return os.path.join(cfg.cache_dir, name)
 
 
 def _make_inputs_require_grad(module, input, output):  # noqa: ARG001
@@ -244,19 +287,27 @@ def build_sampler(
     for encoder in text_encoders:
         encoder.to(DEVICE)
 
-    print(f"Building latent cache (seed={seed})...")
-    cached = build_cache(
-        get_samples(cfg.cache_size, seed=seed, shuffle_buffer=cfg.shuffle_buffer),
-        vae,
-        text_encoders,
-        tokenizers,
-        DEVICE,
-        total=cfg.cache_size,
-        subset_prob=cfg.caption_subset_prob,
-        subset_min=cfg.caption_subset_min,
-        seed=seed,
-        workers=cfg.cache_workers,
-    )
+    path = cache_path(cfg, seed) if cfg.cache_dir else ""
+    if path and os.path.exists(path):
+        print(f"Loading latent cache (seed={seed}) from {path}...")
+        cached = load_cache(path)
+    else:
+        print(f"Building latent cache (seed={seed})...")
+        cached = build_cache(
+            get_samples(cfg.cache_size, seed=seed, shuffle_buffer=cfg.shuffle_buffer),
+            vae,
+            text_encoders,
+            tokenizers,
+            DEVICE,
+            total=cfg.cache_size,
+            subset_prob=cfg.caption_subset_prob,
+            subset_min=cfg.caption_subset_min,
+            seed=seed,
+            workers=cfg.cache_workers,
+        )
+        if path:
+            save_cache(cached, path)
+            print(f"Saved latent cache to {path}")
 
     empty_emb, empty_pooled, _, _ = encode_prompt("", text_encoders, tokenizers, DEVICE)
     empty_emb = empty_emb.detach().to(dtype=torch.float16)
@@ -291,8 +342,11 @@ def train(cfg: argparse.Namespace):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+    plan = segment_plan(cfg.segments, cfg.refresh_cache_per_segment)
+
     print(
-        f"Config: steps={cfg.steps}, mini_batch={cfg.mini_batch_size}, "
+        f"Config: segments={cfg.segments}, cache_dir={cfg.cache_dir or None}, "
+        f"steps={cfg.steps}, mini_batch={cfg.mini_batch_size}, "
         f"grad_accum={cfg.grad_accum_steps}, train_steps={cfg.train_steps}, "
         f"cache_size={cfg.cache_size}, shuffle_buffer={cfg.shuffle_buffer}, "
         f"refresh_per_segment="
@@ -329,24 +383,25 @@ def train(cfg: argparse.Namespace):
 
     min_size = cfg.mini_batch_size
 
-    sampler, empty_emb, empty_pooled = build_sampler(
-        vae, text_encoders, tokenizers, min_size, 0, cfg, models["zero_uncond"]
-    )
-
-    for index, segment_name in enumerate(SEGMENTS):
-        if index > 0 and cfg.refresh_cache_per_segment:
-            sampler = None
+    built = None
+    for _, segment_name, cache_seed in plan:
+        if built is None or built[0] != cache_seed:
+            built = sampler = None
             gc.collect()
             torch.cuda.empty_cache()
-            sampler, empty_emb, empty_pooled = build_sampler(
-                vae,
-                text_encoders,
-                tokenizers,
-                min_size,
-                index,
-                cfg,
-                models["zero_uncond"],
+            built = (
+                cache_seed,
+                *build_sampler(
+                    vae,
+                    text_encoders,
+                    tokenizers,
+                    min_size,
+                    cache_seed,
+                    cfg,
+                    models["zero_uncond"],
+                ),
             )
+        _, sampler, empty_emb, empty_pooled = built
 
         unet = train_segment(
             segment_name=segment_name,

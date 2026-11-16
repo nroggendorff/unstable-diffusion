@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import torch
 from PIL import Image
 
-from .cache import BucketSampler
+from .cache import BucketSampler, load_cache, save_cache
 from .chain import normalize_grad, rollout_chain, save_chain_lora
 from .dataset import build_time_ids, prepare_sample, shuffle_buffer_size
 from .encoder.mask_builder import (
@@ -35,7 +35,7 @@ from .encoding import (
     subset_caption,
 )
 from .model import EARLY_SEG, MID_SEG, NUM_INFERENCE_STEPS
-from .eval import PROMPTS, adherence, angular_spread, radius
+from .eval import PROMPTS, adherence, angular_spread, mean_se, paired_deltas, radius
 from .loss import compute_diffusion_loss, min_snr_weight
 from .rl import composed_prompt, decode_pixels, floor_penalty, scaled_bucket
 from .sampler import (
@@ -60,7 +60,7 @@ from .scheduler import (
     lowfreq_noise,
 )
 from .scorer import square_views
-from .train import apply_conditioning_augmentation
+from .train import apply_conditioning_augmentation, cache_path, segment_plan
 
 INIT_SIGMA = 11.5203
 
@@ -625,6 +625,147 @@ def test_eval_metrics():
     check("adherence is a cosine", -1.0 <= adherence(varied, basin) <= 1.0)
     check(
         "single-sample angular spread is defined", angular_spread(clustered[:1]) == 0.0
+    )
+
+
+def test_paired_deltas():
+    print("\n--- eval: paired deltas ---")
+    torch.manual_seed(11)
+    normalize = torch.nn.functional.normalize
+    mean, se = mean_se(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    check(
+        "mean_se matches the textbook values",
+        abs(mean - 2.5) < 1e-12 and abs(se - 0.6454972) < 1e-6,
+        f"mean={mean} se={se:.7f}",
+    )
+
+    basin = normalize(torch.randn(64), dim=-1)
+    text = normalize(torch.randn(5, 64), dim=-1)
+    base = [normalize(torch.randn(6, 64), dim=-1) for _ in range(5)]
+    same = paired_deltas(base, base, basin, text)
+    check(
+        "identical sets give zero deltas and zero displacement",
+        all(abs(row["delta"]) < 1e-6 for row in same.values()),
+        str({k: round(v["delta"], 8) for k, v in same.items()}),
+    )
+
+    toward = [normalize(f + 0.6 * basin, dim=-1) for f in base]
+    moved = paired_deltas(toward, base, basin, text)
+    check(
+        "moving every image toward the basin gives a negative radius delta",
+        moved["radius"]["delta"] < 0 and moved["displacement"]["delta"] > 0,
+        f"radius={moved['radius']['delta']:+.4f} "
+        f"displacement={moved['displacement']['delta']:.4f}",
+    )
+
+    nudged = [normalize(f + 0.05 * torch.randn_like(f), dim=-1) for f in base]
+    deltas = paired_deltas(nudged, base, basin, text)
+    radius_a = 1 - torch.stack(nudged) @ basin
+    radius_b = 1 - torch.stack(base) @ basin
+    unpaired = (mean_se(radius_a)[1] ** 2 + mean_se(radius_b)[1] ** 2) ** 0.5
+    check(
+        "pairing shrinks the radius SE when images move little per seed",
+        deltas["radius"]["se"] < unpaired / 3,
+        f"paired={deltas['radius']['se']:.5f} unpaired={unpaired:.5f}",
+    )
+    check(
+        "radius delta equals the difference of the unpaired means",
+        abs(
+            deltas["radius"]["delta"]
+            - (radius(torch.cat(nudged), basin) - radius(torch.cat(base), basin))
+        )
+        < 1e-6,
+    )
+
+
+def test_segment_plan():
+    print("\n--- train: segment plan ---")
+    full = segment_plan(["early", "mid", "late"], True)
+    check(
+        "default plan trains all three with cache seeds 0/1/2",
+        full == [(0, "early", 0), (1, "mid", 1), (2, "late", 2)],
+        str(full),
+    )
+    check(
+        "without refresh every segment shares cache seed 0",
+        [seed for _, _, seed in segment_plan(["early", "mid", "late"], False)]
+        == [0, 0, 0],
+    )
+    check(
+        "a single segment keeps the seed it has in a full run",
+        segment_plan(["late"], True) == [(2, "late", 2)],
+    )
+    check(
+        "segment order follows SEGMENTS, not the flag",
+        [name for _, name, _ in segment_plan(["late", "early"], True)]
+        == ["early", "late"],
+    )
+    for bad in (["middle"], []):
+        try:
+            segment_plan(bad, True)
+            raised = False
+        except ValueError:
+            raised = True
+        check(f"segment plan rejects {bad}", raised)
+
+
+def test_latent_cache_persistence():
+    print("\n--- cache: persistence ---")
+    cfg = argparse.Namespace(
+        cache_dir="/tmp/cache",
+        cache_size=128,
+        shuffle_buffer=1024,
+        caption_subset_prob=0.5,
+        caption_subset_min=0.15,
+    )
+    base_path = cache_path(cfg, 0)
+    check("cache path is stable", base_path == cache_path(cfg, 0), base_path)
+    for field, value in (
+        ("seed", None),
+        ("cache_size", 256),
+        ("shuffle_buffer", 512),
+        ("caption_subset_prob", 0.0),
+        ("caption_subset_min", 0.3),
+    ):
+        changed = argparse.Namespace(**vars(cfg))
+        seed = 1 if field == "seed" else 0
+        if value is not None:
+            setattr(changed, field, value)
+        check(
+            f"cache path changes with {field}", cache_path(changed, seed) != base_path
+        )
+
+    cached: list[dict] = [
+        {
+            "latents": torch.randn(1, 4, 8, 6).half(),
+            "text_emb": torch.randn(1, 154, 16).half(),
+            "pooled": torch.randn(1, 8).half(),
+            "time_ids": torch.tensor([512.0, 384.0, 0.0, 16.0, 1216.0, 832.0]),
+            "token_content_mask": torch.rand(1, 154) > 0.5,
+            "token_valid": torch.ones(1, 154, dtype=torch.bool),
+            "bucket": (832, 1216),
+        }
+        for _ in range(3)
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "nested", "latents.pt")
+        save_cache(cached, path)
+        loaded = load_cache(path)
+        check("no partial file is left behind", not os.path.exists(path + ".partial"))
+    check(
+        "a saved cache round-trips exactly",
+        len(loaded) == len(cached)
+        and all(
+            torch.equal(a[k], b[k])
+            for a, b in zip(cached, loaded)
+            for k in a
+            if k != "bucket"
+        ),
+    )
+    check(
+        "buckets come back as hashable tuples",
+        all(isinstance(item["bucket"], tuple) for item in loaded)
+        and BucketSampler(loaded, 1).buckets == [(832, 1216)],
     )
 
 
@@ -1323,6 +1464,9 @@ def main() -> int:
     test_sampler_parity()
     test_app_constant_parity()
     test_eval_metrics()
+    test_paired_deltas()
+    test_segment_plan()
+    test_latent_cache_persistence()
     test_straight_through_clamp()
     test_normalize_grad()
     test_chain_lora_keys()

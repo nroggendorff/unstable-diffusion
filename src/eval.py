@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -65,6 +66,9 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--latent_lf", type=float, default=1.0)
     parser.add_argument("--prompt_limit", type=int, default=0)
     parser.add_argument("--no_contact_sheets", action="store_true")
+    parser.add_argument(
+        "--compare", nargs=2, metavar=("BASELINE", "CANDIDATE"), default=None
+    )
     return parser.parse_args()
 
 
@@ -101,6 +105,82 @@ def adherence(features: torch.Tensor, text_feature: torch.Tensor) -> float:
     return (features @ text_feature).mean().item()
 
 
+def mean_se(values: torch.Tensor) -> tuple[float, float]:
+    values = values.flatten().double()
+    n = values.numel()
+    se = (values.std(unbiased=True) / n**0.5).item() if n > 1 else float("nan")
+    return values.mean().item(), se
+
+
+def paired_deltas(
+    candidate: list[torch.Tensor],
+    baseline: list[torch.Tensor],
+    basin: torch.Tensor,
+    text_features: torch.Tensor,
+) -> dict:
+    fc, fb = torch.stack(candidate).float(), torch.stack(baseline).float()
+    text = text_features.float()[:, None, :]
+    basin = basin.float()
+    rows = {
+        "angular_spread": torch.tensor(
+            [angular_spread(c) - angular_spread(b) for c, b in zip(candidate, baseline)]
+        ),
+        "radius": (fb @ basin) - (fc @ basin),
+        "adherence": (fc * text).sum(-1) - (fb * text).sum(-1),
+        "displacement": 1.0 - (fc * fb).sum(-1),
+    }
+    return {
+        name: dict(zip(("delta", "se"), mean_se(values)))
+        for name, values in rows.items()
+    }
+
+
+def print_deltas(title: str, deltas: dict) -> None:
+    print(f"\n{title} (paired on identical seeds; +- 1 SE):")
+    for name, row in deltas.items():
+        t = row["delta"] / row["se"] if row["se"] > 0 else float("nan")
+        sign = "" if name == "displacement" else "+"
+        tail = "" if name == "displacement" else f"  t={t:+.1f}"
+        print(f"  {name:15s} {row['delta']:{sign}.4f} +- {row['se']:.4f}{tail}")
+
+
+def black_frames(images) -> int:
+    return sum(
+        float(np.asarray(image, dtype=np.float32).std()) < 2.0 for image in images
+    )
+
+
+def _features_path(path: str) -> str:
+    return path if path.endswith(".pt") else os.path.join(path, "eval", "features.pt")
+
+
+def compare(baseline_path: str, candidate_path: str) -> dict:
+    baseline = torch.load(_features_path(baseline_path), weights_only=True)
+    candidate = torch.load(_features_path(candidate_path), weights_only=True)
+    for key in ("prompts", "seed_list"):
+        if baseline[key] != candidate[key]:
+            raise ValueError(f"Cannot pair: the two evals differ in {key}")
+    differing = sorted(
+        k
+        for k in set(baseline["args"]) | set(candidate["args"])
+        if k not in ("adapter_path", "output_dir", "compare", "no_contact_sheets")
+        and baseline["args"].get(k) != candidate["args"].get(k)
+    )
+    if differing:
+        print(
+            "Settings that differ:",
+            ", ".join(
+                f"{k} {baseline['args'].get(k)} -> {candidate['args'].get(k)}"
+                for k in differing
+            ),
+        )
+    deltas = paired_deltas(
+        candidate["lora"], baseline["lora"], baseline["basin"], baseline["text"]
+    )
+    print_deltas(f"candidate - baseline: {candidate_path} vs {baseline_path}", deltas)
+    return deltas
+
+
 def summarize(
     per_prompt: list[dict], basin: torch.Tensor, text_features: torch.Tensor
 ) -> dict:
@@ -134,6 +214,9 @@ def summarize(
 
 def main():
     args = _args()
+    if args.compare:
+        compare(*args.compare)
+        return
     device = torch.device("cuda")
 
     prompts = PROMPTS[: args.prompt_limit] if args.prompt_limit > 0 else PROMPTS
@@ -168,6 +251,8 @@ def main():
         latent_lf=args.latent_lf,
     )
 
+    black = {"basin": 0, "lora": 0, "base": 0}
+
     print(f"Basin pass ({args.basin_seeds} seeds x {len(prompts)} prompts)...")
     basin_features = []
     for index, prompt in enumerate(tqdm(prompts, desc="basin")):
@@ -187,6 +272,7 @@ def main():
             gamma=1.0,
             **shared,
         )
+        black["basin"] += black_frames(images)
         features, _ = embed(clip, processor, images, prompt, device)
         basin_features.append(features)
         del images, features
@@ -196,6 +282,10 @@ def main():
 
     results: dict[str, list] = {}
     sheets: dict[int, list] = {}
+    seed_list = [
+        [args.seed_base + index * 100 + s for s in range(args.seeds)]
+        for index in range(len(prompts))
+    ]
     text_features_by_prompt: dict[int, torch.Tensor] = {}
 
     for use_lora, label in ((True, "lora"), (False, "base")):
@@ -210,7 +300,7 @@ def main():
                 positive_pooled,
                 negative,
                 negative_pooled,
-                seeds=[args.seed_base + index * 100 + s for s in range(args.seeds)],
+                seeds=seed_list[index],
                 use_lora=use_lora,
                 guidance=args.guidance,
                 alpha=args.alpha,
@@ -220,6 +310,7 @@ def main():
                 **shared,
             )
 
+            black[label] += black_frames(images)
             features, text_feature = embed(clip, processor, images, prompt, device)
             text_features_by_prompt[index] = text_feature
             per_prompt.append({"prompt": prompt, "features": features})
@@ -239,13 +330,32 @@ def main():
         [text_features_by_prompt[i] for i in range(len(prompts))]
     )
 
+    lora_features = [entry["features"] for entry in results["lora"]]
+    base_features = [entry["features"] for entry in results["base"]]
     metrics = {
         "args": vars(args),
         "prompts": len(prompts),
         "seeds": args.seeds,
         "lora": summarize(results["lora"], basin, text_features),
         "base": summarize(results["base"], basin, text_features),
+        "lora_vs_base": paired_deltas(
+            lora_features, base_features, basin, text_features
+        ),
+        "black_frames": black,
     }
+
+    torch.save(
+        {
+            "args": vars(args),
+            "prompts": list(prompts),
+            "seed_list": seed_list,
+            "basin": basin.cpu(),
+            "text": text_features.cpu(),
+            "lora": [f.cpu() for f in lora_features],
+            "base": [f.cpu() for f in base_features],
+        },
+        os.path.join(eval_dir, "features.pt"),
+    )
 
     metrics_path = os.path.join(eval_dir, "metrics.json")
     with open(metrics_path, "w") as f:
@@ -256,6 +366,13 @@ def main():
         print(
             f"{label:>5}  angular_spread={row['angular_spread']:.4f}  "
             f"radius={row['radius']:.4f}  adherence={row['adherence']:.4f}"
+        )
+
+    print_deltas("lora - base", metrics["lora_vs_base"])
+    if any(black.values()):
+        print(
+            f"\nWARNING: black frames {black}. A black image is a NaN decode and "
+            "skews every metric it touches; check the sheets and rerun."
         )
 
     print(f"\nWrote {metrics_path}")

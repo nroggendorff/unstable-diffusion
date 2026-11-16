@@ -1,4 +1,6 @@
 import argparse
+import os
+
 import torch
 import numpy as np
 
@@ -12,17 +14,50 @@ from .sampler import ALL_SEGMENTS, NEGATIVE_PROMPT, adapter_weights, prior_laten
 ADAPTER_BASE_PATH = "./creative-lora"
 
 
+def present_segments(adapter_path: str) -> list[str]:
+    if not os.path.isdir(adapter_path):
+        return list(ALL_SEGMENTS)
+    return [
+        segment
+        for segment in ALL_SEGMENTS
+        if os.path.isfile(os.path.join(adapter_path, f"{segment}.safetensors"))
+    ]
+
+
+@torch.no_grad()
+def zero_adapter(unet, adapter_name: str) -> int:
+    suffix = f".lora_B.{adapter_name}.weight"
+    count = 0
+    for name, param in unet.named_parameters():
+        if name.endswith(suffix):
+            param.zero_()
+            count += 1
+    return count
+
+
 def load_pipe(adapter_path: str = ADAPTER_BASE_PATH):
     pipe = load_pipeline()
 
     pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
 
+    present = present_segments(adapter_path)
+    if not present:
+        raise FileNotFoundError(f"No segment adapters found in {adapter_path}")
+
     for segment in ALL_SEGMENTS:
+        source = segment if segment in present else present[0]
         pipe.load_lora_weights(
             adapter_path,
-            weight_name=f"{segment}.safetensors",
+            weight_name=f"{source}.safetensors",
             adapter_name=segment,
         )
+        if segment not in present:
+            if not zero_adapter(pipe.unet, segment):
+                raise RuntimeError(f"Could not zero the {segment} adapter")
+            print(
+                f"No {segment}.safetensors in {adapter_path}: "
+                f"{segment} runs as the base model"
+            )
 
     return pipe
 

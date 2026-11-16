@@ -52,10 +52,14 @@ def get_config() -> argparse.Namespace:
     add("caption_subset_min", float, 0.15)
 
     add("refresh_cache_per_segment", _bool, True)
+    add("segments", str, "early,mid,late")
+    add("cache_dir", str, "")
 
     parser.add_argument("--output_dir", type=str, default=default_output_dir())
 
     cfg = parser.parse_args()
+
+    cfg.segments = [s.strip() for s in cfg.segments.split(",") if s.strip()]
 
     cfg.effective_batch_size = cfg.mini_batch_size * cfg.grad_accum_steps
     cfg.train_steps = cfg.steps // cfg.effective_batch_size
