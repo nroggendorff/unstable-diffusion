@@ -11,6 +11,7 @@ from datasets import load_dataset
 DATASET_ID = "none-yet/processed-anime"
 SHUFFLE_BUFFER = 1024
 CACHE_WORKERS = 6
+STREAM_BATCH_SIZE = 64
 
 BUCKETS = [
     (1024, 1024),
@@ -53,7 +54,9 @@ def shuffle_buffer_size(n: int, shuffle_buffer: int = SHUFFLE_BUFFER) -> int:
 
 
 def get_samples(n=100, seed=0, shuffle_buffer=SHUFFLE_BUFFER):
-    dataset = load_dataset(DATASET_ID, split="train", streaming=True)
+    dataset = load_dataset(
+        DATASET_ID, split="train", streaming=True, batch_size=STREAM_BATCH_SIZE
+    )
     dataset = dataset.shuffle(
         seed=seed, buffer_size=shuffle_buffer_size(n, shuffle_buffer)
     )
