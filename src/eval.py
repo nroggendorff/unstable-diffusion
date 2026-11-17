@@ -5,6 +5,7 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from tqdm import tqdm
 from transformers import CLIPModel, CLIPProcessor
 
@@ -69,6 +70,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument(
         "--compare", nargs=2, metavar=("BASELINE", "CANDIDATE"), default=None
     )
+    parser.add_argument("--base_from", type=str, default="")
     return parser.parse_args()
 
 
@@ -154,6 +156,31 @@ def _features_path(path: str) -> str:
     return path if path.endswith(".pt") else os.path.join(path, "eval", "features.pt")
 
 
+_UNPAIRED_ARGS = ("adapter_path", "output_dir", "compare", "no_contact_sheets")
+_BASE_FREE_ARGS = _UNPAIRED_ARGS + ("base_from", "strength")
+
+
+def reusable_base(prior: dict, args: dict, prompts: list, seed_list: list) -> dict:
+    if prior["prompts"] != list(prompts) or prior["seed_list"] != seed_list:
+        raise ValueError("--base_from eval used different prompts or seeds")
+    differing = sorted(
+        k
+        for k in set(prior["args"]) | set(args)
+        if k not in _BASE_FREE_ARGS and prior["args"].get(k) != args.get(k)
+    )
+    if differing:
+        raise ValueError(f"--base_from eval differs in {', '.join(differing)}")
+    return prior
+
+
+def _base_row(sheet_path: str, size: tuple[int, int], count: int) -> list:
+    if not os.path.exists(sheet_path):
+        return []
+    w, h = size
+    with Image.open(sheet_path) as sheet:
+        return [sheet.crop((i * w, h, (i + 1) * w, 2 * h)).copy() for i in range(count)]
+
+
 def compare(baseline_path: str, candidate_path: str) -> dict:
     baseline = torch.load(_features_path(baseline_path), weights_only=True)
     candidate = torch.load(_features_path(candidate_path), weights_only=True)
@@ -163,7 +190,7 @@ def compare(baseline_path: str, candidate_path: str) -> dict:
     differing = sorted(
         k
         for k in set(baseline["args"]) | set(candidate["args"])
-        if k not in ("adapter_path", "output_dir", "compare", "no_contact_sheets")
+        if k not in _UNPAIRED_ARGS + ("base_from",)
         and baseline["args"].get(k) != candidate["args"].get(k)
     )
     if differing:
@@ -253,42 +280,59 @@ def main():
 
     black = {"basin": 0, "lora": 0, "base": 0}
 
-    print(f"Basin pass ({args.basin_seeds} seeds x {len(prompts)} prompts)...")
-    basin_features = []
-    for index, prompt in enumerate(tqdm(prompts, desc="basin")):
-        positive, positive_pooled, negative, negative_pooled = encoded[prompt]
-        images = anchor_generate(
-            pipe,
-            positive,
-            positive_pooled,
-            negative,
-            negative_pooled,
-            seeds=[args.seed_base + index * 100 + s for s in range(args.basin_seeds)],
-            use_lora=False,
-            guidance=args.basin_guidance,
-            alpha=0.0,
-            sigma=0.0,
-            offset=0.0,
-            gamma=1.0,
-            **shared,
-        )
-        black["basin"] += black_frames(images)
-        features, _ = embed(clip, processor, images, prompt, device)
-        basin_features.append(features)
-        del images, features
-
-    basin = F.normalize(torch.cat(basin_features).mean(0), dim=-1)
-    del basin_features
-
-    results: dict[str, list] = {}
-    sheets: dict[int, list] = {}
     seed_list = [
         [args.seed_base + index * 100 + s for s in range(args.seeds)]
         for index in range(len(prompts))
     ]
+
+    prior = None
+    prior_sheets = ""
+    if args.base_from:
+        prior_path = _features_path(args.base_from)
+        prior = reusable_base(
+            torch.load(prior_path, weights_only=True), vars(args), prompts, seed_list
+        )
+        prior_sheets = os.path.join(os.path.dirname(prior_path), "sheets")
+        print(f"Reusing the basin and base passes of {prior_path}")
+        basin = prior["basin"].to(device)
+    else:
+        print(f"Basin pass ({args.basin_seeds} seeds x {len(prompts)} prompts)...")
+        basin_features = []
+        for index, prompt in enumerate(tqdm(prompts, desc="basin")):
+            positive, positive_pooled, negative, negative_pooled = encoded[prompt]
+            images = anchor_generate(
+                pipe,
+                positive,
+                positive_pooled,
+                negative,
+                negative_pooled,
+                seeds=[
+                    args.seed_base + index * 100 + s for s in range(args.basin_seeds)
+                ],
+                use_lora=False,
+                guidance=args.basin_guidance,
+                alpha=0.0,
+                sigma=0.0,
+                offset=0.0,
+                gamma=1.0,
+                **shared,
+            )
+            black["basin"] += black_frames(images)
+            features, _ = embed(clip, processor, images, prompt, device)
+            basin_features.append(features)
+            del images, features
+
+        basin = F.normalize(torch.cat(basin_features).mean(0), dim=-1)
+        del basin_features
+
+    results: dict[str, list] = {}
+    sheets: dict[int, list] = {}
     text_features_by_prompt: dict[int, torch.Tensor] = {}
 
-    for use_lora, label in ((True, "lora"), (False, "base")):
+    passes = (
+        [(True, "lora")] if prior is not None else [(True, "lora"), (False, "base")]
+    )
+    for use_lora, label in passes:
         print(f"\nSampling pass: {label} ({args.seeds} seeds x {len(prompts)} prompts)")
         per_prompt = []
 
@@ -317,6 +361,15 @@ def main():
 
             if args.no_contact_sheets:
                 del images
+            elif prior is not None:
+                base_row = _base_row(
+                    os.path.join(prior_sheets, f"{index:02d}.png"),
+                    images[0].size,
+                    len(images),
+                )
+                sheet = make_two_row_grid(images, base_row)
+                sheet.save(os.path.join(sheet_dir, f"{index:02d}.png"))
+                del images, sheet, base_row
             elif use_lora:
                 sheets[index] = images
             else:
@@ -325,6 +378,12 @@ def main():
                 del images, sheet
 
         results[label] = per_prompt
+
+    if prior is not None:
+        results["base"] = [
+            {"prompt": prompt, "features": features.to(device)}
+            for prompt, features in zip(prompts, prior["base"])
+        ]
 
     text_features = torch.stack(
         [text_features_by_prompt[i] for i in range(len(prompts))]

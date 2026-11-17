@@ -54,6 +54,7 @@ def get_config() -> argparse.Namespace:
     add("refresh_cache_per_segment", _bool, True)
     add("segments", str, "early,mid,late")
     add("cache_dir", str, "")
+    add("save_every", int, 0)
 
     parser.add_argument("--output_dir", type=str, default=default_output_dir())
 

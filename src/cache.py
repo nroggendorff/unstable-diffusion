@@ -32,7 +32,10 @@ def blend_masks(
     diff_resized = F.interpolate(
         latent_diff, size=spatial_size, mode="bilinear", align_corners=False
     )
-    return (1.0 - alpha) * attn_mask + alpha * normalize_mask(diff_resized, gain)
+    blended = (1.0 - alpha) * attn_mask + alpha * normalize_mask(diff_resized, gain)
+    if isinstance(alpha, torch.Tensor):
+        return torch.where(alpha > 0.0, blended, attn_mask)
+    return blended
 
 
 def stack_added_cond(items: list, device, dtype=torch.float16) -> tuple:

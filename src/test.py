@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import torch
 from PIL import Image
 
-from .cache import BucketSampler, load_cache, save_cache
+from .cache import BucketSampler, blend_masks, load_cache, save_cache
 from .chain import normalize_grad, rollout_chain, save_chain_lora
 from .dataset import build_time_ids, prepare_sample, shuffle_buffer_size
 from .encoder.mask_builder import (
@@ -35,7 +35,17 @@ from .encoding import (
     subset_caption,
 )
 from .model import EARLY_SEG, MID_SEG, NUM_INFERENCE_STEPS
-from .eval import PROMPTS, adherence, angular_spread, mean_se, paired_deltas, radius
+from .eval import (
+    PROMPTS,
+    _base_row,
+    adherence,
+    angular_spread,
+    mean_se,
+    paired_deltas,
+    radius,
+    reusable_base,
+)
+from .inference import make_two_row_grid
 from .loss import compute_diffusion_loss, min_snr_weight
 from .rl import composed_prompt, decode_pixels, floor_penalty, scaled_bucket
 from .sampler import (
@@ -60,7 +70,13 @@ from .scheduler import (
     lowfreq_noise,
 )
 from .scorer import square_views
-from .train import apply_conditioning_augmentation, cache_path, segment_plan
+from .train import (
+    apply_conditioning_augmentation,
+    cache_path,
+    finite_stages,
+    first_nonfinite,
+    segment_plan,
+)
 
 INIT_SIGMA = 11.5203
 
@@ -678,6 +694,52 @@ def test_paired_deltas():
     )
 
 
+def test_base_reuse():
+    print("\n--- eval: reusing a prior base pass ---")
+    prompts = ["a girl", "a boy"]
+    seeds = [[1000, 1001], [1100, 1101]]
+    args = {"guidance": 7.0, "strength": 0.8, "adapter_path": "a", "base_from": ""}
+    prior = {"prompts": prompts, "seed_list": seeds, "args": dict(args)}
+
+    candidate = dict(args, strength=1.0, adapter_path="b", base_from="x")
+    check(
+        "a prior differing only in adapter, strength and base_from is reusable",
+        reusable_base(prior, candidate, prompts, seeds) is prior,
+    )
+    refused = []
+    for name, call in (
+        (
+            "guidance",
+            lambda: reusable_base(prior, dict(args, guidance=6.0), prompts, seeds),
+        ),
+        ("seeds", lambda: reusable_base(prior, args, prompts, [[1, 2], [3, 4]])),
+        ("prompts", lambda: reusable_base(prior, args, prompts[:1], seeds[:1])),
+    ):
+        try:
+            call()
+        except ValueError:
+            refused.append(name)
+    check(
+        "a prior differing in a base setting, seeds or prompts is refused",
+        refused == ["guidance", "seeds", "prompts"],
+        str(refused),
+    )
+
+    colours = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    top = [Image.new("RGB", (8, 12), (9, 9, 9)) for _ in colours]
+    bottom = [Image.new("RGB", (8, 12), c) for c in colours]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "00.png")
+        make_two_row_grid(top, bottom).save(path)
+        row = _base_row(path, (8, 12), 3)
+        missing = _base_row(os.path.join(tmp, "01.png"), (8, 12), 3)
+    check(
+        "_base_row recovers the bottom row of a saved sheet, tile for tile",
+        [im.getpixel((4, 6)) for im in row] == colours and not missing,
+        str([im.getpixel((4, 6)) for im in row]),
+    )
+
+
 def test_segment_plan():
     print("\n--- train: segment plan ---")
     full = segment_plan(["early", "mid", "late"], True)
@@ -1190,6 +1252,52 @@ def test_capture_mask():
     check("unmasked rows are untouched", torch.allclose(masked[1:], full, atol=1e-5))
 
 
+def test_nan_guards():
+    print("\n--- NaN guards: capture scores, discrepancy gate, stage report ---")
+    from diffusers.models.attention_processor import Attention
+
+    attn = Attention(query_dim=8, cross_attention_dim=6, heads=1, dim_head=64).half()
+    with torch.no_grad():
+        attn.to_q.weight.fill_(5.7)
+        attn.to_k.weight.fill_(5.7)
+    hidden = torch.ones(1, 4, 8, dtype=torch.float16)
+    context = torch.ones(1, 3, 6, dtype=torch.float16)
+    seen: list = []
+    processor = _CapturingProcessor(SimpleNamespace(absorb=seen.append))
+    with torch.no_grad():
+        q, k = attn.to_q(hidden), attn.to_k(context)
+        unscaled = torch.bmm(q, k.transpose(-1, -2))
+        processor(attn, hidden, encoder_hidden_states=context)
+    check(
+        "capture scores stay finite where the unscaled fp16 product overflows",
+        bool(torch.isinf(unscaled).any())
+        and bool(torch.isfinite(seen[0]).all())
+        and torch.allclose(seen[0].sum(-1), torch.ones(1, 4)),
+        f"unscaled max {float(unscaled.float().max()):.0f}",
+    )
+
+    attn_mask = torch.rand(2, 1, 4, 4)
+    diff = torch.full((2, 1, 4, 4), float("nan"))
+    blended = blend_masks(
+        attn_mask, diff, (4, 4), torch.tensor([0.0, 0.5]).view(2, 1, 1, 1), gain=1.5
+    )
+    check(
+        "a gated-off discrepancy cannot leak NaN into the mask",
+        torch.equal(blended[0], attn_mask[0]) and bool(torch.isnan(blended[1]).all()),
+    )
+
+    bad = finite_stages(
+        base_pred=torch.ones(2),
+        attn_mask=torch.tensor([1.0, float("inf")]),
+        noise_scale=torch.tensor([float("nan")]),
+    )
+    check(
+        "the stage report names the first non-finite stage, else the LoRA forward",
+        first_nonfinite(bad) == "attn_mask"
+        and first_nonfinite(finite_stages(x=torch.ones(3))) == "the LoRA forward",
+    )
+
+
 def test_chain_window():
     print("\n--- chain: a grad window anywhere in the chain reaches the LoRA ---")
     steps = 8
@@ -1451,6 +1559,7 @@ def main() -> int:
     test_noise_prior_match()
     test_dual_encoder_encoding()
     test_capture_mask()
+    test_nan_guards()
     test_rms_split()
     test_size_conditioning()
     test_min_snr(scheduler)
@@ -1465,6 +1574,7 @@ def main() -> int:
     test_app_constant_parity()
     test_eval_metrics()
     test_paired_deltas()
+    test_base_reuse()
     test_segment_plan()
     test_latent_cache_persistence()
     test_straight_through_clamp()

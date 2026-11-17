@@ -1,5 +1,6 @@
 import argparse
 import gc
+import math
 import os
 import random
 
@@ -135,6 +136,17 @@ def apply_conditioning_augmentation(
     )
 
 
+def finite_stages(**tensors: torch.Tensor) -> dict:
+    return {name: torch.isfinite(x).all() for name, x in tensors.items()}
+
+
+def first_nonfinite(finite: dict) -> str:
+    for name, ok in finite.items():
+        if not bool(ok):
+            return name
+    return "the LoRA forward"
+
+
 def train_segment(
     segment_name,
     scheduler,
@@ -226,6 +238,12 @@ def train_segment(
                 mask = blend_masks(
                     attn_mask, raw_diff, spatial_size, alpha * gate, gain=cfg.mask_gain
                 )
+                finite = finite_stages(
+                    base_pred=base_pred,
+                    attn_mask=attn_mask,
+                    discrepancy=torch.where(gate > 0, raw_diff, 0.0),
+                    blended_mask=mask,
+                )
                 del attn_mask, raw_diff
 
             blur_sigma = mask_builder.blur_sigma_for_step(step, cfg.train_steps)
@@ -237,6 +255,7 @@ def train_segment(
                 bg_boost=cfg.noise_bg_boost,
                 t_ramp=cfg.noise_t_ramp,
             )
+            finite.update(finite_stages(noise_scale=noise_scale))
             noisy_latents = scheduler.add_noise(
                 latents, noise, t, noise_scale=noise_scale
             )
@@ -258,7 +277,14 @@ def train_segment(
 
             # pyrefly: ignore [missing-attribute]
             scaler.scale(loss / cfg.grad_accum_steps).backward()
-            accum_loss += loss.item()
+            loss_value = loss.item()
+            if not math.isfinite(loss_value):
+                print(
+                    f"\nNon-finite loss at step {step}: "
+                    f"{first_nonfinite(finite)} went non-finite first; "
+                    f"t={t.tolist()}, latent {tuple(latents.shape[2:])}"
+                )
+            accum_loss += loss_value
 
             del noisy_latents, noise_scale, mask, base_pred, uniform_noisy
 
@@ -271,6 +297,10 @@ def train_segment(
         scaler.update()
 
         pbar.set_postfix(loss=f"{accum_loss / cfg.grad_accum_steps:.4f}")
+
+        done = step + 1
+        if cfg.save_every and done % cfg.save_every == 0 and done < cfg.train_steps:
+            save_lora(unet, os.path.join(cfg.output_dir, f"step{done}"), segment_name)
 
         if step % 20 == 0:
             torch.cuda.empty_cache()
@@ -356,7 +386,7 @@ def train(cfg: argparse.Namespace):
         f"snr_gamma={cfg.snr_gamma}, cond_partial={cfg.cond_partial_prob}, "
         f"mask_gain={cfg.mask_gain}, "
         f"caption_subset={cfg.caption_subset_prob}/{cfg.caption_subset_min}, "
-        f"output_dir={cfg.output_dir}"
+        f"save_every={cfg.save_every}, output_dir={cfg.output_dir}"
     )
 
     models = load_model()

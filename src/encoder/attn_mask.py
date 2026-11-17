@@ -70,11 +70,11 @@ class _CapturingProcessor:
         v = attn.head_to_batch_dim(v)
 
         scale = q.shape[-1] ** -0.5
-        scores = torch.bmm(q, k.transpose(-1, -2)) * scale
+        scores = torch.bmm(q.float() * scale, k.float().transpose(-1, -2))
         if attention_mask is not None:
-            scores = scores + attention_mask.to(scores.dtype)
+            scores = scores + attention_mask.float()
 
-        weights = torch.softmax(scores.float(), dim=-1)
+        weights = torch.softmax(scores, dim=-1)
 
         self.capture.absorb(weights)
 
