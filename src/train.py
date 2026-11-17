@@ -19,6 +19,8 @@ from .model import (
     MODEL_ID,
     NUM_INFERENCE_STEPS,
     SEGMENT_TIMESTEP_RANGES,
+    SINGLE_ADAPTER,
+    SINGLE_ADAPTER_RANGE,
     VAE_ID,
 )
 from .dataset import BUCKETS, DATASET_ID, get_samples
@@ -55,15 +57,19 @@ from .cache import (
 from .io import save_lora
 
 SEGMENTS = ["early", "mid", "late"]
+TIMESTEP_RANGES = {**SEGMENT_TIMESTEP_RANGES, SINGLE_ADAPTER: SINGLE_ADAPTER_RANGE}
 
 DISCREPANCY_MAX_T = 600
 
 
 def segment_plan(segments: list[str], refresh: bool) -> list[tuple[int, str, int]]:
+    if segments == [SINGLE_ADAPTER]:
+        return [(0, SINGLE_ADAPTER, 0)]
     unknown = [s for s in segments if s not in SEGMENTS]
     if unknown or not segments:
         raise ValueError(
-            f"--segments must be a non-empty subset of {SEGMENTS}, got {segments}"
+            f"--segments must be {SINGLE_ADAPTER} alone or a non-empty subset of "
+            f"{SEGMENTS}, got {segments}"
         )
     return [
         (index, name, index if refresh else 0)
@@ -157,7 +163,7 @@ def train_segment(
     cfg: argparse.Namespace,
 ):
     print(f"\nTraining segment: {segment_name}")
-    t_low, t_high = SEGMENT_TIMESTEP_RANGES[segment_name]
+    t_low, t_high = TIMESTEP_RANGES[segment_name]
 
     # pyrefly: ignore [bad-argument-type]
     unet = get_peft_model(load_unet(), get_lora_config(cfg.lora_rank, cfg.lora_alpha))

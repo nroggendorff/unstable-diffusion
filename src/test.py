@@ -34,7 +34,7 @@ from .encoding import (
     split_clauses,
     subset_caption,
 )
-from .model import EARLY_SEG, MID_SEG, NUM_INFERENCE_STEPS
+from .model import EARLY_SEG, MID_SEG, NUM_INFERENCE_STEPS, SEGMENT_TIMESTEP_RANGES
 from .eval import (
     PROMPTS,
     _base_row,
@@ -76,6 +76,7 @@ from .train import (
     finite_stages,
     first_nonfinite,
     segment_plan,
+    TIMESTEP_RANGES,
 )
 
 INIT_SIGMA = 11.5203
@@ -762,7 +763,17 @@ def test_segment_plan():
         [name for _, name, _ in segment_plan(["late", "early"], True)]
         == ["early", "late"],
     )
-    for bad in (["middle"], []):
+    check(
+        "all trains one adapter on cache seed 0",
+        segment_plan(["all"], True) == [(0, "all", 0)],
+    )
+    low, high = TIMESTEP_RANGES["all"]
+    check(
+        "all covers every segment's timesteps",
+        all(low <= a and b <= high for a, b in SEGMENT_TIMESTEP_RANGES.values()),
+        str(TIMESTEP_RANGES["all"]),
+    )
+    for bad in (["middle"], [], ["all", "early"]):
         try:
             segment_plan(bad, True)
             raised = False

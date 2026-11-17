@@ -8,7 +8,7 @@ from diffusers import EulerDiscreteScheduler
 from PIL import Image
 
 from .encoding import encode_for_sampling
-from .model import load_pipeline
+from .model import SINGLE_ADAPTER, load_pipeline
 from .sampler import ALL_SEGMENTS, NEGATIVE_PROMPT, adapter_weights, prior_latents
 
 ADAPTER_BASE_PATH = "./creative-lora"
@@ -40,12 +40,21 @@ def load_pipe(adapter_path: str = ADAPTER_BASE_PATH):
 
     pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
 
-    present = present_segments(adapter_path)
+    single = os.path.isfile(os.path.join(adapter_path, f"{SINGLE_ADAPTER}.safetensors"))
+    present = list(ALL_SEGMENTS) if single else present_segments(adapter_path)
     if not present:
         raise FileNotFoundError(f"No segment adapters found in {adapter_path}")
+    if single:
+        print(
+            f"Loading {SINGLE_ADAPTER}.safetensors from {adapter_path} "
+            f"as every segment's adapter"
+        )
 
     for segment in ALL_SEGMENTS:
-        source = segment if segment in present else present[0]
+        if single:
+            source = SINGLE_ADAPTER
+        else:
+            source = segment if segment in present else present[0]
         pipe.load_lora_weights(
             adapter_path,
             weight_name=f"{source}.safetensors",

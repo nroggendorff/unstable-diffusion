@@ -28,6 +28,9 @@ SEGMENT_TIMESTEP_RANGES = {
     "late": (1, 364),
 }
 
+SINGLE_ADAPTER = "all"
+SINGLE_ADAPTER_RANGE = (1, 999)
+
 
 def get_lora_config(rank: int = LORA_RANK, alpha: int = LORA_ALPHA):
     return LoraConfig(
