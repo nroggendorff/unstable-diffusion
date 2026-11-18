@@ -2,16 +2,17 @@ import itertools
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
+import pyarrow.dataset as pads
 import torch
 from torchvision import transforms
 from PIL import Image
 
 from datasets import load_dataset
 
-DATASET_ID = "none-yet/processed-anime"
+DATASET_ID = "pepper13/tagged-anime"
 SHUFFLE_BUFFER = 1024
 CACHE_WORKERS = 6
-STREAM_BATCH_SIZE = 64
+STREAM_BATCH_SIZE = 1
 
 BUCKETS = [
     (1024, 1024),
@@ -55,7 +56,11 @@ def shuffle_buffer_size(n: int, shuffle_buffer: int = SHUFFLE_BUFFER) -> int:
 
 def get_samples(n=100, seed=0, shuffle_buffer=SHUFFLE_BUFFER):
     dataset = load_dataset(
-        DATASET_ID, split="train", streaming=True, batch_size=STREAM_BATCH_SIZE
+        DATASET_ID,
+        split="train",
+        streaming=True,
+        batch_size=STREAM_BATCH_SIZE,
+        fragment_scan_options=pads.ParquetFragmentScanOptions(pre_buffer=False),
     )
     dataset = dataset.shuffle(
         seed=seed, buffer_size=shuffle_buffer_size(n, shuffle_buffer)
@@ -85,11 +90,17 @@ def build_time_ids(
     )
 
 
+def has_alpha(image: Image.Image) -> bool:
+    return image.mode in ("RGBA", "LA", "PA", "RGBa", "La") or (
+        image.mode in ("P", "L", "RGB") and "transparency" in image.info
+    )
+
+
 def prepare_sample(sample, device):
     image = sample.get("image", None)
     prompt = sample.get("text", "anime")
 
-    if image is None or not isinstance(image, Image.Image):
+    if image is None or not isinstance(image, Image.Image) or has_alpha(image):
         return None, None, None, None
 
     image = image.convert("RGB")

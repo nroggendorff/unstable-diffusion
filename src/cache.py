@@ -130,10 +130,12 @@ def build_cache(
     words_before = 0
     words_after = 0
     stats = LatentStats()
+    skipped = 0
 
     prepared = prepared_samples(samples, workers)
     for image, prompt, bucket, time_ids in tqdm(prepared, desc="Caching", total=total):
         if image is None or prompt is None:
+            skipped += 1
             continue
 
         conditioning = prompt
@@ -167,6 +169,9 @@ def build_cache(
         )
 
     stats.report()
+
+    if skipped:
+        print(f"Skipped {skipped} samples with alpha or no image")
 
     if cached:
         two_chunk = sum(active_chunks(item["token_valid"]) > 1 for item in cached)

@@ -19,7 +19,12 @@ from .chain import (
     sample_grad_window,
     save_chain_lora,
 )
-from .dataset import build_time_ids, prepare_sample, shuffle_buffer_size
+from .dataset import (
+    build_time_ids,
+    has_alpha,
+    prepare_sample,
+    shuffle_buffer_size,
+)
 from .encoder.mask_builder import (
     _gaussian_blur,
     normalize_mask,
@@ -1726,6 +1731,31 @@ def test_size_conditioning():
     )
 
 
+def test_alpha_skip():
+    print("\n--- Images with alpha are skipped ---")
+
+    palette = Image.new("P", (2, 1))
+    palette.info["transparency"] = 0
+    keyed = Image.new("RGB", (2, 1))
+    keyed.info["transparency"] = (0, 0, 0)
+    alpha = {
+        "RGBA": Image.new("RGBA", (4, 4)),
+        "LA": Image.new("LA", (4, 4)),
+        "P with a transparent index": palette,
+        "RGB with a transparent colour key": keyed,
+    }
+    for name, image in alpha.items():
+        check(f"{name} is detected", has_alpha(image))
+        result = prepare_sample({"image": image, "text": "a girl"}, "cpu")
+        check(f"{name} is skipped", result == (None, None, None, None))
+
+    for mode in ("RGB", "L", "P", "CMYK"):
+        image = Image.new(mode, (4, 4))
+        check(f"plain {mode} is not alpha", not has_alpha(image))
+        tensor, _, _, _ = prepare_sample({"image": image, "text": "a girl"}, "cpu")
+        check(f"plain {mode} is kept", tensor is not None)
+
+
 _APP_PATH = pathlib.Path(__file__).resolve().parent.parent / "app.py"
 
 _APP_MIRRORED_CONSTANTS = {
@@ -1803,6 +1833,7 @@ def main() -> int:
     test_nan_guards()
     test_rms_split()
     test_size_conditioning()
+    test_alpha_skip()
     test_min_snr(scheduler)
     test_loss_weighting(scheduler)
     test_bucket_sampler()

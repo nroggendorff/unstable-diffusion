@@ -379,6 +379,8 @@ def train(cfg: argparse.Namespace):
     torch.backends.cudnn.allow_tf32 = True
 
     plan = segment_plan(cfg.segments, cfg.refresh_cache_per_segment)
+    if cfg.cache_only and not cfg.cache_dir:
+        raise ValueError("--cache_only 1 needs --cache_dir to save the cache into")
 
     print(
         f"Config: segments={cfg.segments}, cache_dir={cfg.cache_dir or None}, "
@@ -392,7 +394,8 @@ def train(cfg: argparse.Namespace):
         f"snr_gamma={cfg.snr_gamma}, cond_partial={cfg.cond_partial_prob}, "
         f"mask_gain={cfg.mask_gain}, "
         f"caption_subset={cfg.caption_subset_prob}/{cfg.caption_subset_min}, "
-        f"save_every={cfg.save_every}, output_dir={cfg.output_dir}"
+        f"save_every={cfg.save_every}, cache_only={cfg.cache_only}, "
+        f"output_dir={cfg.output_dir}"
     )
 
     models = load_model()
@@ -418,6 +421,20 @@ def train(cfg: argparse.Namespace):
     )
 
     min_size = cfg.mini_batch_size
+
+    if cfg.cache_only:
+        for cache_seed in dict.fromkeys(seed for _, _, seed in plan):
+            build_sampler(
+                vae,
+                text_encoders,
+                tokenizers,
+                min_size,
+                cache_seed,
+                cfg,
+                models["zero_uncond"],
+            )
+            gc.collect()
+        return
 
     built = None
     for _, segment_name, cache_seed in plan:
