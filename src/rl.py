@@ -1,22 +1,36 @@
 import argparse
 import functools
+import json
 import os
 import random
 
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
+from diffusers import EulerDiscreteScheduler
 from tqdm import tqdm
 
-from .chain import lora_parameters, rollout_chain, save_chain_lora
+from .chain import (
+    lora_parameters,
+    rollout_chain,
+    sample_grad_window,
+    save_chain_lora,
+)
 from .config import default_output_dir
 from .dataset import DATASET_ID
-from .encoding import encode_for_sampling, subset_caption
+from .encoding import encode_for_sampling_masked, subset_caption
 from .inference import ADAPTER_BASE_PATH, load_pipe
-from .model import DEVICE, NUM_INFERENCE_STEPS
+from .model import (
+    DEVICE,
+    LORA_RANK,
+    NUM_INFERENCE_STEPS,
+    get_lora_config,
+    load_pipeline,
+)
 from .sampler import (
     ALL_SEGMENTS,
     NEGATIVE_PROMPT,
+    adapter_weights,
     anchor_plan,
     lied_timestep,
     prior_latents,
@@ -182,6 +196,44 @@ def scaled_bucket(bucket: tuple[int, int], scale: float) -> tuple[int, int]:
     return width, height
 
 
+def adapter_exposure(grad_steps: set, strength: float, steps: int) -> list[float]:
+    totals = [0.0] * len(ALL_SEGMENTS)
+    for index in grad_steps:
+        if index == steps - 1:
+            continue
+        for segment, weight in enumerate(adapter_weights(index, strength)):
+            totals[segment] += weight
+    return totals
+
+
+def parse_steps(text: str) -> set[int]:
+    return {int(part) for part in text.split(",") if part.strip()}
+
+
+@torch.no_grad()
+def group_norm(tensors: list) -> float | None:
+    present = [t for t in tensors if t is not None]
+    if not present:
+        return None
+    return float(torch.stack(torch._foreach_norm(present)).norm())
+
+
+@torch.no_grad()
+def clip_by_exposure(groups: dict, exposure: dict, clip: float) -> tuple[dict, dict]:
+    before, after = {}, {}
+    for segment, params in groups.items():
+        grads = [param.grad for param in params if param.grad is not None]
+        norm = group_norm(grads)
+        before[segment] = after[segment] = norm
+        if norm is None or clip <= 0.0:
+            continue
+        limit = clip * exposure.get(segment, 0.0)
+        if norm > limit:
+            torch._foreach_mul_(grads, limit / norm)
+            after[segment] = limit
+    return before, after
+
+
 def decode_pixels(vae, latents: torch.Tensor) -> torch.Tensor:
     decoded = vae.decode(latents.to(dtype=vae.dtype) / vae.config.scaling_factor)
     decoded = decoded.sample.float()
@@ -191,6 +243,8 @@ def decode_pixels(vae, latents: torch.Tensor) -> torch.Tensor:
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--adapter_path", type=str, default=ADAPTER_BASE_PATH)
+    parser.add_argument("--fresh", type=int, default=0)
+    parser.add_argument("--lora_rank", type=int, default=LORA_RANK)
     parser.add_argument("--output_dir", type=str, default=default_output_dir())
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--batch", type=int, default=2)
@@ -222,6 +276,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--calibration_steps", type=int, default=8)
     parser.add_argument("--unet_checkpoint", type=int, default=1)
     parser.add_argument("--save_every", type=int, default=50)
+    parser.add_argument("--save_steps", type=str, default="")
     return parser.parse_args()
 
 
@@ -233,19 +288,47 @@ class QualityRL:
             args.seed, args.caption_subset_prob, args.caption_subset_min
         )
 
-        pipe = load_pipe(args.adapter_path)
-        pipe.set_progress_bar_config(disable=True)
-        if args.tether_weight > 0.0:
-            for segment, name in zip(ALL_SEGMENTS, REFERENCE_ADAPTERS):
-                pipe.load_lora_weights(
-                    args.adapter_path,
-                    weight_name=f"{segment}.safetensors",
-                    adapter_name=name,
+        if args.fresh:
+            pipe = load_pipeline()
+            pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
+            for segment in ALL_SEGMENTS:
+                pipe.unet.add_adapter(
+                    get_lora_config(args.lora_rank, args.lora_rank),
+                    adapter_name=segment,
                 )
+            self.reference_adapters = None
+            print(
+                f"Fresh rank-{args.lora_rank} adapters; "
+                "the tether reference is the base model"
+            )
+        else:
+            pipe = load_pipe(args.adapter_path)
+            self.reference_adapters = REFERENCE_ADAPTERS
+            if args.tether_weight > 0.0:
+                for segment, name in zip(ALL_SEGMENTS, REFERENCE_ADAPTERS):
+                    pipe.load_lora_weights(
+                        args.adapter_path,
+                        weight_name=f"{segment}.safetensors",
+                        adapter_name=name,
+                    )
+        pipe.set_progress_bar_config(disable=True)
         for param in pipe.unet.parameters():
             param.requires_grad_(False)
         self.params = lora_parameters(pipe.unet)
         print(f"Trainable LoRA tensors: {len(self.params)}")
+
+        def segment_params(segment: str, kinds=("lora_A", "lora_B")):
+            return [
+                param
+                for name, param in pipe.unet.named_parameters()
+                if any(f".{kind}.{segment}.weight" in name for kind in kinds)
+            ]
+
+        self.groups = {segment: segment_params(segment) for segment in ALL_SEGMENTS}
+        self.b_groups = {
+            segment: segment_params(segment, ("lora_B",)) for segment in ALL_SEGMENTS
+        }
+        self.log_path = ""
 
         if args.unet_checkpoint:
             pipe.unet.enable_gradient_checkpointing()
@@ -262,15 +345,16 @@ class QualityRL:
         self.tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
         self.scorer = ImageScorer(args.scorer, views=args.scorer_views).to(DEVICE)
 
-    def prompts(self, count: int) -> list[str]:
-        return [
-            (
-                next(self.captions)
-                if self.rng.random() < self.args.dataset_prompt_prob
-                else composed_prompt(self.rng)
-            )
-            for _ in range(count)
-        ]
+    def prompts(self, count: int) -> tuple[list[str], list[str]]:
+        prompts, sources = [], []
+        for _ in range(count):
+            if self.rng.random() < self.args.dataset_prompt_prob:
+                prompts.append(next(self.captions))
+                sources.append("dataset")
+            else:
+                prompts.append(composed_prompt(self.rng))
+                sources.append("composed")
+        return prompts, sources
 
     def rollout(self, prompts: list[str], settings: dict, grad: bool):
         args = self.args
@@ -278,8 +362,10 @@ class QualityRL:
         steps = self.timesteps.shape[0]
         width, height = scaled_bucket(self.rng.choice(BUCKETS), args.scale)
 
-        positive, pooled, negative, negative_pooled = encode_for_sampling(
-            prompts, NEGATIVE_PROMPT, self.encoders, self.tokenizers, DEVICE
+        positive, pooled, negative, negative_pooled, chunk_mask = (
+            encode_for_sampling_masked(
+                prompts, NEGATIVE_PROMPT, self.encoders, self.tokenizers, DEVICE
+            )
         )
         jitter_seed = self.rng.randrange(1 << 30)
 
@@ -328,15 +414,11 @@ class QualityRL:
                 lied_timestep, self.timesteps, offset=offset, gamma=gamma
             )
 
-        if not grad:
-            grad_steps = set()
-        elif 0 < args.grad_window < steps:
-            start = self.rng.randrange(0, steps - args.grad_window + 1)
-            grad_steps = set(range(start, start + args.grad_window))
-        else:
-            grad_steps = set(range(steps))
+        grad_steps = (
+            sample_grad_window(self.rng, steps - 1, args.grad_window) if grad else set()
+        )
 
-        def run(adapters, steps_with_grad, anchor):
+        def run(adapters, steps_with_grad, anchor, use_lora=True):
             anchor_at, raw_guidance = anchor
             return rollout_chain(
                 self.pipe,
@@ -350,11 +432,12 @@ class QualityRL:
                 anchor_at,
                 raw_guidance,
                 settings["strength"],
-                True,
+                use_lora,
                 steps_with_grad,
                 args.grad_target_rms,
                 adapters,
                 timestep_at,
+                chunk_mask,
             )
 
         with torch.set_grad_enabled(grad):
@@ -364,10 +447,13 @@ class QualityRL:
         if grad and args.tether_weight > 0.0:
             with torch.no_grad():
                 reference = run(
-                    REFERENCE_ADAPTERS, set(), plan(negative, negative_pooled)
+                    self.reference_adapters or ALL_SEGMENTS,
+                    set(),
+                    plan(negative, negative_pooled),
+                    use_lora=self.reference_adapters is not None,
                 )
 
-        return generated, reference, (width, height)
+        return generated, reference, (width, height), grad_steps
 
     def score(self, latents, prompts):
         embeds = self.scorer.image_embeds(decode_pixels(self.pipe.vae, latents))
@@ -379,9 +465,9 @@ class QualityRL:
         args = self.args
         qualities, adherences = [], []
         for _ in tqdm(range(args.calibration_steps), desc="calibrate"):
-            prompts = self.prompts(args.batch)
+            prompts, _ = self.prompts(args.batch)
             settings = draw_settings(self.rng, args.preset_prob)
-            generated, _, _ = self.rollout(prompts, settings, grad=False)
+            generated, _, _, _ = self.rollout(prompts, settings, grad=False)
             _, quality, adherence = self.score(generated, prompts)
             qualities.append(quality.float().cpu())
             adherences.append(adherence.float().cpu())
@@ -413,19 +499,42 @@ class QualityRL:
             f"  adherence {summary(adherence)}  floor {adherence_floor:.3f} "
             f"({(adherence < adherence_floor).float().mean().item():.0%} below)"
         )
+        self.log(
+            calibration=dict(
+                quality=quality.tolist(),
+                adherence=adherence.tolist(),
+                quality_floor=quality_floor,
+                adherence_floor=adherence_floor,
+            )
+        )
         return quality_floor, adherence_floor
+
+    def log(self, **record):
+        if not self.log_path:
+            return
+        with open(self.log_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
 
     def train(self):
         args = self.args
+        os.makedirs(args.output_dir, exist_ok=True)
+        self.log_path = os.path.join(args.output_dir, "rl_log.jsonl")
+        open(self.log_path, "w").close()
+        self.log(args=vars(args))
         quality_floor, adherence_floor = self.calibrate()
         optimizer = torch.optim.AdamW(self.params, lr=args.lr)
+        save_steps = parse_steps(args.save_steps)
+        steps = self.timesteps.shape[0]
 
         for step in (pbar := tqdm(range(args.steps), desc="rl")):
             optimizer.zero_grad(set_to_none=True)
 
-            prompts = self.prompts(args.batch)
+            prompts, sources = self.prompts(args.batch)
             settings = draw_settings(self.rng, args.preset_prob)
-            generated, reference, size = self.rollout(prompts, settings, grad=True)
+            generated, reference, size, grad_steps = self.rollout(
+                prompts, settings, grad=True
+            )
+            exposure = adapter_exposure(grad_steps, settings["strength"], steps)
 
             embeds, quality, adherence = self.score(generated, prompts)
             penalty = floor_penalty(quality, quality_floor, args.quality_temp)
@@ -447,12 +556,40 @@ class QualityRL:
             loss = penalty.mean()
             if not torch.isfinite(loss):
                 print(f"\nstep {step}: non-finite loss, skipped")
+                self.log(step=step, skipped="non-finite loss")
                 del generated, reference, loss
                 continue
 
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.params, args.grad_clip_norm)
+            exposed = dict(zip(ALL_SEGMENTS, exposure))
+            segment_grads, clipped_grads = clip_by_exposure(
+                self.groups, exposed, args.grad_clip_norm
+            )
+            grad_norm = sum(n**2 for n in segment_grads.values() if n) ** 0.5
             optimizer.step()
+
+            record = dict(
+                step=step,
+                loss=loss.item(),
+                quality=quality.tolist(),
+                adherence=adherence.tolist(),
+                identity=identity.tolist(),
+                grad_norm=grad_norm,
+                segment_grad_norm=segment_grads,
+                clipped_grad_norm=clipped_grads,
+                exposure=exposed,
+                window=[min(grad_steps), max(grad_steps)],
+                resolution=list(size),
+                settings=settings,
+                sources=sources,
+                prompts=prompts,
+            )
+            if step % 10 == 0 or step + 1 == args.steps:
+                record["b_norm"] = {
+                    segment: group_norm(list(params))
+                    for segment, params in self.b_groups.items()
+                }
+            self.log(**record)
 
             pbar.set_postfix(
                 loss=f"{loss.item():.3f}",
@@ -460,7 +597,8 @@ class QualityRL:
                 qmin=f"{quality.min().item():.2f}",
                 adh=f"{adherence.mean().item():.3f}",
                 ident=f"{identity.mean().item():.3f}",
-                gnorm=f"{grad_norm.item():.2e}",
+                gnorm=f"{grad_norm:.2e}",
+                win=f"{min(grad_steps)}-{max(grad_steps)}",
                 res=f"{size[0]}x{size[1]}",
                 vram=f"{torch.cuda.max_memory_allocated() / 2**30:.1f}G",
             )
@@ -469,8 +607,11 @@ class QualityRL:
             if step % 10 == 0:
                 torch.cuda.empty_cache()
 
-            if args.save_every and (step + 1) % args.save_every == 0:
-                self.save(os.path.join(args.output_dir, f"step{step + 1}"))
+            done = step + 1
+            if done < args.steps and (
+                done in save_steps or (args.save_every and done % args.save_every == 0)
+            ):
+                self.save(os.path.join(args.output_dir, f"step{done}"))
 
         self.save(args.output_dir)
 

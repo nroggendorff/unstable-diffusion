@@ -12,7 +12,13 @@ import torch
 from PIL import Image
 
 from .cache import BucketSampler, blend_masks, load_cache, save_cache
-from .chain import normalize_grad, rollout_chain, save_chain_lora
+from .chain import (
+    active_adapters,
+    normalize_grad,
+    rollout_chain,
+    sample_grad_window,
+    save_chain_lora,
+)
 from .dataset import build_time_ids, prepare_sample, shuffle_buffer_size
 from .encoder.mask_builder import (
     _gaussian_blur,
@@ -31,6 +37,7 @@ from .encoding import (
     encode_prompt,
     pack_chunks,
     rms_scaled_noise,
+    sampling_chunk_mask,
     split_clauses,
     subset_caption,
 )
@@ -47,10 +54,18 @@ from .eval import (
 )
 from .inference import make_two_row_grid
 from .loss import compute_diffusion_loss, min_snr_weight
-from .rl import composed_prompt, decode_pixels, floor_penalty, scaled_bucket
+from .rl import (
+    adapter_exposure,
+    clip_by_exposure,
+    composed_prompt,
+    decode_pixels,
+    floor_penalty,
+    scaled_bucket,
+)
 from .sampler import (
     _BLEND_HALF,
     _MAX_RAW_GUIDANCE,
+    ALL_SEGMENTS,
     NEGATIVE_PROMPT,
     adapter_weights,
     lied_timestep,
@@ -1359,6 +1374,221 @@ def test_chain_window():
     check("an empty window produces none", run(set()) == 0.0)
 
 
+class _BlendUNet(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(4, 4, 3, padding=1)
+        self.lora = torch.nn.ParameterDict(
+            {
+                name: torch.nn.Parameter(torch.full((1, 4, 1, 1), 0.1))
+                for name in ALL_SEGMENTS
+            }
+        )
+        self.active: dict = {}
+        self.calls: list = []
+
+    def forward(self, sample, t, encoder_hidden_states=None, **kwargs):  # noqa: ARG002
+        out = self.conv(sample.float())
+        for name, weight in self.active.items():
+            out = out + weight * self.lora[name] * sample.float()
+        return SimpleNamespace(sample=out)
+
+
+def _blend_pipe(unet):
+    def set_adapters(names, weights):
+        unet.active = dict(zip(names, weights))
+        unet.calls.append(dict(unet.active))
+
+    def disable_lora():
+        unet.active = {}
+        unet.calls.append({})
+
+    return SimpleNamespace(
+        unet=unet,
+        enable_lora=lambda: None,
+        disable_lora=disable_lora,
+        set_adapters=set_adapters,
+    )
+
+
+def test_chain_blend_weights():
+    print("\n--- chain: each adapter's gradient is weighted by its blend weight ---")
+    steps = NUM_INFERENCE_STEPS
+    sigmas = torch.linspace(10.0, 0.0, steps + 1)
+    timesteps = torch.linspace(958.0, 1.0, steps)
+    embeds = torch.randn(1, 5, 16)
+    pooled = torch.randn(1, 12)
+
+    def anchor_at(index):  # noqa: ARG001
+        return embeds, pooled
+
+    def run(window, strength=1.0):
+        torch.manual_seed(0)
+        unet = _BlendUNet()
+        out = rollout_chain(
+            _blend_pipe(unet),
+            10.05,
+            sigmas,
+            timesteps,
+            torch.randn(1, 4, 8, 8),
+            embeds,
+            pooled,
+            torch.zeros(2, 6),
+            anchor_at,
+            lambda index: 5.0,  # noqa: ARG005
+            strength,
+            True,
+            window,
+            0.0,
+        )
+        out.pow(2).mean().backward()
+        grads = {name: unet.lora[name].grad for name in ALL_SEGMENTS}
+        return grads, unet.calls
+
+    check(
+        "active_adapters drops zero-weight adapters",
+        active_adapters(ALL_SEGMENTS, [0.75, 0.25, 0.0])
+        == (["early", "mid"], [0.75, 0.25])
+        and active_adapters(ALL_SEGMENTS, [0.0, 0.0, 0.0]) == ([], []),
+    )
+
+    blend_step = EARLY_SEG - 1
+    weights = adapter_weights(blend_step, 1.0)
+    grads, calls = run({blend_step})
+    early, mid = grads["early"], grads["mid"]
+    assert early is not None and mid is not None
+    ratio = float(mid.abs().sum() / early.abs().sum())
+    check(
+        "at a blend step the gradient ratio equals the weight ratio",
+        abs(ratio - weights[1] / weights[0]) < 1e-4,
+        f"step {blend_step} weights {weights[:2]} grad ratio {ratio:.5f}",
+    )
+    check(
+        "an adapter with zero weight at every grad step gets no gradient at all",
+        grads["late"] is None,
+    )
+    check(
+        "the final step runs with every adapter off",
+        calls[steps - 1] == {},
+        str(calls[steps - 1]),
+    )
+    check(
+        "the backward recompute re-applies the grad step's blend, not the last step's",
+        len(calls) == steps + 1
+        and calls[-1] == {"early": weights[0], "mid": weights[1]},
+        str(calls[-1]),
+    )
+
+    only_early, _ = run({0, 1, 2})
+    check(
+        "a window inside one segment trains only that adapter",
+        only_early["early"] is not None
+        and only_early["mid"] is None
+        and only_early["late"] is None,
+    )
+
+
+def test_grad_window_coverage():
+    print("\n--- RL: grad windows cover every trainable step equally ---")
+    trainable, window, draws = NUM_INFERENCE_STEPS - 1, 10, 40000
+    rng = random.Random(0)
+    counts = [0] * NUM_INFERENCE_STEPS
+    contiguous = True
+    for _ in range(draws):
+        steps = sample_grad_window(rng, trainable, window)
+        contiguous = contiguous and steps == set(range(min(steps), max(steps) + 1))
+        for index in steps:
+            counts[index] += 1
+    expected = draws * window / (trainable + window - 1)
+    worst = max(abs(c - expected) / expected for c in counts[:trainable])
+    check(
+        "per-step coverage is uniform within 3%",
+        worst < 0.03,
+        f"worst {worst:.3f}, ends {counts[0]}/{counts[trainable - 1]}, mid {counts[14]}",
+    )
+    check("the final, adapter-free step is never in a window", counts[trainable] == 0)
+    check("windows are contiguous and non-empty", contiguous)
+    check(
+        "window >= trainable steps covers everything",
+        sample_grad_window(rng, trainable, 40) == set(range(trainable))
+        and sample_grad_window(rng, trainable, 0) == set(range(trainable)),
+    )
+    exposure = [0.0, 0.0, 0.0]
+    for index in range(trainable):
+        for segment, value in enumerate(
+            adapter_exposure({index}, 1.0, NUM_INFERENCE_STEPS)
+        ):
+            exposure[segment] += value
+    check(
+        "under uniform coverage no adapter gets more than 1.25x another's exposure",
+        max(exposure) / min(exposure) < 1.25,
+        " / ".join(f"{e:.2f}" for e in exposure),
+    )
+
+
+def test_clip_by_exposure():
+    print("\n--- RL: per-adapter clipping scales with blend exposure ---")
+    big = torch.nn.Parameter(torch.zeros(4))
+    small = torch.nn.Parameter(torch.zeros(4))
+    idle = torch.nn.Parameter(torch.zeros(4))
+    big.grad = torch.tensor([6.0, 8.0, 0.0, 0.0])
+    small.grad = torch.tensor([0.06, 0.08, 0.0, 0.0])
+    direction = big.grad / big.grad.norm()
+    before, after = clip_by_exposure(
+        {"early": [big], "mid": [small], "late": [idle]},
+        {"early": 2.0, "mid": 0.5, "late": 0.0},
+        1.0,
+    )
+    check(
+        "an adapter over its limit is scaled to clip x exposure, direction kept",
+        abs(float(big.grad.norm()) - 2.0) < 1e-6
+        and torch.allclose(big.grad / big.grad.norm(), direction)
+        and before["early"] == 10.0
+        and after["early"] == 2.0,
+        f"{before['early']} -> {float(big.grad.norm()):.4f}",
+    )
+    check(
+        "an adapter under its limit is untouched",
+        abs(float(small.grad.norm()) - 0.1) < 1e-6,
+    )
+    check(
+        "an adapter with no gradient stays None",
+        idle.grad is None and before["late"] is None,
+    )
+
+
+def test_sampling_chunk_mask():
+    print("\n--- sampling: per-row chunk mask for mixed-length batches ---")
+
+    def valid(*chunks):
+        rows = []
+        for count in chunks:
+            rows.append(
+                [1] * (count * CHUNK_LENGTH)
+                + [0] * ((MAX_CHUNKS - count) * CHUNK_LENGTH)
+            )
+        return torch.tensor(rows, dtype=torch.bool)
+
+    check(
+        "a single prompt needs no mask",
+        sampling_chunk_mask(valid(1), valid(1), 1) is None
+        and sampling_chunk_mask(valid(2), valid(1), 2) is None,
+    )
+    mixed = sampling_chunk_mask(valid(1, 2), valid(1), 2)
+    assert mixed is not None
+    check(
+        "a short row in a long batch masks only its own empty chunk",
+        tuple(mixed.shape) == (2, 2 * CHUNK_LENGTH)
+        and bool(mixed[0, :CHUNK_LENGTH].all())
+        and not bool(mixed[0, CHUNK_LENGTH:].any())
+        and bool(mixed[1].all()),
+    )
+    check(
+        "a two-chunk negative keeps both chunks for every row, as unbatched sampling does",
+        sampling_chunk_mask(valid(1, 2), valid(2), 2) is None,
+    )
+
+
 def test_rl_reward():
     print("\n--- RL: floor reward and sampling helpers ---")
     floor, temperature = 5.0, 0.25
@@ -1592,6 +1822,10 @@ def main() -> int:
     test_normalize_grad()
     test_chain_lora_keys()
     test_chain_window()
+    test_chain_blend_weights()
+    test_grad_window_coverage()
+    test_sampling_chunk_mask()
+    test_clip_by_exposure()
     test_rl_reward()
 
     print()

@@ -290,8 +290,24 @@ def pack_chunks(
     )
 
 
+def sampling_chunk_mask(
+    valid: torch.Tensor, negative_valid: torch.Tensor, chunks: int
+) -> torch.Tensor | None:
+    def per_chunk(mask: torch.Tensor) -> torch.Tensor:
+        return mask.reshape(mask.shape[0], -1, CHUNK_LENGTH).any(-1)[:, :chunks]
+
+    rows = per_chunk(valid.bool()) | per_chunk(negative_valid.bool()).any(
+        0, keepdim=True
+    )
+    if bool(rows.all()):
+        return None
+    return rows.repeat_interleave(CHUNK_LENGTH, dim=1)
+
+
 @torch.no_grad()
-def encode_for_sampling(prompts, negative_prompt, text_encoders, tokenizers, device):
+def encode_for_sampling_masked(
+    prompts, negative_prompt, text_encoders, tokenizers, device
+):
     positive, pooled, _, valid = encode_prompt(
         prompts, text_encoders, tokenizers, device
     )
@@ -299,9 +315,18 @@ def encode_for_sampling(prompts, negative_prompt, text_encoders, tokenizers, dev
         negative_prompt, text_encoders, tokenizers, device
     )
     chunks = max(active_chunks(valid), active_chunks(negative_valid))
+    mask = sampling_chunk_mask(valid, negative_valid, chunks)
     return (
         trim_chunks(positive, chunks).to(torch.float16),
         pooled.to(torch.float16),
         trim_chunks(negative, chunks).to(torch.float16),
         negative_pooled.to(torch.float16),
+        None if mask is None else mask.to(torch.float16),
     )
+
+
+def encode_for_sampling(prompts, negative_prompt, text_encoders, tokenizers, device):
+    positive, pooled, negative, negative_pooled, _ = encode_for_sampling_masked(
+        prompts, negative_prompt, text_encoders, tokenizers, device
+    )
+    return positive, pooled, negative, negative_pooled

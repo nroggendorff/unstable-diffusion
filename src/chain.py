@@ -27,6 +27,18 @@ def normalize_grad(x: torch.Tensor, target_rms: float) -> torch.Tensor:
     return _NormalizeGrad.apply(x, target_rms)
 
 
+def active_adapters(adapters, weights) -> tuple[list[str], list[float]]:
+    pairs = [(name, weight) for name, weight in zip(adapters, weights) if weight != 0.0]
+    return [name for name, _ in pairs], [weight for _, weight in pairs]
+
+
+def sample_grad_window(rng, trainable_steps: int, window: int) -> set[int]:
+    if window <= 0 or window >= trainable_steps:
+        return set(range(trainable_steps))
+    start = rng.randrange(1 - window, trainable_steps)
+    return set(range(max(0, start), min(trainable_steps, start + window)))
+
+
 def lora_parameters(unet, segments=ALL_SEGMENTS):
     params = []
     for name, param in unet.named_parameters():
@@ -64,11 +76,13 @@ def _unet_eps(
     use_lora,
     use_ckpt,
     adapters=ALL_SEGMENTS,
+    attention_mask=None,
 ):
     def run(sample, prompt_embeds, add_text_embeds):
-        if use_lora:
+        names, scales = active_adapters(adapters, weights) if use_lora else ([], [])
+        if names:
             pipe.enable_lora()
-            pipe.set_adapters(adapters, weights)
+            pipe.set_adapters(names, scales)
         else:
             pipe.disable_lora()
 
@@ -78,6 +92,7 @@ def _unet_eps(
                 model_in.to(dtype=torch.float16),
                 timestep,
                 encoder_hidden_states=prompt_embeds,
+                encoder_attention_mask=attention_mask,
                 added_cond_kwargs={
                     "text_embeds": add_text_embeds,
                     "time_ids": time_ids,
@@ -111,10 +126,13 @@ def rollout_chain(
     grad_target_rms: float,
     adapters=ALL_SEGMENTS,
     timestep_at=None,
+    attention_mask=None,
 ) -> torch.Tensor:
     steps = timesteps.shape[0]
     last = steps - 1
     x = latents.float() * init_sigma
+    if attention_mask is not None:
+        attention_mask = torch.cat([attention_mask, attention_mask])
 
     for index in range(steps):
         needs_grad = use_lora and index in grad_steps
@@ -143,6 +161,7 @@ def rollout_chain(
                 use_lora,
                 needs_grad,
                 adapters,
+                attention_mask,
             )
 
         with torch.set_grad_enabled(carries):
