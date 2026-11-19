@@ -11,7 +11,15 @@ from types import SimpleNamespace
 import torch
 from PIL import Image
 
-from .cache import BucketSampler, blend_masks, load_cache, save_cache
+from .cache import (
+    BucketSampler,
+    blend_masks,
+    compact_text,
+    load_cache,
+    pack_text,
+    save_cache,
+    stack_text,
+)
 from .chain import (
     active_adapters,
     normalize_grad,
@@ -47,8 +55,12 @@ from .encoding import (
     subset_caption,
 )
 from .model import EARLY_SEG, MID_SEG, NUM_INFERENCE_STEPS, SEGMENT_TIMESTEP_RANGES
+from .curate import basin_radius, select
 from .eval import (
     PROMPTS,
+    TEXTUAL_PROMPTS,
+    TEXTUAL_THRESHOLD,
+    _UNRECORDED_NEGATIVE,
     _base_row,
     adherence,
     angular_spread,
@@ -56,6 +68,7 @@ from .eval import (
     paired_deltas,
     radius,
     reusable_base,
+    textual_probability,
 )
 from .inference import make_two_row_grid
 from .loss import compute_diffusion_loss, min_snr_weight
@@ -714,6 +727,36 @@ def test_paired_deltas():
         < 1e-6,
     )
 
+    d_text, d_plain = normalize(torch.randn(2, 64), dim=-1)
+    probe = torch.stack([d_text] * len(TEXTUAL_PROMPTS) + [d_plain] * 3)
+    plain_set = [
+        normalize(d_plain + 0.2 * torch.randn(6, 64), dim=-1) for _ in range(5)
+    ]
+    wordy = [normalize(d_text + 0.2 * torch.randn(6, 64), dim=-1) for _ in range(5)]
+    wordy[0] = normalize(plain_set[0] + 0.05 * torch.randn(6, 64), dim=-1)
+    textual = paired_deltas(wordy, plain_set, basin, text, (probe, 100.0))
+    p_wordy = textual_probability(torch.cat(wordy), probe, 100.0)
+    p_base = textual_probability(torch.cat(plain_set), probe, 100.0)
+    plain = (p_wordy <= TEXTUAL_THRESHOLD) & (p_base <= TEXTUAL_THRESHOLD)
+    radius_rows = (torch.cat(plain_set) @ basin) - (torch.cat(wordy) @ basin)
+    check(
+        "the textual delta is the paired mean of p_text differences",
+        abs(textual["textual"]["delta"] - (p_wordy - p_base).mean().item()) < 1e-6
+        and textual["textual"]["delta"] > 0.5,
+        f"{textual['textual']['delta']:+.3f}",
+    )
+    check(
+        "radius_plain averages only the pairs where neither image is textual",
+        textual["radius_plain"]["n"] == int(plain.sum()) == 6
+        and abs(textual["radius_plain"]["delta"] - radius_rows[plain].mean().item())
+        < 1e-6,
+        f"n={textual['radius_plain']['n']}",
+    )
+    check(
+        "without a probe the deltas carry no textual rows",
+        "textual" not in deltas and "radius_plain" not in deltas,
+    )
+
 
 def test_base_reuse():
     print("\n--- eval: reusing a prior base pass ---")
@@ -744,6 +787,33 @@ def test_base_reuse():
         "a prior differing in a base setting, seeds or prompts is refused",
         refused == ["guidance", "seeds", "prompts"],
         str(refused),
+    )
+    check(
+        "a prior that predates a flag pairs with that flag's default",
+        reusable_base(prior, dict(args, latent_lf=1.0), prompts, seeds) is prior,
+    )
+    try:
+        reusable_base(prior, dict(args, latent_lf=0.5), prompts, seeds)
+        late_flag_refused = False
+    except ValueError:
+        late_flag_refused = True
+    check(
+        "a prior that predates a flag is refused against a non-default value",
+        late_flag_refused,
+    )
+    unrecorded = dict(args, negative_prompt=_UNRECORDED_NEGATIVE)
+    check(
+        "a prior with no recorded negative pairs with the pre-flag negative",
+        reusable_base(prior, unrecorded, prompts, seeds) is prior,
+    )
+    try:
+        reusable_base(prior, dict(args, negative_prompt="other"), prompts, seeds)
+        negative_refused = False
+    except ValueError:
+        negative_refused = True
+    check(
+        "a prior with no recorded negative is refused against any other negative",
+        negative_refused,
     )
 
     colours = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
@@ -859,6 +929,136 @@ def test_latent_cache_persistence():
         "buckets come back as hashable tuples",
         all(isinstance(item["bucket"], tuple) for item in loaded)
         and BucketSampler(loaded, 1).buckets == [(832, 1216)],
+    )
+
+
+def test_cache_chunk_trim():
+    print("\n--- cache: unused chunks are not stored ---")
+    full = MAX_CHUNKS * CHUNK_LENGTH
+
+    def encoded(two_chunk: bool):
+        valid = torch.zeros(1, full, dtype=torch.bool)
+        valid[:, : full if two_chunk else CHUNK_LENGTH] = True
+        content = (torch.rand(1, full) > 0.5).float() * valid.float()
+        return torch.randn(1, full, 16).half(), content, valid
+
+    short_emb, short_content, short_valid = encoded(False)
+    long_emb, long_content, long_valid = encoded(True)
+    short = compact_text(short_emb, short_content, short_valid)
+    long = compact_text(long_emb, long_content, long_valid)
+
+    check(
+        "a one-chunk caption is stored at one chunk",
+        all(short[k].shape[1] == CHUNK_LENGTH for k in short),
+        str({k: tuple(v.shape) for k, v in short.items()}),
+    )
+    check(
+        "a two-chunk caption is stored whole",
+        all(long[k].shape[1] == full for k in long),
+    )
+    check(
+        "a stored chunk owns only its own bytes",
+        short["text_emb"].untyped_storage().nbytes() == CHUNK_LENGTH * 16 * 2,
+        str(short["text_emb"].untyped_storage().nbytes()),
+    )
+
+    stored_full = {
+        "text_emb": short_emb,
+        "token_content_mask": short_content,
+        "token_valid": short_valid,
+    }
+    trimmed_pack = pack_text(*_reorder(stack_text([short, short], "cpu")))
+    full_pack = pack_text(*_reorder(stack_text([stored_full, stored_full], "cpu")))
+    check(
+        "a one-chunk batch packs identically trimmed or full",
+        trimmed_pack[1] is None
+        and full_pack[1] is None
+        and torch.equal(trimmed_pack[0], full_pack[0])
+        and torch.equal(trimmed_pack[2], full_pack[2]),
+    )
+
+    text_emb, content, valid = stack_text([short, long], "cpu")
+    check(
+        "a mixed batch stacks to the full token length",
+        text_emb.shape == (2, full, 16)
+        and content.shape == (2, full)
+        and valid.shape == (2, full),
+    )
+    check(
+        "the padded chunk is invalid, non-content and zero",
+        not bool(valid[0, CHUNK_LENGTH:].any())
+        and not bool(content[0, CHUNK_LENGTH:].any())
+        and not bool(text_emb[0, CHUNK_LENGTH:].any()),
+    )
+    _, mask, _ = pack_text(text_emb, valid, content)
+    full_valid = torch.cat([short_valid, long_valid])
+    check(
+        "a mixed batch masks exactly the short row's missing chunk",
+        mask is not None and torch.equal(mask.bool(), full_valid),
+    )
+
+
+def _reorder(stacked: tuple) -> tuple:
+    text_emb, content, valid = stacked
+    return text_emb, valid, content
+
+
+def test_curation():
+    print("\n--- curate: off-basin selection ---")
+    generator = torch.Generator().manual_seed(0)
+
+    def unit(vector):
+        return vector / vector.norm()
+
+    basin = unit(torch.randn(16, generator=generator))
+    features = torch.stack(
+        [unit(torch.randn(16, generator=generator)) for _ in range(8)]
+    )
+    features[2] = -basin
+    features[0] = unit(-basin + 0.3 * unit(torch.randn(16, generator=generator)))
+    features[1] = unit(features[0] + 0.02 * torch.randn(16, generator=generator))
+    quality = torch.full((8,), 6.0)
+    quality[2] = 4.0
+
+    radius = basin_radius(features, basin)
+    check(
+        "radius is one minus the cosine to the basin",
+        torch.allclose(radius, 1.0 - features @ basin),
+    )
+    chosen, examined = select(radius, quality, features, 4, 5.0, 0.97)
+    picks = chosen.tolist()
+    check("nothing below the quality floor is selected", 2 not in picks, str(picks))
+    check(
+        "the selection runs in descending radius",
+        all(radius[a] >= radius[b] for a, b in zip(picks, picks[1:])),
+    )
+    check(
+        "a near-duplicate of a higher-radius pick is skipped",
+        len({0, 1} & set(picks)) == 1 and examined == 5,
+        f"picks {picks}, examined {examined}",
+    )
+    check("the count is respected", len(picks) == 4)
+    undeduped, _ = select(radius, quality, features, 4, 5.0, 1.0)
+    check(
+        "dedup 1.0 keeps both near-duplicates",
+        {0, 1} <= set(undeduped.tolist()),
+        str(undeduped.tolist()),
+    )
+    textual = torch.zeros(8)
+    textual[0] = 0.9
+    plain_only, _ = select(radius, quality, features, 4, 5.0, 0.97, textual, 0.3)
+    check(
+        "an image over text_max is excluded and its near-duplicate takes its place",
+        0 not in plain_only.tolist() and 1 in plain_only.tolist(),
+        str(plain_only.tolist()),
+    )
+    prompts = torch.stack([features[0], features[3], features[4]])
+    probability = textual_probability(features, prompts, 100.0, 1)
+    check(
+        "p_text is the softmax mass on the textual prompts",
+        torch.allclose(probability, (100.0 * features @ prompts.T).softmax(-1)[:, 0])
+        and probability[0] > 0.99,
+        f"{probability[0]:.4f}",
     )
 
 
@@ -1849,6 +2049,8 @@ def main() -> int:
     test_base_reuse()
     test_segment_plan()
     test_latent_cache_persistence()
+    test_curation()
+    test_cache_chunk_trim()
     test_straight_through_clamp()
     test_normalize_grad()
     test_chain_lora_keys()

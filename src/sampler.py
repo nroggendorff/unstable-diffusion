@@ -11,7 +11,7 @@ ALL_SEGMENTS = ["early", "mid", "late"]
 NEGATIVE_PROMPT = (
     "nsfw, explicit, questionable, sensitive, suggestive, underwear, panties, "
     "lingerie, cleavage, nude, ugly, low quality, lowres, worst quality, "
-    "text, watermark, comic"
+    "text, watermark, comic, speech bubble, 4koma, multiple views, english text, logo"
 )
 
 _BOUNDARIES = [EARLY_SEG, EARLY_SEG + MID_SEG]

@@ -17,6 +17,36 @@ from .sampler import NEGATIVE_PROMPT, anchor_generate
 
 CLIP_ID = "openai/clip-vit-base-patch32"
 
+TEXTUAL_PROMPTS = [
+    "an image with large text",
+    "a poster with a title",
+    "a logo",
+    "a video game cover",
+    "a magazine cover",
+    "a manga page with speech bubbles",
+    "a comic strip",
+    "a calendar",
+    "a birthday card with handwritten text",
+    "typography",
+]
+PLAIN_PROMPTS = [
+    "an anime illustration of a character",
+    "an anime girl",
+    "a drawing of a person",
+    "a painting of a landscape",
+    "a watercolor portrait",
+    "a fantasy illustration",
+    "a group of anime characters",
+    "a sketch",
+]
+TEXTUAL_THRESHOLD = 0.3
+
+_UNRECORDED_NEGATIVE = (
+    "nsfw, explicit, questionable, sensitive, suggestive, underwear, panties, "
+    "lingerie, cleavage, nude, ugly, low quality, lowres, worst quality, "
+    "text, watermark, comic"
+)
+
 PROMPTS = [
     "a girl",
     "a boy standing",
@@ -45,7 +75,7 @@ PROMPTS = [
 ]
 
 
-def _args() -> argparse.Namespace:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--adapter_path", type=str, default=ADAPTER_BASE_PATH)
     parser.add_argument("--output_dir", type=str, default=default_output_dir())
@@ -71,7 +101,20 @@ def _args() -> argparse.Namespace:
         "--compare", nargs=2, metavar=("BASELINE", "CANDIDATE"), default=None
     )
     parser.add_argument("--base_from", type=str, default="")
-    return parser.parse_args()
+    parser.add_argument("--negative_prompt", type=str, default=NEGATIVE_PROMPT)
+    return parser
+
+
+def _args() -> argparse.Namespace:
+    return _parser().parse_args()
+
+
+def _with_defaults(args: dict) -> dict:
+    return {
+        **vars(_parser().parse_args([])),
+        "negative_prompt": _UNRECORDED_NEGATIVE,
+        **args,
+    }
 
 
 @torch.no_grad()
@@ -88,6 +131,28 @@ def embed(clip, processor, images, prompt, device) -> tuple[torch.Tensor, torch.
         F.normalize(output.image_embeds.float(), dim=-1),
         F.normalize(output.text_embeds.float(), dim=-1)[0],
     )
+
+
+@torch.no_grad()
+def text_probe(clip, processor) -> tuple[torch.Tensor, float]:
+    inputs = processor(
+        text=TEXTUAL_PROMPTS + PLAIN_PROMPTS,
+        images=[Image.new("RGB", (224, 224))],
+        return_tensors="pt",
+        padding=True,
+    ).to(clip.device)
+    probe = F.normalize(clip(**inputs).text_embeds.float(), dim=-1)
+    return probe, clip.logit_scale.exp().item()
+
+
+def textual_probability(
+    features: torch.Tensor,
+    probe: torch.Tensor,
+    scale: float,
+    textual: int = len(TEXTUAL_PROMPTS),
+) -> torch.Tensor:
+    probs = (scale * features.float() @ probe.float().to(features.device).T).softmax(-1)
+    return probs[..., :textual].sum(-1)
 
 
 def angular_spread(features: torch.Tensor) -> float:
@@ -119,10 +184,11 @@ def paired_deltas(
     baseline: list[torch.Tensor],
     basin: torch.Tensor,
     text_features: torch.Tensor,
+    probe: tuple[torch.Tensor, float] | None = None,
 ) -> dict:
     fc, fb = torch.stack(candidate).float(), torch.stack(baseline).float()
-    text = text_features.float()[:, None, :]
-    basin = basin.float()
+    text = text_features.float()[:, None, :].to(fc.device)
+    basin = basin.float().to(fc.device)
     rows = {
         "angular_spread": torch.tensor(
             [angular_spread(c) - angular_spread(b) for c, b in zip(candidate, baseline)]
@@ -131,10 +197,18 @@ def paired_deltas(
         "adherence": (fc * text).sum(-1) - (fb * text).sum(-1),
         "displacement": 1.0 - (fc * fb).sum(-1),
     }
-    return {
+    if probe is not None:
+        pc, pb = textual_probability(fc, *probe), textual_probability(fb, *probe)
+        plain = (pc <= TEXTUAL_THRESHOLD) & (pb <= TEXTUAL_THRESHOLD)
+        rows["textual"] = pc - pb
+        rows["radius_plain"] = rows["radius"][plain]
+    deltas = {
         name: dict(zip(("delta", "se"), mean_se(values)))
         for name, values in rows.items()
     }
+    if probe is not None:
+        deltas["radius_plain"]["n"] = int(rows["radius_plain"].numel())
+    return deltas
 
 
 def print_deltas(title: str, deltas: dict) -> None:
@@ -143,6 +217,8 @@ def print_deltas(title: str, deltas: dict) -> None:
         t = row["delta"] / row["se"] if row["se"] > 0 else float("nan")
         sign = "" if name == "displacement" else "+"
         tail = "" if name == "displacement" else f"  t={t:+.1f}"
+        if "n" in row:
+            tail += f"  ({row['n']} pairs with neither image textual)"
         print(f"  {name:15s} {row['delta']:{sign}.4f} +- {row['se']:.4f}{tail}")
 
 
@@ -163,10 +239,11 @@ _BASE_FREE_ARGS = _UNPAIRED_ARGS + ("base_from", "strength")
 def reusable_base(prior: dict, args: dict, prompts: list, seed_list: list) -> dict:
     if prior["prompts"] != list(prompts) or prior["seed_list"] != seed_list:
         raise ValueError("--base_from eval used different prompts or seeds")
+    prior_args, args = _with_defaults(prior["args"]), _with_defaults(args)
     differing = sorted(
         k
-        for k in set(prior["args"]) | set(args)
-        if k not in _BASE_FREE_ARGS and prior["args"].get(k) != args.get(k)
+        for k in set(prior_args) | set(args)
+        if k not in _BASE_FREE_ARGS and prior_args.get(k) != args.get(k)
     )
     if differing:
         raise ValueError(f"--base_from eval differs in {', '.join(differing)}")
@@ -181,28 +258,55 @@ def _base_row(sheet_path: str, size: tuple[int, int], count: int) -> list:
         return [sheet.crop((i * w, h, (i + 1) * w, 2 * h)).copy() for i in range(count)]
 
 
+def textual_summary(
+    features: list[torch.Tensor], probe: tuple[torch.Tensor, float]
+) -> dict:
+    p = textual_probability(torch.cat([f.float() for f in features]), *probe)
+    return {
+        "textual": p.mean().item(),
+        "textual_rate": (p > TEXTUAL_THRESHOLD).float().mean().item(),
+    }
+
+
+def _textual_line(label: str, row: dict) -> str:
+    return (
+        f"{label:>5}  textual={row['textual']:.3f}  "
+        f"{row['textual_rate']:.0%} over {TEXTUAL_THRESHOLD}"
+    )
+
+
 def compare(baseline_path: str, candidate_path: str) -> dict:
     baseline = torch.load(_features_path(baseline_path), weights_only=True)
     candidate = torch.load(_features_path(candidate_path), weights_only=True)
     for key in ("prompts", "seed_list"):
         if baseline[key] != candidate[key]:
             raise ValueError(f"Cannot pair: the two evals differ in {key}")
+    baseline_args = _with_defaults(baseline["args"])
+    candidate_args = _with_defaults(candidate["args"])
     differing = sorted(
         k
-        for k in set(baseline["args"]) | set(candidate["args"])
+        for k in set(baseline_args) | set(candidate_args)
         if k not in _UNPAIRED_ARGS + ("base_from",)
-        and baseline["args"].get(k) != candidate["args"].get(k)
+        and baseline_args.get(k) != candidate_args.get(k)
     )
     if differing:
         print(
             "Settings that differ:",
             ", ".join(
-                f"{k} {baseline['args'].get(k)} -> {candidate['args'].get(k)}"
+                f"{k} {baseline_args.get(k)} -> {candidate_args.get(k)}"
                 for k in differing
             ),
         )
+    clip = CLIPModel.from_pretrained(CLIP_ID).eval()
+    probe = text_probe(clip, CLIPProcessor.from_pretrained(CLIP_ID))
+    del clip
+    for label, features in (
+        ("baseline", baseline["lora"]),
+        ("candidate", candidate["lora"]),
+    ):
+        print(_textual_line(label, textual_summary(features, probe)))
     deltas = paired_deltas(
-        candidate["lora"], baseline["lora"], baseline["basin"], baseline["text"]
+        candidate["lora"], baseline["lora"], baseline["basin"], baseline["text"], probe
     )
     print_deltas(f"candidate - baseline: {candidate_path} vs {baseline_path}", deltas)
     return deltas
@@ -257,13 +361,14 @@ def main():
 
     clip = CLIPModel.from_pretrained(CLIP_ID).to(device).eval()
     processor = CLIPProcessor.from_pretrained(CLIP_ID)
+    probe = text_probe(clip, processor)
 
     encoders = [pipe.text_encoder, pipe.text_encoder_2]
     tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
 
     encoded = {
         prompt: encode_for_sampling(
-            prompt, NEGATIVE_PROMPT, encoders, tokenizers, device
+            prompt, args.negative_prompt, encoders, tokenizers, device
         )
         for prompt in prompts
     }
@@ -395,10 +500,16 @@ def main():
         "args": vars(args),
         "prompts": len(prompts),
         "seeds": args.seeds,
-        "lora": summarize(results["lora"], basin, text_features),
-        "base": summarize(results["base"], basin, text_features),
+        "lora": {
+            **summarize(results["lora"], basin, text_features),
+            **textual_summary(lora_features, probe),
+        },
+        "base": {
+            **summarize(results["base"], basin, text_features),
+            **textual_summary(base_features, probe),
+        },
         "lora_vs_base": paired_deltas(
-            lora_features, base_features, basin, text_features
+            lora_features, base_features, basin, text_features, probe
         ),
         "black_frames": black,
     }
@@ -426,6 +537,7 @@ def main():
             f"{label:>5}  angular_spread={row['angular_spread']:.4f}  "
             f"radius={row['radius']:.4f}  adherence={row['adherence']:.4f}"
         )
+        print(_textual_line("", row))
 
     print_deltas("lora - base", metrics["lora_vs_base"])
     if any(black.values()):
@@ -439,7 +551,8 @@ def main():
         print(f"Contact sheets in {sheet_dir} (top row LoRA, bottom row base).")
     print(
         "None of these numbers say whether a sample is any good. "
-        "Angular spread and radius both rise on garbage; adherence is the only "
+        "Angular spread and radius both rise on garbage, and radius rises on text, "
+        "posters and comic pages (textual, radius_plain); adherence is the only "
         "brake. Look at the sheets."
     )
 

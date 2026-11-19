@@ -323,7 +323,9 @@ def build_sampler(
     for encoder in text_encoders:
         encoder.to(DEVICE)
 
-    path = cache_path(cfg, seed) if cfg.cache_dir else ""
+    path = cfg.cache_file or (cache_path(cfg, seed) if cfg.cache_dir else "")
+    if cfg.cache_file and not os.path.exists(path):
+        raise FileNotFoundError(f"--cache_file {path} does not exist")
     if path and os.path.exists(path):
         print(f"Loading latent cache (seed={seed}) from {path}...")
         cached = load_cache(path)
@@ -384,6 +386,7 @@ def train(cfg: argparse.Namespace):
 
     print(
         f"Config: segments={cfg.segments}, cache_dir={cfg.cache_dir or None}, "
+        f"cache_file={cfg.cache_file or None}, "
         f"steps={cfg.steps}, mini_batch={cfg.mini_batch_size}, "
         f"grad_accum={cfg.grad_accum_steps}, train_steps={cfg.train_steps}, "
         f"cache_size={cfg.cache_size}, shuffle_buffer={cfg.shuffle_buffer}, "

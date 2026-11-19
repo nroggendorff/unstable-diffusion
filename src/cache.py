@@ -8,7 +8,15 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from .dataset import CACHE_WORKERS, prepared_samples
-from .encoding import active_chunks, encode_prompt, pack_chunks, subset_caption
+from .encoding import (
+    CHUNK_LENGTH,
+    MAX_CHUNKS,
+    active_chunks,
+    encode_prompt,
+    pack_chunks,
+    subset_caption,
+    trim_chunks,
+)
 from .encoder.mask_builder import normalize_mask
 from .scheduler import LATENT_DC_STD, LATENT_MEAN
 
@@ -44,11 +52,29 @@ def stack_added_cond(items: list, device, dtype=torch.float16) -> tuple:
     return pooled, time_ids
 
 
+def compact_text(text_emb, content, valid) -> dict:
+    chunks = active_chunks(valid)
+    return {
+        "text_emb": trim_chunks(text_emb, chunks).to("cpu", torch.float16, copy=True),
+        "token_content_mask": trim_chunks(content, chunks).to("cpu", copy=True),
+        "token_valid": trim_chunks(valid, chunks).to("cpu", copy=True),
+    }
+
+
+def _pad_tokens(tensor: torch.Tensor, length: int) -> torch.Tensor:
+    if tensor.shape[1] == length:
+        return tensor
+    padded = tensor.new_zeros((tensor.shape[0], length, *tensor.shape[2:]))
+    padded[:, : tensor.shape[1]] = tensor
+    return padded
+
+
 def stack_text(items: list, device, dtype=torch.float16) -> tuple:
-    text_emb = torch.cat([x["text_emb"] for x in items]).to(device, dtype=dtype)
-    content = torch.cat([x["token_content_mask"] for x in items]).to(device)
-    valid = torch.cat([x["token_valid"] for x in items]).to(device)
-    return text_emb, content, valid
+    length = MAX_CHUNKS * CHUNK_LENGTH
+    text_emb = torch.cat([_pad_tokens(x["text_emb"], length) for x in items])
+    content = torch.cat([_pad_tokens(x["token_content_mask"], length) for x in items])
+    valid = torch.cat([_pad_tokens(x["token_valid"], length) for x in items])
+    return text_emb.to(device, dtype=dtype), content.to(device), valid.to(device)
 
 
 def pack_text(text_emb, valid, content) -> tuple:
@@ -159,11 +185,9 @@ def build_cache(
         cached.append(
             {
                 "latents": latents.cpu().half(),
-                "text_emb": text_emb.cpu().half(),
+                **compact_text(text_emb, content, valid),
                 "pooled": pooled.cpu().half(),
                 "time_ids": torch.tensor(time_ids, dtype=torch.float32),
-                "token_content_mask": content.cpu(),
-                "token_valid": valid.cpu(),
                 "bucket": bucket,
             }
         )
