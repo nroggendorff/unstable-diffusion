@@ -312,8 +312,8 @@ class QualityRL:
                         adapter_name=name,
                     )
         pipe.set_progress_bar_config(disable=True)
-        for param in pipe.unet.parameters():
-            param.requires_grad_(False)
+        pipe.unet.requires_grad_(False)
+        pipe.vae.requires_grad_(False)
         self.params = lora_parameters(pipe.unet)
         print(f"Trainable LoRA tensors: {len(self.params)}")
 
