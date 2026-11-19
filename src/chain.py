@@ -32,6 +32,29 @@ def active_adapters(adapters, weights) -> tuple[list[str], list[float]]:
     return [name for name, _ in pairs], [weight for _, weight in pairs]
 
 
+_UNKNOWN = object()
+
+
+class AdapterSwitch:
+    def __init__(self, pipe):
+        self.pipe = pipe
+        self.state = _UNKNOWN
+
+    def apply(self, names: list[str], scales: list[float]):
+        state = (tuple(names), tuple(scales))
+        if state == self.state:
+            return
+        if names:
+            self.pipe.enable_lora()
+            self.pipe.set_adapters(names, scales)
+        else:
+            self.pipe.disable_lora()
+        self.state = state
+
+    def forget(self):
+        self.state = _UNKNOWN
+
+
 def sample_grad_window(rng, trainable_steps: int, window: int) -> set[int]:
     if window <= 0 or window >= trainable_steps:
         return set(range(trainable_steps))
@@ -77,14 +100,14 @@ def _unet_eps(
     use_ckpt,
     adapters=ALL_SEGMENTS,
     attention_mask=None,
+    switch: AdapterSwitch | None = None,
 ):
+    if switch is None:
+        switch = AdapterSwitch(pipe)
+
     def run(sample, prompt_embeds, add_text_embeds):
         names, scales = active_adapters(adapters, weights) if use_lora else ([], [])
-        if names:
-            pipe.enable_lora()
-            pipe.set_adapters(names, scales)
-        else:
-            pipe.disable_lora()
+        switch.apply(names, scales)
 
         model_in = torch.cat([sample, sample]) / ((sigma**2 + 1) ** 0.5)
         with torch.amp.autocast("cuda", dtype=torch.float16):
@@ -133,6 +156,9 @@ def rollout_chain(
     x = latents.float() * init_sigma
     if attention_mask is not None:
         attention_mask = torch.cat([attention_mask, attention_mask])
+    sigma_values = sigmas[:steps].tolist()
+    deltas = (sigmas[1 : steps + 1] - sigmas[:steps]).tolist()
+    switch = AdapterSwitch(pipe)
 
     for index in range(steps):
         needs_grad = use_lora and index in grad_steps
@@ -141,8 +167,8 @@ def rollout_chain(
         embeds = torch.cat([anchor, positive])
         pooled = torch.cat([anchor_pooled, positive_pooled])
 
-        sigma = sigmas[index].item()
-        delta = (sigmas[index + 1] - sigmas[index]).item()
+        sigma = sigma_values[index]
+        delta = deltas[index]
 
         carries = needs_grad or (x.requires_grad and torch.is_grad_enabled())
 
@@ -162,6 +188,7 @@ def rollout_chain(
                 needs_grad,
                 adapters,
                 attention_mask,
+                switch,
             )
 
         with torch.set_grad_enabled(carries):
@@ -169,4 +196,5 @@ def rollout_chain(
 
         x = x_next if carries else x_next.detach()
 
+    switch.forget()
     return x

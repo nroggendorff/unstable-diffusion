@@ -21,6 +21,7 @@ from .cache import (
     stack_text,
 )
 from .chain import (
+    AdapterSwitch,
     active_adapters,
     normalize_grad,
     rollout_chain,
@@ -1591,8 +1592,10 @@ class _BlendUNet(torch.nn.Module):
         )
         self.active: dict = {}
         self.calls: list = []
+        self.seen: list = []
 
     def forward(self, sample, t, encoder_hidden_states=None, **kwargs):  # noqa: ARG002
+        self.seen.append(dict(self.active))
         out = self.conv(sample.float())
         for name, weight in self.active.items():
             out = out + weight * self.lora[name] * sample.float()
@@ -1648,7 +1651,12 @@ def test_chain_blend_weights():
         )
         out.pow(2).mean().backward()
         grads = {name: unet.lora[name].grad for name in ALL_SEGMENTS}
-        return grads, unet.calls
+        return grads, unet.calls, unet.seen
+
+    def blend(index):
+        if index == steps - 1:
+            return {}
+        return dict(zip(*active_adapters(ALL_SEGMENTS, adapter_weights(index, 1.0))))
 
     check(
         "active_adapters drops zero-weight adapters",
@@ -1659,7 +1667,7 @@ def test_chain_blend_weights():
 
     blend_step = EARLY_SEG - 1
     weights = adapter_weights(blend_step, 1.0)
-    grads, calls = run({blend_step})
+    grads, calls, seen = run({blend_step})
     early, mid = grads["early"], grads["mid"]
     assert early is not None and mid is not None
     ratio = float(mid.abs().sum() / early.abs().sum())
@@ -1674,17 +1682,49 @@ def test_chain_blend_weights():
     )
     check(
         "the final step runs with every adapter off",
-        calls[steps - 1] == {},
-        str(calls[steps - 1]),
+        seen[steps - 1] == {},
+        str(seen[steps - 1]),
+    )
+    check(
+        "every step runs its own blend",
+        seen[:steps] == [blend(index) for index in range(steps)],
     )
     check(
         "the backward recompute re-applies the grad step's blend, not the last step's",
-        len(calls) == steps + 1
-        and calls[-1] == {"early": weights[0], "mid": weights[1]},
-        str(calls[-1]),
+        len(seen) == steps + 1 and seen[-1] == {"early": weights[0], "mid": weights[1]},
+        str(seen[-1]),
+    )
+    changes = 1 + sum(seen[i] != seen[i - 1] for i in range(1, steps))
+    check(
+        "adapters switch only when the blend changes",
+        len(calls) == changes + 1 and changes < steps // 2,
+        f"{len(calls)} switches over {steps} steps and one recompute",
     )
 
-    only_early, _ = run({0, 1, 2})
+    window = set(range(blend_step - 2, blend_step + 3))
+    across, _, seen = run(window)
+    check(
+        "recomputes across a blend zone each see their own step's blend",
+        seen[steps:] == [blend(index) for index in sorted(window, reverse=True)]
+        and across["early"] is not None
+        and across["mid"] is not None,
+        f"window {sorted(window)}",
+    )
+
+    pipe = _blend_pipe(_BlendUNet())
+    switch = AdapterSwitch(pipe)
+    switch.apply(["early"], [1.0])
+    switch.apply(["early"], [1.0])
+    pipe.disable_lora()
+    switch.forget()
+    switch.apply(["early"], [1.0])
+    check(
+        "a forgotten switch re-applies after an outside change",
+        pipe.unet.calls == [{"early": 1.0}, {}, {"early": 1.0}],
+        str(pipe.unet.calls),
+    )
+
+    only_early, _, _ = run({0, 1, 2})
     check(
         "a window inside one segment trains only that adapter",
         only_early["early"] is not None
