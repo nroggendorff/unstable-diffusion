@@ -4,16 +4,16 @@ A diffusion trainer that discourages boring output.
 
 ## Definitions
 
-| Key | Value |
-|-----|-------|
-| Basin | The region of latent space holding spokeless images: the average of everything the model has seen, present nowhere in the dataset |
-| Spoke | An artistic direction out of the basin. For example, many artists draw noses in a unique way; with the style unspecified, the model should pick one rather than average them |
-| Radius | How far an image sits from the basin |
-| Angle | Which spoke it committed to. Which style did this seed land in? |
-| Orbit | Holding radius while varying angle: staying out of the basin, and landing somewhere different each time |
-| Garbage | Random pixels, formless images, anything outside the radius dividing art from spokeless "slop" |
-| Adherence | The success metric for finding a point in the manifold that complies with the prompt |
-| Variance | Stylistic choices, such as color palette, artstyle/genre, or composition |
+| Key       | Value                                                                                                                                                                        |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Basin     | The region of latent space holding spokeless images: the average of everything the model has seen, present nowhere in the dataset                                            |
+| Spoke     | An artistic direction out of the basin. For example, many artists draw noses in a unique way; with the style unspecified, the model should pick one rather than average them |
+| Radius    | How far an image sits from the basin                                                                                                                                         |
+| Angle     | Which spoke it committed to. Which style did this seed land in?                                                                                                              |
+| Orbit     | Holding radius while varying angle: staying out of the basin, and landing somewhere different each time                                                                      |
+| Garbage   | Random pixels, formless images, anything outside the radius dividing art from spokeless "slop"                                                                               |
+| Adherence | The success metric for finding a point in the manifold that complies with the prompt                                                                                         |
+| Variance  | Stylistic choices, such as color palette, artstyle/genre, or composition                                                                                                     |
 
 Radius and angle are independent, and both can fail on their own. Several images boldly committed to the same unique style have radius but no angle variance.
 
@@ -37,10 +37,10 @@ We want to create a new manifold that exists after pulling down all of the basin
 
 ## Evaluating this
 
-| Key | Value |
-|-----|-------|
-| Angular spread | mean pairwise distance between samples in a semantic embedding space. |
-| Radius | distance from the basin, measured as displacement from the unconditioned or heavily-averaged centroid. |
-| Adherence | similarity to the prompt, as a guard against drifting off-subject rather than as a measure of quality. |
+| Key            | Value                                                                                                  |
+| -------------- | ------------------------------------------------------------------------------------------------------ |
+| Angular spread | mean pairwise distance between samples in a semantic embedding space.                                  |
+| Radius         | distance from the basin, measured as displacement from the unconditioned or heavily-averaged centroid. |
+| Adherence      | similarity to the prompt, as a guard against drifting off-subject rather than as a measure of quality. |
 
-None of these measures whether the result is any *good*. A well-placed detail and a poorly-placed one score identically. Every metric here can confirm that samples differ and that they left the basin; none can confirm they arrived anywhere worth being. That judgement stays human (unfortunately).
+None of these measures whether the result is any _good_. A well-placed detail and a poorly-placed one score identically. Every metric here can confirm that samples differ and that they left the basin; none can confirm they arrived anywhere worth being. That judgement stays human (unfortunately).
