@@ -9,7 +9,7 @@ from PIL import Image
 
 from datasets import load_dataset
 
-DATASET_ID = "pepper13/tagged-anime"
+DATASET_ID = "pepper13/anime-illustrations"
 SHUFFLE_BUFFER = 1024
 CACHE_WORKERS = 6
 STREAM_BATCH_SIZE = 1

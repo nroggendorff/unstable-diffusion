@@ -1,4 +1,6 @@
 import os
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 
 import torch
 from safetensors.torch import save_file
@@ -33,6 +35,15 @@ def active_adapters(adapters, weights) -> tuple[list[str], list[float]]:
 
 
 _UNKNOWN = object()
+
+
+@dataclass
+class Teacher:
+    adapters: Sequence[str]
+    use_lora: bool
+    anchor_at: Callable
+    raw_guidance: Callable
+    losses: list = field(default_factory=list)
 
 
 class AdapterSwitch:
@@ -101,7 +112,7 @@ def _unet_eps(
     adapters=ALL_SEGMENTS,
     attention_mask=None,
     switch: AdapterSwitch | None = None,
-):
+) -> torch.Tensor:
     if switch is None:
         switch = AdapterSwitch(pipe)
 
@@ -126,6 +137,7 @@ def _unet_eps(
         return uncond + guidance * (cond - uncond)
 
     if use_ckpt:
+        # pyrefly: ignore [bad-return]
         return torch.utils.checkpoint.checkpoint(
             run, x, embeds, pooled, use_reentrant=False
         )
@@ -150,6 +162,7 @@ def rollout_chain(
     adapters=ALL_SEGMENTS,
     timestep_at=None,
     attention_mask=None,
+    teacher: Teacher | None = None,
 ) -> torch.Tensor:
     steps = timesteps.shape[0]
     last = steps - 1
@@ -169,6 +182,7 @@ def rollout_chain(
 
         sigma = sigma_values[index]
         delta = deltas[index]
+        timestep = timesteps[index] if timestep_at is None else timestep_at(index)
 
         carries = needs_grad or (x.requires_grad and torch.is_grad_enabled())
 
@@ -177,7 +191,7 @@ def rollout_chain(
             eps = _unet_eps(
                 pipe,
                 x_in,
-                timesteps[index] if timestep_at is None else timestep_at(index),
+                timestep,
                 embeds,
                 pooled,
                 time_ids,
@@ -190,6 +204,27 @@ def rollout_chain(
                 attention_mask,
                 switch,
             )
+
+        if teacher is not None and needs_grad:
+            teacher_anchor, teacher_pooled = teacher.anchor_at(index)
+            with torch.no_grad():
+                target = _unet_eps(
+                    pipe,
+                    x.detach(),
+                    timestep,
+                    torch.cat([teacher_anchor, positive]),
+                    torch.cat([teacher_pooled, positive_pooled]),
+                    time_ids,
+                    sigma,
+                    teacher.raw_guidance(index),
+                    weights,
+                    teacher.use_lora,
+                    False,
+                    teacher.adapters,
+                    attention_mask,
+                    switch,
+                )
+            teacher.losses.append((eps - target).pow(2).flatten(1).mean(1))
 
         with torch.set_grad_enabled(carries):
             x_next = x_in + eps * delta

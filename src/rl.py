@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from .chain import (
     lora_parameters,
+    Teacher,
     rollout_chain,
     sample_grad_window,
     save_chain_lora,
@@ -273,6 +274,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--tether_weight", type=float, default=10.0)
     parser.add_argument("--tether_floor", type=float, default=0.85)
     parser.add_argument("--tether_temp", type=float, default=0.02)
+    parser.add_argument("--tether_negative", type=int, default=1)
+    parser.add_argument("--distill_weight", type=float, default=0.0)
     parser.add_argument("--calibration_steps", type=int, default=8)
     parser.add_argument("--unet_checkpoint", type=int, default=1)
     parser.add_argument("--save_every", type=int, default=50)
@@ -304,7 +307,7 @@ class QualityRL:
         else:
             pipe = load_pipe(args.adapter_path)
             self.reference_adapters = REFERENCE_ADAPTERS
-            if args.tether_weight > 0.0:
+            if args.tether_weight > 0.0 or args.distill_weight > 0.0:
                 for segment, name in zip(ALL_SEGMENTS, REFERENCE_ADAPTERS):
                     pipe.load_lora_weights(
                         args.adapter_path,
@@ -387,6 +390,9 @@ class QualityRL:
         policy_plan = plan(
             torch.zeros_like(negative), torch.zeros_like(negative_pooled)
         )
+        negative_plan = plan(negative, negative_pooled)
+        reference_adapters = self.reference_adapters or ALL_SEGMENTS
+        reference_lora = self.reference_adapters is not None
         time_ids = torch.tensor(
             [[height, width, 0, 0, height, width]] * (2 * batch),
             device=DEVICE,
@@ -418,7 +424,7 @@ class QualityRL:
             sample_grad_window(self.rng, steps - 1, args.grad_window) if grad else set()
         )
 
-        def run(adapters, steps_with_grad, anchor, use_lora=True):
+        def run(adapters, steps_with_grad, anchor, use_lora=True, teacher=None):
             anchor_at, raw_guidance = anchor
             return rollout_chain(
                 self.pipe,
@@ -438,22 +444,31 @@ class QualityRL:
                 adapters,
                 timestep_at,
                 chunk_mask,
+                teacher,
             )
 
+        teacher = None
+        if grad and args.distill_weight > 0.0:
+            teacher = Teacher(reference_adapters, reference_lora, *negative_plan)
+
         with torch.set_grad_enabled(grad):
-            generated = run(ALL_SEGMENTS, grad_steps, policy_plan)
+            generated = run(ALL_SEGMENTS, grad_steps, policy_plan, teacher=teacher)
 
         reference = None
         if grad and args.tether_weight > 0.0:
             with torch.no_grad():
                 reference = run(
-                    self.reference_adapters or ALL_SEGMENTS,
+                    reference_adapters,
                     set(),
-                    plan(negative, negative_pooled),
-                    use_lora=self.reference_adapters is not None,
+                    negative_plan if args.tether_negative else policy_plan,
+                    use_lora=reference_lora,
                 )
 
-        return generated, reference, (width, height), grad_steps
+        distill = None
+        if teacher is not None and teacher.losses:
+            distill = torch.stack(teacher.losses).mean(0)
+
+        return generated, reference, distill, (width, height), grad_steps
 
     def score(self, latents, prompts):
         embeds = self.scorer.image_embeds(decode_pixels(self.pipe.vae, latents))
@@ -467,7 +482,7 @@ class QualityRL:
         for _ in tqdm(range(args.calibration_steps), desc="calibrate"):
             prompts, _ = self.prompts(args.batch)
             settings = draw_settings(self.rng, args.preset_prob)
-            generated, _, _, _ = self.rollout(prompts, settings, grad=False)
+            generated, _, _, _, _ = self.rollout(prompts, settings, grad=False)
             _, quality, adherence = self.score(generated, prompts)
             qualities.append(quality.float().cpu())
             adherences.append(adherence.float().cpu())
@@ -531,7 +546,7 @@ class QualityRL:
 
             prompts, sources = self.prompts(args.batch)
             settings = draw_settings(self.rng, args.preset_prob)
-            generated, reference, size, grad_steps = self.rollout(
+            generated, reference, distill, size, grad_steps = self.rollout(
                 prompts, settings, grad=True
             )
             exposure = adapter_exposure(grad_steps, settings["strength"], steps)
@@ -552,6 +567,11 @@ class QualityRL:
                 penalty = penalty + args.tether_weight * floor_penalty(
                     identity, args.tether_floor, args.tether_temp
                 )
+
+            if distill is None:
+                distill = torch.zeros_like(quality)
+            else:
+                penalty = penalty + args.distill_weight * distill
 
             loss = penalty.mean()
             if not torch.isfinite(loss):
@@ -574,6 +594,7 @@ class QualityRL:
                 quality=quality.tolist(),
                 adherence=adherence.tolist(),
                 identity=identity.tolist(),
+                distill=distill.tolist(),
                 grad_norm=grad_norm,
                 segment_grad_norm=segment_grads,
                 clipped_grad_norm=clipped_grads,
@@ -597,13 +618,14 @@ class QualityRL:
                 qmin=f"{quality.min().item():.2f}",
                 adh=f"{adherence.mean().item():.3f}",
                 ident=f"{identity.mean().item():.3f}",
+                dist=f"{distill.mean().item():.4f}",
                 gnorm=f"{grad_norm:.2e}",
                 win=f"{min(grad_steps)}-{max(grad_steps)}",
                 res=f"{size[0]}x{size[1]}",
                 vram=f"{torch.cuda.max_memory_allocated() / 2**30:.1f}G",
             )
 
-            del generated, reference, embeds, loss, penalty
+            del generated, reference, distill, embeds, loss, penalty
             if step % 10 == 0:
                 torch.cuda.empty_cache()
 

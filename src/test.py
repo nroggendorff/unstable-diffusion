@@ -22,6 +22,7 @@ from .cache import (
 )
 from .chain import (
     AdapterSwitch,
+    Teacher,
     active_adapters,
     normalize_grad,
     rollout_chain,
@@ -1733,6 +1734,95 @@ def test_chain_blend_weights():
     )
 
 
+def test_chain_teacher():
+    print("\n--- chain: the per-step teacher reads the student's latent ---")
+    steps = NUM_INFERENCE_STEPS
+    sigmas = torch.linspace(10.0, 0.0, steps + 1)
+    timesteps = torch.linspace(958.0, 1.0, steps)
+    embeds = torch.randn(2, 5, 16)
+    pooled = torch.randn(2, 12)
+
+    def anchor_at(index):  # noqa: ARG001
+        return embeds, pooled
+
+    def guidance(index):  # noqa: ARG001
+        return 5.0
+
+    def run(window, teacher):
+        torch.manual_seed(0)
+        unet = _BlendUNet()
+        out = rollout_chain(
+            _blend_pipe(unet),
+            10.05,
+            sigmas,
+            timesteps,
+            torch.randn(2, 4, 8, 8),
+            embeds,
+            pooled,
+            torch.zeros(4, 6),
+            anchor_at,
+            guidance,
+            1.0,
+            True,
+            window,
+            0.0,
+            teacher=teacher,
+        )
+        return out, unet
+
+    def blend(index):
+        if index == steps - 1:
+            return {}
+        return dict(zip(*active_adapters(ALL_SEGMENTS, adapter_weights(index, 1.0))))
+
+    window = set(range(EARLY_SEG - 3, EARLY_SEG + 2))
+    plain, _ = run(window, None)
+    teacher = Teacher(ALL_SEGMENTS, False, anchor_at, guidance)
+    out, unet = run(window, teacher)
+    check(
+        "one loss per grad step, one value per sample",
+        len(teacher.losses) == len(window)
+        and all(loss.shape == (2,) for loss in teacher.losses),
+        f"{len(teacher.losses)} losses for a {len(window)}-step window",
+    )
+    check(
+        "the teacher does not change the rollout",
+        torch.equal(out.detach(), plain.detach()),
+    )
+    forward = []
+    for index in range(steps):
+        forward.append(blend(index))
+        if index in window:
+            forward.append({})
+    check(
+        "each policy step re-applies its own blend after a teacher call",
+        unet.seen[: len(forward)] == forward,
+    )
+    check(
+        "a LoRA-off teacher disagrees with a LoRA-on student",
+        all(float(loss.min()) > 0.0 for loss in teacher.losses),
+    )
+    torch.stack(teacher.losses).mean().backward()
+    early, late = unet.lora["early"].grad, unet.lora["late"].grad
+    check(
+        "the distillation loss reaches the window's adapters and no others",
+        early is not None and float(early.abs().sum()) > 0.0 and late is None,
+    )
+    check(
+        "the backward recompute sees the policy blend, never the teacher's",
+        unet.seen[len(forward) :]
+        == [blend(index) for index in sorted(window, reverse=True)],
+        str(unet.seen[len(forward) :]),
+    )
+
+    same = Teacher(ALL_SEGMENTS, True, anchor_at, guidance)
+    run(window, same)
+    check(
+        "a teacher identical to the student gives zero loss",
+        all(float(loss.abs().max()) == 0.0 for loss in same.losses),
+    )
+
+
 def test_grad_window_coverage():
     print("\n--- RL: grad windows cover every trainable step equally ---")
     trainable, window, draws = NUM_INFERENCE_STEPS - 1, 10, 40000
@@ -2096,6 +2186,7 @@ def main() -> int:
     test_chain_lora_keys()
     test_chain_window()
     test_chain_blend_weights()
+    test_chain_teacher()
     test_grad_window_coverage()
     test_sampling_chunk_mask()
     test_clip_by_exposure()
