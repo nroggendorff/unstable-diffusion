@@ -54,7 +54,7 @@ def shuffle_buffer_size(n: int, shuffle_buffer: int = SHUFFLE_BUFFER) -> int:
     return min(shuffle_buffer, max(n, 256))
 
 
-def get_samples(n=100, seed=0, shuffle_buffer=SHUFFLE_BUFFER):
+def get_samples(n=100, seed=0, shuffle_buffer=SHUFFLE_BUFFER, skip=0):
     dataset = load_dataset(
         DATASET_ID,
         split="train",
@@ -65,6 +65,8 @@ def get_samples(n=100, seed=0, shuffle_buffer=SHUFFLE_BUFFER):
     dataset = dataset.shuffle(
         seed=seed, buffer_size=shuffle_buffer_size(n, shuffle_buffer)
     )
+    if skip:
+        dataset = dataset.skip(skip)
 
     iterator = iter(dataset)
     try:

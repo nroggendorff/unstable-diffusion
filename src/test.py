@@ -1,5 +1,6 @@
 import argparse
 import ast
+import math
 import os
 import pathlib
 import random
@@ -7,6 +8,7 @@ import string
 import sys
 import tempfile
 from types import SimpleNamespace
+from typing import Any
 
 import torch
 from PIL import Image
@@ -73,6 +75,7 @@ from .eval import (
     textual_probability,
 )
 from .inference import make_two_row_grid
+from .io import load_lora, save_lora
 from .loss import compute_diffusion_loss, min_snr_weight
 from .rl import (
     adapter_exposure,
@@ -84,13 +87,31 @@ from .rl import (
 )
 from .sampler import (
     _BLEND_HALF,
+    _DINO_PATCH,
+    _IMAGENET_MEAN,
+    _IMAGENET_STD,
     _MAX_RAW_GUIDANCE,
     ALL_SEGMENTS,
+    COND_HI,
+    COND_LO,
+    COND_NOISE_SALT,
+    DINO_ID,
     NEGATIVE_PROMPT,
+    PG_HI,
+    PG_LO,
+    PG_POOL,
+    PG_SEMANTIC_SIDE,
+    PG_SPACES,
+    TAESD_ID,
     adapter_weights,
+    cond_noise_plan,
+    early_weight,
     lied_timestep,
+    particle_guidance,
+    pg_grid,
     prior_deviation,
     prior_latents,
+    repulsion,
 )
 from .scheduler import (
     LATENT_DC_STD,
@@ -108,6 +129,7 @@ from .scorer import square_views
 from .train import (
     apply_conditioning_augmentation,
     cache_path,
+    check_resume,
     finite_stages,
     first_nonfinite,
     segment_plan,
@@ -650,6 +672,142 @@ def test_sampler_parity():
     )
     check("lied_timestep reproduces the original lie_about_noise", same)
 
+    def app_early_weight(step_index, lo, hi):
+        step_progress = 1.0 - step_index / (NUM_INFERENCE_STEPS - 1)
+        if step_progress >= hi:
+            return 1.0
+        if step_progress <= lo:
+            return 0.0
+        return (step_progress - lo) / (hi - lo)
+
+    check(
+        "sampler.early_weight matches the app.py copy for both windows",
+        all(
+            early_weight(i, NUM_INFERENCE_STEPS, lo, hi) == app_early_weight(i, lo, hi)
+            for lo, hi in ((COND_LO, COND_HI), (PG_LO, PG_HI))
+            for i in range(NUM_INFERENCE_STEPS)
+        ),
+    )
+
+    def app_cond_noise_plan(positive, positive_pooled, seeds, sigma):
+        if sigma <= 0.0:
+            return lambda step_index: (positive, positive_pooled)  # noqa: ARG005
+        noise, pooled_noise = [], []
+        for row, row_seed in enumerate(seeds):
+            generator = torch.Generator(device=positive.device).manual_seed(
+                row_seed ^ COND_NOISE_SALT
+            )
+            noise.append(
+                rms_scaled_noise(
+                    positive[row : row + 1], sigma, generator, split=HIDDEN_SPLIT
+                )
+            )
+            pooled_noise.append(
+                rms_scaled_noise(positive_pooled[row : row + 1], sigma, generator)
+            )
+        embed_noise = torch.cat(noise)
+        pooled_offset = torch.cat(pooled_noise)
+
+        def positive_at(step_index):
+            weight = app_early_weight(step_index, COND_LO, COND_HI)
+            if weight == 0.0:
+                return positive, positive_pooled
+            return (
+                positive + weight * embed_noise,
+                positive_pooled + weight * pooled_offset,
+            )
+
+        return positive_at
+
+    torch.manual_seed(11)
+    positive = torch.randn(1, 77, 2048).expand(3, -1, -1)
+    pooled = torch.randn(1, POOLED_DIM).expand(3, -1)
+    seeds = [47, 48, 49]
+    mine = cond_noise_plan(
+        positive, pooled, seeds, NUM_INFERENCE_STEPS, 0.4, COND_LO, COND_HI
+    )
+    theirs = app_cond_noise_plan(positive, pooled, seeds, 0.4)
+    check(
+        "sampler.cond_noise_plan matches the app.py copy at every step",
+        all(
+            torch.equal(mine(i)[0], theirs(i)[0])
+            and torch.equal(mine(i)[1], theirs(i)[1])
+            for i in range(NUM_INFERENCE_STEPS)
+        ),
+    )
+
+    def app_pg_grid(height, width, space):
+        if space == "latent":
+            return max(1, height // PG_POOL), max(1, width // PG_POOL)
+        scale = PG_SEMANTIC_SIDE / min(height, width)
+        return max(1, round(height * scale)), max(1, round(width * scale))
+
+    def app_flat(coarse):
+        return coarse.flatten(1)
+
+    def app_repulsion(x0, grid, embed=app_flat):
+        batch, _, height, width = x0.shape
+        none = torch.zeros(x0.shape, dtype=torch.float32, device=x0.device)
+        if batch < 2:
+            return none
+        coarse = torch.nn.functional.adaptive_avg_pool2d(x0.detach().float(), grid)
+        off_diagonal = ~torch.eye(batch, dtype=torch.bool, device=x0.device)
+        with torch.enable_grad():
+            coarse.requires_grad_(True)
+            features = embed(coarse).float().flatten(1)
+            diff = features[:, None, :] - features[None, :, :]
+            dist2 = diff.pow(2).sum(-1)[off_diagonal]
+            bandwidth = float(dist2.detach().median()) / math.log(batch)
+            if bandwidth <= 0.0:
+                return none
+            potential = torch.exp(-dist2 / bandwidth).sum()
+            (gradient,) = torch.autograd.grad(potential, coarse)
+        field = torch.nn.functional.interpolate(
+            -gradient, size=(height, width), mode="bilinear", align_corners=False
+        )
+        rms = float(field.pow(2).mean().sqrt())
+        if not math.isfinite(rms) or rms <= 0.0:
+            return none
+        return field / rms
+
+    sizes = [(152, 104), (128, 128), (104, 152), (96, 168)]
+    check(
+        "sampler.pg_grid matches the app.py copy in both spaces",
+        all(
+            pg_grid(h, w, space) == app_pg_grid(h, w, space)
+            for h, w in sizes
+            for space in PG_SPACES
+        ),
+    )
+
+    x0 = torch.randn(4, 4, 152, 104)
+    latent_grid = pg_grid(152, 104, "latent")
+    gap = (
+        (repulsion(x0, latent_grid) - app_repulsion(x0, latent_grid)).abs().max().item()
+    )
+    check(
+        "sampler.repulsion (latent) matches the app.py copy",
+        gap < 1e-6 and not app_repulsion(x0[:1], latent_grid).any(),
+        f"max gap {gap:.2e}",
+    )
+
+    torch.manual_seed(11)
+    projection = torch.randn(4 * 6 * 4, 16)
+
+    def toy(coarse):
+        return torch.nn.functional.normalize(
+            torch.tanh(coarse.flatten(1) @ projection), dim=-1
+        )
+
+    toy_gap = (
+        (repulsion(x0, (6, 4), toy) - app_repulsion(x0, (6, 4), toy)).abs().max().item()
+    )
+    check(
+        "sampler.repulsion through a nonlinear embedder matches the app.py copy",
+        toy_gap < 1e-6,
+        f"max gap {toy_gap:.2e}",
+    )
+
 
 def test_eval_metrics():
     print("\n--- eval metrics ---")
@@ -872,6 +1030,304 @@ def test_segment_plan():
         except ValueError:
             raised = True
         check(f"segment plan rejects {bad}", raised)
+
+
+class _ToyAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.to_q = torch.nn.Linear(8, 8)
+        self.to_k = torch.nn.Linear(8, 8)
+
+
+class _ToyUNet(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attn1 = _ToyAttention()
+        self.attn2 = _ToyAttention()
+
+
+def _toy_peft(targets=("to_q", "to_k")):
+    from peft import LoraConfig, get_peft_model
+
+    torch.manual_seed(0)
+    return get_peft_model(
+        # pyrefly: ignore [bad-argument-type]
+        _ToyUNet(),
+        LoraConfig(r=2, lora_alpha=2, target_modules=list(targets)),
+    )
+
+
+def _lora_state(model) -> dict:
+    return {n: p.detach().clone() for n, p in model.named_parameters() if "lora_" in n}
+
+
+def test_cond_noise():
+    print("\n--- sampler: per-seed conditioning noise ---")
+    torch.manual_seed(0)
+    positive = torch.randn(1, 77, 2048).expand(3, -1, -1)
+    pooled = torch.randn(1, POOLED_DIM).expand(3, -1)
+    steps = NUM_INFERENCE_STEPS
+
+    off = cond_noise_plan(positive, pooled, [1, 2, 3], steps, 0.0, 0.6, 0.9)
+    emb, pool = off(0)
+    check("sigma 0 returns the prompt unchanged", emb is positive and pool is pooled)
+
+    weights = [early_weight(i, steps, 0.6, 0.9) for i in range(steps)]
+    check(
+        "weight is 1 at the start, 0 by mid-schedule, never rising",
+        weights[0] == 1.0
+        and weights[-1] == 0.0
+        and all(a >= b for a, b in zip(weights, weights[1:])),
+        str([round(w, 2) for w in weights[:14]]),
+    )
+
+    plan = cond_noise_plan(positive, pooled, [5, 7, 9], steps, 0.5, 0.6, 0.9)
+    alone = cond_noise_plan(positive[:1], pooled[:1], [7], steps, 0.5, 0.6, 0.9)
+    emb0, pool0 = plan(0)
+    check(
+        "a seed's noise does not depend on its batch partners",
+        torch.equal(emb0[1:2], alone(0)[0]) and torch.equal(pool0[1:2], alone(0)[1]),
+    )
+    check(
+        "different seeds get different noise",
+        not torch.equal(emb0[0], emb0[2]),
+    )
+    check("the pooled embedding is perturbed with it", not torch.equal(pool0, pooled))
+    rel = ((emb0 - positive).norm() / positive.norm()).item()
+    check("noise RMS is sigma times the prompt's", abs(rel - 0.5) < 0.02, f"{rel:.3f}")
+    emb_late, pool_late = plan(steps - 1)
+    check(
+        "the late steps see the clean prompt",
+        emb_late is positive and pool_late is pooled,
+    )
+    mid = 8
+    w = early_weight(mid, steps, 0.6, 0.9)
+    check(
+        "the ramp scales the same noise",
+        torch.allclose(plan(mid)[0] - positive, w * (emb0 - positive), atol=1e-5),
+        f"w={w:.3f}",
+    )
+
+
+def _euler_30() -> Any:
+    from diffusers import EulerDiscreteScheduler
+
+    scheduler: Any = EulerDiscreteScheduler(
+        beta_start=0.00085,
+        beta_end=0.012,
+        beta_schedule="scaled_linear",
+        timestep_spacing="leading",
+        steps_offset=1,
+        prediction_type="epsilon",
+    )
+    scheduler.set_timesteps(NUM_INFERENCE_STEPS)
+    return scheduler
+
+
+def test_particle_guidance():
+    from diffusers import DDPMScheduler, EulerDiscreteScheduler
+
+    print("\n--- sampler: particle guidance ---")
+    torch.manual_seed(0)
+    pool = torch.nn.functional.adaptive_avg_pool2d
+    x0 = torch.randn(5, 4, 32, 48)
+    push = repulsion(x0, (4, 6))
+
+    check("a lone image gets no push", not repulsion(x0[:1], (4, 6)).any())
+    rms = push.pow(2).mean().sqrt().item()
+    check(
+        "the push has the latent's shape and unit batch RMS",
+        push.shape == x0.shape and abs(rms - 1.0) < 1e-4,
+        f"{rms:.5f}",
+    )
+    drift = push.sum(0).abs().max().item()
+    check("the push leaves the batch centroid in place", drift < 1e-4, f"{drift:.2e}")
+
+    off = ~torch.eye(5, dtype=torch.bool)
+
+    def pair_dist2(embedded):
+        return (embedded[:, None] - embedded[None]).pow(2).sum(-1)[off]
+
+    def potential(embed, latents, step):
+        start = pair_dist2(embed(latents))
+        bandwidth = start.median() / torch.log(torch.tensor(5.0))
+        moved = pair_dist2(embed(latents + step))
+        return (
+            torch.exp(-start / bandwidth).sum().item(),
+            torch.exp(-moved / bandwidth).sum().item(),
+            start.sqrt().mean().item(),
+            moved.sqrt().mean().item(),
+        )
+
+    def pooled(latents):
+        return pool(latents, (4, 6)).flatten(1)
+
+    k0, k1, d0, d1 = potential(pooled, x0, 0.05 * push)
+    check(
+        "a small step along the push lowers the kernel potential and spreads the batch",
+        k1 < k0 and d1 > d0,
+        f"kernel {k0:.4f} -> {k1:.4f}, distance {d0:.4f} -> {d1:.4f}",
+    )
+
+    rows = torch.arange(32).view(-1, 1)
+    cols = torch.arange(48).view(1, -1)
+    checker = ((rows + cols) % 2 * 2 - 1).float().expand(4, -1, -1)
+    detailed = x0.clone()
+    detailed[0] += checker
+    gap = (repulsion(detailed, (4, 6)) - push).abs().max().item()
+    check(
+        "detail finer than the pooling window does not change the push",
+        gap < 1e-4,
+        f"{gap:.2e}",
+    )
+
+    features = pool(x0, (4, 6)).flatten(1)
+    diff = features[:, None, :] - features[None, :, :]
+    dist2 = diff.pow(2).sum(-1)
+    kernel = torch.exp(-dist2 / (dist2[off].median() / torch.log(torch.tensor(5.0))))
+    analytic = torch.nn.functional.interpolate(
+        (kernel[:, :, None] * diff).sum(1).view(5, 4, 4, 6),
+        size=(32, 48),
+        mode="bilinear",
+        align_corners=False,
+    )
+    analytic = analytic / analytic.pow(2).mean().sqrt()
+    gap = (analytic - push).abs().max().item()
+    check(
+        "the autograd push equals the closed-form latent push sum_j K_ij (f_i - f_j)",
+        gap < 1e-4,
+        f"{gap:.2e}",
+    )
+
+    check(
+        "the latent grid pools by 8 and the semantic grid keeps aspect at short side 28",
+        pg_grid(152, 104, "latent") == (19, 13)
+        and pg_grid(152, 104, "semantic") == (41, 28)
+        and pg_grid(104, 152, "semantic") == (28, 41),
+        f"{pg_grid(152, 104, 'latent')} {pg_grid(152, 104, 'semantic')}",
+    )
+
+    weight = torch.randn(16, 4, 3, 3)
+
+    def toy(coarse):
+        mapped = torch.tanh(torch.nn.functional.conv2d(coarse, weight, padding=1))
+        return torch.nn.functional.normalize(mapped.mean((-2, -1)), dim=-1)
+
+    def toy_pooled(latents):
+        return toy(pool(latents, (4, 6)))
+
+    toy_push = repulsion(x0, (4, 6), toy)
+    k0, k1, d0, d1 = potential(toy_pooled, x0, 0.01 * toy_push)
+    check(
+        "through a nonlinear embedder the push still lowers the potential and spreads",
+        k1 < k0 and d1 > d0 and toy_push.isfinite().all().item(),
+        f"kernel {k0:.4f} -> {k1:.4f}, distance {d0:.4f} -> {d1:.4f}",
+    )
+
+    steps = NUM_INFERENCE_STEPS
+    sample = 14.0 * torch.randn(3, 4, 16, 24)
+    eps = torch.randn(3, 4, 16, 24)
+    plain, guided = _euler_30(), _euler_30()
+    first = plain.timesteps[0]
+    with particle_guidance(SimpleNamespace(scheduler=guided), steps, 0.3, 0.5, 0.75):
+        _, guided_x0 = guided.step(eps, first, sample, return_dict=False)
+    _, plain_x0 = plain.step(eps, first, sample, return_dict=False)
+    moved = guided_x0 - plain_x0
+    expected = 0.3 * repulsion(plain_x0, pg_grid(16, 24, "latent"))
+    check(
+        "the first step moves the x0 estimate by strength times the push",
+        torch.allclose(moved, expected, atol=1e-4),
+        f"max err {(moved - expected).abs().max().item():.2e}",
+    )
+    check(
+        "the scheduler's own step is back after the block",
+        getattr(guided.step, "__func__", None) is EulerDiscreteScheduler.step,
+    )
+
+    plain, guided = _euler_30(), _euler_30()
+    late = plain.timesteps[steps - 5]
+    with particle_guidance(SimpleNamespace(scheduler=guided), steps, 0.3, 0.5, 0.75):
+        guided_prev, _ = guided.step(eps, late, sample, return_dict=False)
+    plain_prev, _ = plain.step(eps, late, sample, return_dict=False)
+    check("late steps are untouched", torch.equal(guided_prev, plain_prev))
+
+    untouched = _euler_30()
+    with particle_guidance(SimpleNamespace(scheduler=untouched), steps, 0.0, 0.5, 0.75):
+        check("strength 0 leaves the scheduler alone", "step" not in vars(untouched))
+
+    try:
+        with particle_guidance(
+            SimpleNamespace(scheduler=DDPMScheduler()), steps, 0.3, 0.5, 0.75
+        ):
+            pass
+        refused = False
+    except ValueError:
+        refused = True
+    check("a scheduler that is not epsilon Euler is refused", refused)
+
+    try:
+        with particle_guidance(
+            SimpleNamespace(scheduler=_euler_30()), steps, 0.3, 0.5, 0.75, "pixel"
+        ):
+            pass
+        refused = False
+    except ValueError:
+        refused = True
+    check("an unknown feature space is refused", refused)
+
+
+def test_lora_resume():
+    print("\n--- train: resume from a saved adapter ---")
+    trained = _toy_peft()
+    with torch.no_grad():
+        for name, param in trained.named_parameters():
+            if "lora_" in name:
+                param.copy_(torch.randn_like(param))
+    want = _lora_state(trained)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        save_lora(trained, tmp, "early")
+        fresh = _toy_peft()
+        before = _lora_state(fresh)
+        count = load_lora(fresh, tmp, "early")
+        got = _lora_state(fresh)
+        check(
+            "every LoRA tensor is loaded",
+            count == len(want) and set(got) == set(want),
+            f"{count} of {len(want)}",
+        )
+        check(
+            "loaded tensors equal the saved ones",
+            all(torch.equal(got[n], want[n]) for n in want),
+        )
+        check(
+            "the load changed the fresh adapter",
+            any(not torch.equal(before[n], got[n]) for n in want),
+        )
+
+        narrow = _toy_peft(("to_q",))
+        save_lora(narrow, tmp, "mid")
+        try:
+            load_lora(_toy_peft(), tmp, "mid")
+            raised = False
+        except RuntimeError:
+            raised = True
+        check("an adapter missing LoRA keys is refused", raised)
+
+        cfg = argparse.Namespace(resume_dir=tmp, resume_step=500, train_steps=1000)
+        check_resume(cfg, ["early"])
+        for bad, segments in (
+            (dict(resume_step=0), ["early"]),
+            (dict(resume_step=1000), ["early"]),
+            ({}, ["early", "late"]),
+            (dict(resume_dir="", resume_step=500), ["early"]),
+        ):
+            try:
+                check_resume(argparse.Namespace(**{**vars(cfg), **bad}), segments)
+                raised = False
+            except (ValueError, FileNotFoundError):
+                raised = True
+            check(f"resume check rejects {bad or 'a missing segment'}", raised)
 
 
 def test_latent_cache_persistence():
@@ -2105,6 +2561,19 @@ _APP_MIRRORED_CONSTANTS = {
     "TERMINAL_LEAK": TERMINAL_LEAK,
     "NOISE_LF_STRENGTH": NOISE_LF_STRENGTH,
     "NEGATIVE_PROMPT": NEGATIVE_PROMPT,
+    "COND_NOISE_SALT": COND_NOISE_SALT,
+    "COND_LO": COND_LO,
+    "COND_HI": COND_HI,
+    "PG_SPACES": PG_SPACES,
+    "PG_POOL": PG_POOL,
+    "PG_LO": PG_LO,
+    "PG_HI": PG_HI,
+    "PG_SEMANTIC_SIDE": PG_SEMANTIC_SIDE,
+    "TAESD_ID": TAESD_ID,
+    "DINO_ID": DINO_ID,
+    "_IMAGENET_MEAN": _IMAGENET_MEAN,
+    "_IMAGENET_STD": _IMAGENET_STD,
+    "_DINO_PATCH": _DINO_PATCH,
 }
 
 
@@ -2173,11 +2642,14 @@ def main() -> int:
     test_mask_normalization()
     test_predict_x0(scheduler)
     test_sampler_parity()
+    test_cond_noise()
+    test_particle_guidance()
     test_app_constant_parity()
     test_eval_metrics()
     test_paired_deltas()
     test_base_reuse()
     test_segment_plan()
+    test_lora_resume()
     test_latent_cache_persistence()
     test_curation()
     test_cache_chunk_trim()

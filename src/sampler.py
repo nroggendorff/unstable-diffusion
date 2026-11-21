@@ -1,6 +1,10 @@
 import contextlib
+import math
+from typing import Any
 
 import torch
+import torch.nn.functional as F
+from diffusers import EulerDiscreteScheduler
 
 from .encoding import rms_scaled_noise, HIDDEN_SPLIT
 from .model import EARLY_SEG, MID_SEG, NUM_INFERENCE_STEPS
@@ -153,6 +157,192 @@ def anchor_plan(
     return anchor_at, raw_guidance
 
 
+COND_NOISE_SALT = 0xC0DE
+COND_LO = 0.6
+COND_HI = 0.9
+
+
+def early_weight(
+    step_index: int, num_inference_steps: int, lo: float, hi: float
+) -> float:
+    step_progress = progress(step_index, num_inference_steps)
+    if step_progress >= hi:
+        return 1.0
+    if step_progress <= lo:
+        return 0.0
+    return (step_progress - lo) / (hi - lo)
+
+
+def cond_noise_plan(
+    positive: torch.Tensor,
+    positive_pooled: torch.Tensor,
+    seeds: list[int],
+    num_inference_steps: int,
+    sigma: float,
+    lo: float,
+    hi: float,
+):
+    if sigma <= 0.0:
+        return lambda step_index: (positive, positive_pooled)  # noqa: ARG005
+
+    noise, pooled_noise = [], []
+    for row, seed in enumerate(seeds):
+        generator = torch.Generator(device=positive.device).manual_seed(
+            seed ^ COND_NOISE_SALT
+        )
+        noise.append(
+            rms_scaled_noise(
+                positive[row : row + 1], sigma, generator, split=HIDDEN_SPLIT
+            )
+        )
+        pooled_noise.append(
+            rms_scaled_noise(positive_pooled[row : row + 1], sigma, generator)
+        )
+    embed_noise = torch.cat(noise)
+    pooled_offset = torch.cat(pooled_noise)
+
+    def positive_at(step_index: int):
+        weight = early_weight(step_index, num_inference_steps, lo, hi)
+        if weight == 0.0:
+            return positive, positive_pooled
+        return positive + weight * embed_noise, positive_pooled + weight * pooled_offset
+
+    return positive_at
+
+
+PG_SPACES = ("latent", "semantic")
+PG_LO = 0.5
+PG_HI = 0.75
+PG_POOL = 8
+PG_SEMANTIC_SIDE = 28
+TAESD_ID = "madebyollin/taesdxl"
+DINO_ID = "facebook/dinov2-small"
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+_DINO_PATCH = 14
+
+
+def pg_grid(height: int, width: int, space: str) -> tuple[int, int]:
+    if space == "latent":
+        return max(1, height // PG_POOL), max(1, width // PG_POOL)
+    scale = PG_SEMANTIC_SIDE / min(height, width)
+    return max(1, round(height * scale)), max(1, round(width * scale))
+
+
+class SemanticEmbedder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        from diffusers import AutoencoderTiny
+        from transformers import Dinov2Model
+
+        taesd: Any = AutoencoderTiny.from_pretrained(TAESD_ID)
+        self.decoder = taesd.decoder
+        self.dino = Dinov2Model.from_pretrained(DINO_ID)
+        self.eval().requires_grad_(False)
+
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        images = self.decoder(latents.float())
+        size = [
+            _DINO_PATCH * max(1, round(side / _DINO_PATCH))
+            for side in images.shape[-2:]
+        ]
+        images = F.interpolate(images, size=size, mode="bilinear", align_corners=False)
+        mean = torch.tensor(_IMAGENET_MEAN, device=images.device).view(1, 3, 1, 1)
+        std = torch.tensor(_IMAGENET_STD, device=images.device).view(1, 3, 1, 1)
+        pixels = ((images + 1.0) / 2.0 - mean) / std
+        return F.normalize(self.dino(pixel_values=pixels).pooler_output, dim=-1)
+
+
+_EMBEDDERS: dict[str, SemanticEmbedder] = {}
+
+
+def semantic_embedder(device) -> SemanticEmbedder:
+    key = str(device)
+    if key not in _EMBEDDERS:
+        _EMBEDDERS[key] = SemanticEmbedder().to(device)
+    return _EMBEDDERS[key]
+
+
+def _flat(coarse: torch.Tensor) -> torch.Tensor:
+    return coarse.flatten(1)
+
+
+def repulsion(x0: torch.Tensor, grid: tuple[int, int], embed=_flat) -> torch.Tensor:
+    batch, _, height, width = x0.shape
+    none = torch.zeros(x0.shape, dtype=torch.float32, device=x0.device)
+    if batch < 2:
+        return none
+
+    coarse = F.adaptive_avg_pool2d(x0.detach().float(), grid)
+    off_diagonal = ~torch.eye(batch, dtype=torch.bool, device=x0.device)
+    with torch.enable_grad():
+        coarse.requires_grad_(True)
+        features = embed(coarse).float().flatten(1)
+        diff = features[:, None, :] - features[None, :, :]
+        dist2 = diff.pow(2).sum(-1)[off_diagonal]
+        bandwidth = float(dist2.detach().median()) / math.log(batch)
+        if bandwidth <= 0.0:
+            return none
+        potential = torch.exp(-dist2 / bandwidth).sum()
+        (gradient,) = torch.autograd.grad(potential, coarse)
+
+    field = F.interpolate(
+        -gradient, size=(height, width), mode="bilinear", align_corners=False
+    )
+    rms = float(field.pow(2).mean().sqrt())
+    if not math.isfinite(rms) or rms <= 0.0:
+        return none
+    return field / rms
+
+
+def _epsilon_euler(scheduler) -> bool:
+    prediction = getattr(getattr(scheduler, "config", None), "prediction_type", None)
+    return isinstance(scheduler, EulerDiscreteScheduler) and prediction == "epsilon"
+
+
+@contextlib.contextmanager
+def particle_guidance(
+    pipe,
+    num_inference_steps: int,
+    strength: float,
+    lo: float,
+    hi: float,
+    space: str = "latent",
+):
+    if strength <= 0.0:
+        yield
+        return
+
+    if space not in PG_SPACES:
+        raise ValueError(f"pg space must be one of {PG_SPACES}, not {space!r}")
+    scheduler = pipe.scheduler
+    if not _epsilon_euler(scheduler):
+        raise ValueError(
+            "particle guidance reads x0 as sample - sigma * eps and needs the pinned "
+            f"epsilon EulerDiscreteScheduler, not {type(scheduler).__name__}"
+        )
+    embed = semantic_embedder(pipe.unet.device) if space == "semantic" else _flat
+    original = scheduler.step
+
+    def step(model_output, timestep, sample, *args, **kwargs):
+        index = int((scheduler.timesteps - timestep).abs().argmin().item())
+        weight = early_weight(index, num_inference_steps, lo, hi)
+        if weight == 0.0:
+            return original(model_output, timestep, sample, *args, **kwargs)
+        sigma = float(scheduler.sigmas[index])
+        x0 = sample.float() - sigma * model_output.float()
+        grid = pg_grid(x0.shape[-2], x0.shape[-1], space)
+        shift = (strength * weight / sigma) * repulsion(x0, grid, embed)
+        guided = (model_output.float() - shift).to(model_output.dtype)
+        return original(guided, timestep, sample, *args, **kwargs)
+
+    scheduler.step = step
+    try:
+        yield
+    finally:
+        scheduler.step = original
+
+
 def anchor_generate(
     pipe,
     positive: torch.Tensor,
@@ -173,6 +363,13 @@ def anchor_generate(
     offset: float = 0.0,
     gamma: float = 1.0,
     latent_lf: float = 1.0,
+    cond_sigma: float = 0.0,
+    cond_lo: float = COND_LO,
+    cond_hi: float = COND_HI,
+    pg_strength: float = 0.0,
+    pg_lo: float = PG_LO,
+    pg_hi: float = PG_HI,
+    pg_space: str = "latent",
 ):
     batch = len(seeds)
     last_step = num_inference_steps - 1
@@ -204,6 +401,15 @@ def anchor_generate(
         sigma_cutover,
         jitter_generator,
     )
+    positive_at = cond_noise_plan(
+        positive,
+        positive_pooled,
+        seeds,
+        num_inference_steps,
+        cond_sigma,
+        cond_lo,
+        cond_hi,
+    )
 
     def callback(p, step_index, timestep, callback_kwargs):  # noqa: ARG001
         if use_lora:
@@ -215,8 +421,9 @@ def anchor_generate(
         p._guidance_scale = raw_guidance(min(step_index + 1, last_step))
 
         anchor, anchor_pooled = anchor_at(min(step_index + 1, last_step))
-        callback_kwargs["prompt_embeds"] = torch.cat([anchor, positive])
-        callback_kwargs["add_text_embeds"] = torch.cat([anchor_pooled, positive_pooled])
+        step_positive, step_pooled = positive_at(min(step_index + 1, last_step))
+        callback_kwargs["prompt_embeds"] = torch.cat([anchor, step_positive])
+        callback_kwargs["add_text_embeds"] = torch.cat([anchor_pooled, step_pooled])
         return callback_kwargs
 
     pipe.scheduler.set_timesteps(num_inference_steps, device=pipe.unet.device)
@@ -232,12 +439,18 @@ def anchor_generate(
     )
 
     start_anchor, start_anchor_pooled = anchor_at(0)
+    start_positive, start_positive_pooled = positive_at(0)
 
     try:
-        with lie_about_noise(pipe, offset, gamma):
+        with (
+            lie_about_noise(pipe, offset, gamma),
+            particle_guidance(
+                pipe, num_inference_steps, pg_strength, pg_lo, pg_hi, pg_space
+            ),
+        ):
             result = pipe(
-                prompt_embeds=positive,
-                pooled_prompt_embeds=positive_pooled,
+                prompt_embeds=start_positive,
+                pooled_prompt_embeds=start_positive_pooled,
                 negative_prompt_embeds=start_anchor,
                 negative_pooled_prompt_embeds=start_anchor_pooled,
                 width=width,

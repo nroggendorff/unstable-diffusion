@@ -13,7 +13,15 @@ from .config import default_output_dir
 from .encoding import encode_for_sampling
 from .inference import ADAPTER_BASE_PATH, load_pipe, make_two_row_grid
 from .model import NUM_INFERENCE_STEPS
-from .sampler import NEGATIVE_PROMPT, anchor_generate
+from .sampler import (
+    COND_HI,
+    COND_LO,
+    NEGATIVE_PROMPT,
+    PG_HI,
+    PG_LO,
+    PG_SPACES,
+    anchor_generate,
+)
 
 CLIP_ID = "openai/clip-vit-base-patch32"
 
@@ -95,6 +103,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--offset", type=float, default=0.0)
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--latent_lf", type=float, default=1.0)
+    parser.add_argument("--cond_sigma", type=float, default=0.0)
+    parser.add_argument("--cond_lo", type=float, default=COND_LO)
+    parser.add_argument("--cond_hi", type=float, default=COND_HI)
+    parser.add_argument("--pg_strength", type=float, default=0.0)
+    parser.add_argument("--pg_lo", type=float, default=PG_LO)
+    parser.add_argument("--pg_hi", type=float, default=PG_HI)
+    parser.add_argument("--pg_space", choices=PG_SPACES, default="latent")
     parser.add_argument("--prompt_limit", type=int, default=0)
     parser.add_argument("--no_contact_sheets", action="store_true")
     parser.add_argument(
@@ -456,6 +471,13 @@ def main():
                 sigma=args.sigma,
                 offset=args.offset,
                 gamma=args.gamma,
+                cond_sigma=args.cond_sigma,
+                cond_lo=args.cond_lo,
+                cond_hi=args.cond_hi,
+                pg_strength=args.pg_strength,
+                pg_lo=args.pg_lo,
+                pg_hi=args.pg_hi,
+                pg_space=args.pg_space,
                 **shared,
             )
 

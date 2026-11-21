@@ -57,6 +57,8 @@ def get_config() -> argparse.Namespace:
     add("cache_only", _bool, False)
     add("cache_file", str, "")
     add("save_every", int, 0)
+    add("resume_dir", str, "")
+    add("resume_step", int, 0)
 
     parser.add_argument("--output_dir", type=str, default=default_output_dir())
 

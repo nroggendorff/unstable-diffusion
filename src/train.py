@@ -54,7 +54,7 @@ from .cache import (
     stack_text,
     BucketSampler,
 )
-from .io import save_lora
+from .io import load_lora, save_lora
 
 SEGMENTS = ["early", "mid", "late"]
 TIMESTEP_RANGES = {**SEGMENT_TIMESTEP_RANGES, SINGLE_ADAPTER: SINGLE_ADAPTER_RANGE}
@@ -94,6 +94,26 @@ def cache_path(cfg: argparse.Namespace, seed: int) -> str:
     )
     name = f"latents-seed{seed}-n{cfg.cache_size}-{key}.pt"
     return os.path.join(cfg.cache_dir, name)
+
+
+def check_resume(cfg: argparse.Namespace, segments: list[str]):
+    if not cfg.resume_dir:
+        if cfg.resume_step:
+            raise ValueError("--resume_step needs --resume_dir")
+        return
+    if not 0 < cfg.resume_step < cfg.train_steps:
+        raise ValueError(
+            f"--resume_step must be in (0, {cfg.train_steps}), got {cfg.resume_step}"
+        )
+    missing = [
+        s
+        for s in segments
+        if not os.path.isfile(os.path.join(cfg.resume_dir, f"{s}.safetensors"))
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"--resume_dir {cfg.resume_dir} has no adapter for {', '.join(missing)}"
+        )
 
 
 def _make_inputs_require_grad(module, input, output):  # noqa: ARG001
@@ -167,6 +187,12 @@ def train_segment(
 
     # pyrefly: ignore [bad-argument-type]
     unet = get_peft_model(load_unet(), get_lora_config(cfg.lora_rank, cfg.lora_alpha))
+    if cfg.resume_dir:
+        loaded = load_lora(unet, cfg.resume_dir, segment_name)
+        print(
+            f"Resumed {segment_name} from {cfg.resume_dir} at step {cfg.resume_step} "
+            f"({loaded} tensors; optimizer state starts fresh)"
+        )
     unet.to(DEVICE)
     torch.cuda.empty_cache()
 
@@ -181,7 +207,8 @@ def train_segment(
 
     capture = CrossAttentionCapture(unet, gain=cfg.mask_gain)
 
-    for step in (pbar := tqdm(range(cfg.train_steps))):
+    steps = range(cfg.resume_step, cfg.train_steps)
+    for step in (pbar := tqdm(steps, initial=cfg.resume_step, total=cfg.train_steps)):
         optimizer.zero_grad(set_to_none=True)
 
         accum_loss = 0.0
@@ -332,7 +359,12 @@ def build_sampler(
     else:
         print(f"Building latent cache (seed={seed})...")
         cached = build_cache(
-            get_samples(cfg.cache_size, seed=seed, shuffle_buffer=cfg.shuffle_buffer),
+            get_samples(
+                cfg.cache_size,
+                seed=seed,
+                shuffle_buffer=cfg.shuffle_buffer,
+                skip=seed * cfg.cache_size,
+            ),
             vae,
             text_encoders,
             tokenizers,
@@ -383,6 +415,7 @@ def train(cfg: argparse.Namespace):
     plan = segment_plan(cfg.segments, cfg.refresh_cache_per_segment)
     if cfg.cache_only and not cfg.cache_dir:
         raise ValueError("--cache_only 1 needs --cache_dir to save the cache into")
+    check_resume(cfg, [name for _, name, _ in plan])
 
     print(
         f"Config: segments={cfg.segments}, cache_dir={cfg.cache_dir or None}, "
@@ -398,6 +431,7 @@ def train(cfg: argparse.Namespace):
         f"mask_gain={cfg.mask_gain}, "
         f"caption_subset={cfg.caption_subset_prob}/{cfg.caption_subset_min}, "
         f"save_every={cfg.save_every}, cache_only={cfg.cache_only}, "
+        f"resume={cfg.resume_dir or None}@{cfg.resume_step}, "
         f"output_dir={cfg.output_dir}"
     )
 
