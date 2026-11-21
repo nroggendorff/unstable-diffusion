@@ -1,8 +1,6 @@
 import argparse
-import ast
 import math
 import os
-import pathlib
 import random
 import string
 import sys
@@ -46,7 +44,6 @@ from .encoder.mask_builder import (
 from .encoder.attn_mask import _CapturingProcessor
 from .encoding import (
     CHUNK_LENGTH,
-    CHUNK_TOKENS,
     HIDDEN_SPLIT,
     MAX_CHUNKS,
     POOLED_DIM,
@@ -58,7 +55,7 @@ from .encoding import (
     split_clauses,
     subset_caption,
 )
-from .model import EARLY_SEG, MID_SEG, NUM_INFERENCE_STEPS, SEGMENT_TIMESTEP_RANGES
+from .model import EARLY_SEG, NUM_INFERENCE_STEPS, SEGMENT_TIMESTEP_RANGES
 from .curate import basin_radius, select
 from .eval import (
     PROMPTS,
@@ -89,23 +86,15 @@ from .rl import (
     scaled_bucket,
 )
 from .sampler import (
-    _BLEND_HALF,
-    _DINO_PATCH,
-    _IMAGENET_MEAN,
-    _IMAGENET_STD,
-    _MAX_RAW_GUIDANCE,
     ALL_SEGMENTS,
     COND_HI,
     COND_LO,
     COND_NOISE_SALT,
-    DINO_ID,
-    NEGATIVE_PROMPT,
     PG_HI,
     PG_LO,
     PG_POOL,
     PG_SEMANTIC_SIDE,
     PG_SPACES,
-    TAESD_ID,
     adapter_weights,
     cond_noise_plan,
     early_weight,
@@ -543,9 +532,9 @@ def test_predict_x0(scheduler):
 
 
 def test_sampler_parity():
-    print("\n--- sampler parity with the app.py mirror ---")
+    print("\n--- sampler parity with reference copies ---")
 
-    def app_weights(step_index, strength):
+    def ref_weights(step_index, strength):
         boundaries, half = [10, 20], 2
         for i, boundary in enumerate(boundaries):
             distance = step_index - boundary
@@ -565,12 +554,12 @@ def test_sampler_parity():
         return weights
 
     check(
-        "sampler.adapter_weights matches the app.py copy across the schedule",
-        all(adapter_weights(i, 0.8) == app_weights(i, 0.8) for i in range(30)),
+        "sampler.adapter_weights matches the reference copy across the schedule",
+        all(adapter_weights(i, 0.8) == ref_weights(i, 0.8) for i in range(30)),
     )
 
-    def app_prior_latents(shape, generators, device, dtype, init_sigma, lf=1.0):
-        def app_field(shape, generator, device):
+    def ref_prior_latents(shape, generators, device, dtype, init_sigma, lf=1.0):
+        def ref_field(shape, generator, device):
             batch, channels, height, width = shape
             field = PRIOR_DC * torch.randn(
                 (batch, channels, 1, 1), generator=generator, device=device
@@ -604,7 +593,7 @@ def test_sampler_parity():
                 dtype=torch.float32,
             )
             if lf > 0.0:
-                field = app_field((1, channels, height, width), generator, device)
+                field = ref_field((1, channels, height, width), generator, device)
                 noise = noise + lf * (mean + deviation * field) / init_sigma
             samples.append(noise)
         return torch.cat(samples).to(dtype)
@@ -620,7 +609,7 @@ def test_sampler_parity():
             init_sigma=INIT_SIGMA,
             lf=lf,
         )
-        theirs = app_prior_latents(
+        theirs = ref_prior_latents(
             shape,
             [torch.Generator().manual_seed(7 + i) for i in range(shape[0])],
             "cpu",
@@ -629,7 +618,7 @@ def test_sampler_parity():
             lf=lf,
         )
         matches = matches and bool(torch.equal(mine, theirs))
-    check("sampler.prior_latents matches the app.py copy across lf", matches)
+    check("sampler.prior_latents matches the reference copy across lf", matches)
 
     plain = prior_latents(
         shape,
@@ -675,7 +664,7 @@ def test_sampler_parity():
     )
     check("lied_timestep reproduces the original lie_about_noise", same)
 
-    def app_early_weight(step_index, lo, hi):
+    def ref_early_weight(step_index, lo, hi):
         step_progress = 1.0 - step_index / (NUM_INFERENCE_STEPS - 1)
         if step_progress >= hi:
             return 1.0
@@ -684,15 +673,15 @@ def test_sampler_parity():
         return (step_progress - lo) / (hi - lo)
 
     check(
-        "sampler.early_weight matches the app.py copy for both windows",
+        "sampler.early_weight matches the reference copy for both windows",
         all(
-            early_weight(i, NUM_INFERENCE_STEPS, lo, hi) == app_early_weight(i, lo, hi)
+            early_weight(i, NUM_INFERENCE_STEPS, lo, hi) == ref_early_weight(i, lo, hi)
             for lo, hi in ((COND_LO, COND_HI), (PG_LO, PG_HI))
             for i in range(NUM_INFERENCE_STEPS)
         ),
     )
 
-    def app_cond_noise_plan(positive, positive_pooled, seeds, sigma):
+    def ref_cond_noise_plan(positive, positive_pooled, seeds, sigma):
         if sigma <= 0.0:
             return lambda step_index: (positive, positive_pooled)  # noqa: ARG005
         noise, pooled_noise = [], []
@@ -712,7 +701,7 @@ def test_sampler_parity():
         pooled_offset = torch.cat(pooled_noise)
 
         def positive_at(step_index):
-            weight = app_early_weight(step_index, COND_LO, COND_HI)
+            weight = ref_early_weight(step_index, COND_LO, COND_HI)
             if weight == 0.0:
                 return positive, positive_pooled
             return (
@@ -729,9 +718,9 @@ def test_sampler_parity():
     mine = cond_noise_plan(
         positive, pooled, seeds, NUM_INFERENCE_STEPS, 0.4, COND_LO, COND_HI
     )
-    theirs = app_cond_noise_plan(positive, pooled, seeds, 0.4)
+    theirs = ref_cond_noise_plan(positive, pooled, seeds, 0.4)
     check(
-        "sampler.cond_noise_plan matches the app.py copy at every step",
+        "sampler.cond_noise_plan matches the reference copy at every step",
         all(
             torch.equal(mine(i)[0], theirs(i)[0])
             and torch.equal(mine(i)[1], theirs(i)[1])
@@ -739,16 +728,16 @@ def test_sampler_parity():
         ),
     )
 
-    def app_pg_grid(height, width, space):
+    def ref_pg_grid(height, width, space):
         if space == "latent":
             return max(1, height // PG_POOL), max(1, width // PG_POOL)
         scale = PG_SEMANTIC_SIDE / min(height, width)
         return max(1, round(height * scale)), max(1, round(width * scale))
 
-    def app_flat(coarse):
+    def ref_flat(coarse):
         return coarse.flatten(1)
 
-    def app_repulsion(x0, grid, embed=app_flat):
+    def ref_repulsion(x0, grid, embed=ref_flat):
         batch, _, height, width = x0.shape
         none = torch.zeros(x0.shape, dtype=torch.float32, device=x0.device)
         if batch < 2:
@@ -775,9 +764,9 @@ def test_sampler_parity():
 
     sizes = [(152, 104), (128, 128), (104, 152), (96, 168)]
     check(
-        "sampler.pg_grid matches the app.py copy in both spaces",
+        "sampler.pg_grid matches the reference copy in both spaces",
         all(
-            pg_grid(h, w, space) == app_pg_grid(h, w, space)
+            pg_grid(h, w, space) == ref_pg_grid(h, w, space)
             for h, w in sizes
             for space in PG_SPACES
         ),
@@ -786,11 +775,11 @@ def test_sampler_parity():
     x0 = torch.randn(4, 4, 152, 104)
     latent_grid = pg_grid(152, 104, "latent")
     gap = (
-        (repulsion(x0, latent_grid) - app_repulsion(x0, latent_grid)).abs().max().item()
+        (repulsion(x0, latent_grid) - ref_repulsion(x0, latent_grid)).abs().max().item()
     )
     check(
-        "sampler.repulsion (latent) matches the app.py copy",
-        gap < 1e-6 and not app_repulsion(x0[:1], latent_grid).any(),
+        "sampler.repulsion (latent) matches the reference copy",
+        gap < 1e-6 and not ref_repulsion(x0[:1], latent_grid).any(),
         f"max gap {gap:.2e}",
     )
 
@@ -803,10 +792,10 @@ def test_sampler_parity():
         )
 
     toy_gap = (
-        (repulsion(x0, (6, 4), toy) - app_repulsion(x0, (6, 4), toy)).abs().max().item()
+        (repulsion(x0, (6, 4), toy) - ref_repulsion(x0, (6, 4), toy)).abs().max().item()
     )
     check(
-        "sampler.repulsion through a nonlinear embedder matches the app.py copy",
+        "sampler.repulsion through a nonlinear embedder matches the reference copy",
         toy_gap < 1e-6,
         f"max gap {toy_gap:.2e}",
     )
@@ -1688,7 +1677,7 @@ def test_chain_lora_keys():
 
     check("only the requested adapter is written", count == 2, f"{count} tensors")
     check(
-        "keys match the flat layout app.py loads",
+        "keys match the flat adapter layout",
         keys
         == {
             "unet.down_blocks.0.attentions.0.attn1.to_q.lora_A.weight",
@@ -2633,84 +2622,6 @@ def test_alpha_skip():
         check(f"plain {mode} is kept", tensor is not None)
 
 
-_APP_PATH = pathlib.Path(__file__).resolve().parent.parent / "app.py"
-
-_APP_MIRRORED_CONSTANTS = {
-    "EARLY_SEG": EARLY_SEG,
-    "MID_SEG": MID_SEG,
-    "NUM_INFERENCE_STEPS": NUM_INFERENCE_STEPS,
-    "_BLEND_HALF": _BLEND_HALF,
-    "_MAX_RAW_GUIDANCE": _MAX_RAW_GUIDANCE,
-    "CHUNK_TOKENS": CHUNK_TOKENS,
-    "MAX_CHUNKS": MAX_CHUNKS,
-    "HIDDEN_SPLIT": HIDDEN_SPLIT,
-    "POOLED_DIM": POOLED_DIM,
-    "LATENT_MEAN": LATENT_MEAN,
-    "LATENT_DC_STD": LATENT_DC_STD,
-    "PRIOR_LEVELS": PRIOR_LEVELS,
-    "PRIOR_DC": PRIOR_DC,
-    "TERMINAL_LEAK": TERMINAL_LEAK,
-    "NOISE_LF_STRENGTH": NOISE_LF_STRENGTH,
-    "NEGATIVE_PROMPT": NEGATIVE_PROMPT,
-    "COND_NOISE_SALT": COND_NOISE_SALT,
-    "COND_LO": COND_LO,
-    "COND_HI": COND_HI,
-    "PG_SPACES": PG_SPACES,
-    "PG_POOL": PG_POOL,
-    "PG_LO": PG_LO,
-    "PG_HI": PG_HI,
-    "PG_SEMANTIC_SIDE": PG_SEMANTIC_SIDE,
-    "TAESD_ID": TAESD_ID,
-    "DINO_ID": DINO_ID,
-    "_IMAGENET_MEAN": _IMAGENET_MEAN,
-    "_IMAGENET_STD": _IMAGENET_STD,
-    "_DINO_PATCH": _DINO_PATCH,
-}
-
-
-def _module_constants(path: pathlib.Path) -> dict:
-    found = {}
-    for node in ast.parse(path.read_text(encoding="utf-8")).body:
-        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-            continue
-        target = node.targets[0]
-        if not isinstance(target, ast.Name):
-            continue
-        try:
-            found[target.id] = ast.literal_eval(node.value)
-        except ValueError:
-            continue
-    return found
-
-
-def test_app_constant_parity():
-    print("\n--- app.py constant parity ---")
-
-    if not _APP_PATH.exists():
-        check(
-            "app.py is absent, so there is nothing to diff (expected in the image)",
-            True,
-            str(_APP_PATH),
-        )
-        return
-
-    found = _module_constants(_APP_PATH)
-
-    for name, expected in _APP_MIRRORED_CONSTANTS.items():
-        present = name in found
-        check(
-            f"app.py defines {name}",
-            present,
-            "" if present else "not found as a module-level literal",
-        )
-        if present:
-            check(
-                f"app.py {name} matches src",
-                found[name] == expected,
-                f"app={found[name]!r} src={expected!r}",
-            )
-
-
 def main() -> int:
     torch.manual_seed(0)
     random.seed(0)
@@ -2735,7 +2646,6 @@ def main() -> int:
     test_sampler_parity()
     test_cond_noise()
     test_particle_guidance()
-    test_app_constant_parity()
     test_eval_metrics()
     test_paired_deltas()
     test_space_metrics()
