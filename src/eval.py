@@ -11,6 +11,7 @@ from transformers import CLIPModel, CLIPProcessor
 
 from .config import default_output_dir
 from .encoding import encode_for_sampling
+from .features import SPACES, FeatureSpaces, project
 from .inference import ADAPTER_BASE_PATH, load_pipe, make_two_row_grid
 from .model import NUM_INFERENCE_STEPS
 from .sampler import (
@@ -187,6 +188,60 @@ def adherence(features: torch.Tensor, text_feature: torch.Tensor) -> float:
     return (features @ text_feature).mean().item()
 
 
+def unit_pixels(images, device) -> torch.Tensor:
+    arr = np.stack(
+        [np.asarray(image.convert("RGB"), dtype=np.uint8) for image in images]
+    )
+    return torch.from_numpy(arr).to(device).permute(0, 3, 1, 2).float() / 255.0
+
+
+@torch.no_grad()
+def space_features(model, images, device) -> dict[str, torch.Tensor]:
+    return {k: v.cpu() for k, v in model(unit_pixels(images, device)).items()}
+
+
+def space_rows(spaces: dict, row: str) -> dict[str, list]:
+    return {space: spaces[space][row] for space in SPACES}
+
+
+def space_reference(spaces: dict, space: str) -> tuple[torch.Tensor, torch.Tensor]:
+    pool = torch.cat(
+        [spaces[space]["basin"].float()] + [f.float() for f in spaces[space]["base"]]
+    )
+    basin = F.normalize(project(space, spaces[space]["basin"], pool).mean(0), dim=-1)
+    return pool, basin
+
+
+def space_summary(rows: dict[str, list], reference: dict) -> dict:
+    out = {}
+    for space in SPACES:
+        pool, basin = space_reference(reference, space)
+        projected = [project(space, f, pool) for f in rows[space]]
+        out[f"{space}_spread"] = sum(angular_spread(f) for f in projected) / len(
+            projected
+        )
+        out[f"{space}_radius"] = radius(torch.cat(projected), basin)
+    return out
+
+
+def space_deltas(
+    candidate: dict[str, list], baseline: dict[str, list], reference: dict
+) -> dict:
+    rows = {}
+    for space in SPACES:
+        pool, basin = space_reference(reference, space)
+        fc = [project(space, f, pool) for f in candidate[space]]
+        fb = [project(space, f, pool) for f in baseline[space]]
+        rows[f"{space}_spread"] = torch.tensor(
+            [angular_spread(c) - angular_spread(b) for c, b in zip(fc, fb)]
+        )
+        rows[f"{space}_radius"] = (torch.cat(fb) @ basin) - (torch.cat(fc) @ basin)
+    return {
+        name: dict(zip(("delta", "se"), mean_se(values)))
+        for name, values in rows.items()
+    }
+
+
 def mean_se(values: torch.Tensor) -> tuple[float, float]:
     values = values.flatten().double()
     n = values.numel()
@@ -323,6 +378,16 @@ def compare(baseline_path: str, candidate_path: str) -> dict:
     deltas = paired_deltas(
         candidate["lora"], baseline["lora"], baseline["basin"], baseline["text"], probe
     )
+    if "spaces" in baseline and "spaces" in candidate:
+        deltas.update(
+            space_deltas(
+                space_rows(candidate["spaces"], "lora"),
+                space_rows(baseline["spaces"], "lora"),
+                baseline["spaces"],
+            )
+        )
+    else:
+        print("One of these evals predates the content and style spaces; CLIP only.")
     print_deltas(f"candidate - baseline: {candidate_path} vs {baseline_path}", deltas)
     return deltas
 
@@ -414,10 +479,25 @@ def main():
         )
         prior_sheets = os.path.join(os.path.dirname(prior_path), "sheets")
         print(f"Reusing the basin and base passes of {prior_path}")
+
+    spaces_model = None
+    if prior is None or "spaces" in prior:
+        spaces_model = FeatureSpaces().to(device)
+    else:
+        print(
+            "The --base_from eval predates the content and style spaces; "
+            "reporting CLIP metrics only."
+        )
+
+    basin_space: dict[str, torch.Tensor] = {}
+    if prior is not None:
         basin = prior["basin"].to(device)
+        if spaces_model is not None:
+            basin_space = {s: prior["spaces"][s]["basin"] for s in SPACES}
     else:
         print(f"Basin pass ({args.basin_seeds} seeds x {len(prompts)} prompts)...")
         basin_features = []
+        basin_spaces: dict[str, list] = {s: [] for s in SPACES}
         for index, prompt in enumerate(tqdm(prompts, desc="basin")):
             positive, positive_pooled, negative, negative_pooled = encoded[prompt]
             images = anchor_generate(
@@ -440,10 +520,14 @@ def main():
             black["basin"] += black_frames(images)
             features, _ = embed(clip, processor, images, prompt, device)
             basin_features.append(features)
+            if spaces_model is not None:
+                for s, f in space_features(spaces_model, images, device).items():
+                    basin_spaces[s].append(f)
             del images, features
 
         basin = F.normalize(torch.cat(basin_features).mean(0), dim=-1)
-        del basin_features
+        basin_space = {s: torch.cat(v) for s, v in basin_spaces.items() if v}
+        del basin_features, basin_spaces
 
     results: dict[str, list] = {}
     sheets: dict[int, list] = {}
@@ -484,7 +568,10 @@ def main():
             black[label] += black_frames(images)
             features, text_feature = embed(clip, processor, images, prompt, device)
             text_features_by_prompt[index] = text_feature
-            per_prompt.append({"prompt": prompt, "features": features})
+            entry: dict = {"prompt": prompt, "features": features}
+            if spaces_model is not None:
+                entry["spaces"] = space_features(spaces_model, images, device)
+            per_prompt.append(entry)
 
             if args.no_contact_sheets:
                 del images
@@ -518,6 +605,21 @@ def main():
 
     lora_features = [entry["features"] for entry in results["lora"]]
     base_features = [entry["features"] for entry in results["base"]]
+
+    spaces = None
+    if spaces_model is not None:
+        spaces = {
+            s: {
+                "basin": basin_space[s],
+                "lora": [entry["spaces"][s] for entry in results["lora"]],
+                "base": (
+                    prior["spaces"][s]["base"]
+                    if prior is not None
+                    else [entry["spaces"][s] for entry in results["base"]]
+                ),
+            }
+            for s in SPACES
+        }
     metrics = {
         "args": vars(args),
         "prompts": len(prompts),
@@ -535,6 +637,12 @@ def main():
         ),
         "black_frames": black,
     }
+    if spaces is not None:
+        for label in ("lora", "base"):
+            metrics[label].update(space_summary(space_rows(spaces, label), spaces))
+        metrics["lora_vs_base"].update(
+            space_deltas(space_rows(spaces, "lora"), space_rows(spaces, "base"), spaces)
+        )
 
     torch.save(
         {
@@ -545,6 +653,7 @@ def main():
             "text": text_features.cpu(),
             "lora": [f.cpu() for f in lora_features],
             "base": [f.cpu() for f in base_features],
+            **({"spaces": spaces} if spaces is not None else {}),
         },
         os.path.join(eval_dir, "features.pt"),
     )
@@ -560,6 +669,13 @@ def main():
             f"radius={row['radius']:.4f}  adherence={row['adherence']:.4f}"
         )
         print(_textual_line("", row))
+        if spaces is not None:
+            print(
+                f"{'':>5}  content_spread={row['content_spread']:.4f}  "
+                f"content_radius={row['content_radius']:.4f}  "
+                f"style_spread={row['style_spread']:.4f}  "
+                f"style_radius={row['style_radius']:.4f}"
+            )
 
     print_deltas("lora - base", metrics["lora_vs_base"])
     if any(black.values()):
@@ -575,7 +691,9 @@ def main():
         "None of these numbers say whether a sample is any good. "
         "Angular spread and radius both rise on garbage, and radius rises on text, "
         "posters and comic pages (textual, radius_plain); adherence is the only "
-        "brake. Look at the sheets."
+        "brake. CLIP spread and radius track subject, not style: content_* is "
+        "DINOv2 (no text bias), style_* is VGG19 channel statistics. "
+        "Look at the sheets."
     )
 
 

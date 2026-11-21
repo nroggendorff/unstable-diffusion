@@ -72,8 +72,11 @@ from .eval import (
     paired_deltas,
     radius,
     reusable_base,
+    space_deltas,
+    space_summary,
     textual_probability,
 )
+from .features import SPACES, VGG_BLOCKS, project
 from .inference import make_two_row_grid
 from .io import load_lora, save_lora
 from .loss import compute_diffusion_loss, min_snr_weight
@@ -915,6 +918,94 @@ def test_paired_deltas():
     check(
         "without a probe the deltas carry no textual rows",
         "textual" not in deltas and "radius_plain" not in deltas,
+    )
+
+
+def test_space_metrics():
+    print("\n--- eval: content and style spaces ---")
+    torch.manual_seed(12)
+    normalize = torch.nn.functional.normalize
+    dim = sum(VGG_BLOCKS)
+    scales = torch.rand(dim) * 100 + 0.01
+    offsets = torch.randn(dim) * 50
+    reference = torch.randn(40, dim) * scales + offsets
+    raw = torch.randn(6, dim) * scales + offsets
+    projected = project("style", raw, reference)
+    check(
+        "a style projection is unit norm",
+        torch.allclose(projected.norm(dim=-1), torch.ones(6), atol=1e-5),
+    )
+    rescale = torch.rand(dim) * 10 + 0.1
+    shift = torch.randn(dim) * 20
+    again = project("style", raw * rescale + shift, reference * rescale + shift)
+    check(
+        "a style projection ignores per-channel units and offsets",
+        torch.allclose(projected, again, atol=1e-4),
+        f"max diff {(projected - again).abs().max().item():.2e}",
+    )
+
+    unit = torch.randn(400, dim)
+    unit = (unit - unit.mean(0)) / unit.std(0)
+    both = torch.zeros(1, dim)
+    both[0, : VGG_BLOCKS[0]] = 1.0
+    both[0, -VGG_BLOCKS[-1] :] = 1.0
+    weighted = project("style", both, unit)[0]
+    first = weighted[: VGG_BLOCKS[0]].norm().item()
+    last = weighted[-VGG_BLOCKS[-1] :].norm().item()
+    check(
+        "each VGG layer block carries equal weight regardless of its width",
+        abs(first - last) < 1e-3 * max(first, last),
+        f"64-channel block {first:.4f}, 512-channel block {last:.4f}",
+    )
+
+    content = normalize(torch.randn(6, 768), dim=-1)
+    check(
+        "the content projection is the normalized DINOv2 embedding",
+        torch.allclose(project("content", 3.0 * content, unit), content, atol=1e-6),
+    )
+
+    basin = {
+        "content": normalize(torch.randn(768) + 0.3 * torch.randn(8, 768), dim=-1),
+        "style": torch.randn(8, dim) * 0.3 + 2.0,
+    }
+    base = {
+        "content": [normalize(torch.randn(5, 768), dim=-1) for _ in range(3)],
+        "style": [torch.randn(5, dim) for _ in range(3)],
+    }
+    spaces = {s: {"basin": basin[s], "base": base[s]} for s in SPACES}
+    same = space_deltas(base, base, spaces)
+    check(
+        "identical sets give zero content and style deltas",
+        set(same) == {f"{s}_{m}" for s in SPACES for m in ("spread", "radius")}
+        and all(abs(row["delta"]) < 1e-6 for row in same.values()),
+        str({k: round(v["delta"], 8) for k, v in same.items()}),
+    )
+    toward = {
+        "content": [
+            normalize(f + 2.0 * basin["content"].mean(0), dim=-1)
+            for f in base["content"]
+        ],
+        "style": [f + 0.8 * (basin["style"].mean(0) - f) for f in base["style"]],
+    }
+    moved = space_deltas(toward, base, spaces)
+    check(
+        "moving every image toward the basin gives negative content and style radius",
+        moved["content_radius"]["delta"] < 0 and moved["style_radius"]["delta"] < 0,
+        f"content {moved['content_radius']['delta']:+.4f} "
+        f"style {moved['style_radius']['delta']:+.4f}",
+    )
+    summary_toward = space_summary(toward, spaces)
+    summary_base = space_summary(base, spaces)
+    check(
+        "a paired radius delta equals the difference of the pass summaries",
+        all(
+            abs(
+                moved[f"{s}_radius"]["delta"]
+                - (summary_toward[f"{s}_radius"] - summary_base[f"{s}_radius"])
+            )
+            < 1e-5
+            for s in SPACES
+        ),
     )
 
 
@@ -2647,6 +2738,7 @@ def main() -> int:
     test_app_constant_parity()
     test_eval_metrics()
     test_paired_deltas()
+    test_space_metrics()
     test_base_reuse()
     test_segment_plan()
     test_lora_resume()
